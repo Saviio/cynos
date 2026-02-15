@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["crates/js", "crates/cynos-js"]
+
+# Run performance benchmarks: cargo run -p cynos-perf --release
+# Or: cargo perf (if alias configured)
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/Saviio/cynos"
+
+[workspace.dependencies]
+cynos-core = { version = "0.1.0", path = "crates/core" }
+cynos-jsonb = { version = "0.1.0", path = "crates/jsonb" }
+cynos-index = { version = "0.1.0", path = "crates/index" }
+cynos-storage = { version = "0.1.0", path = "crates/storage" }
+cynos-query = { version = "0.1.0", path = "crates/query" }
+cynos-incremental = { version = "0.1.0", path = "crates/incremental" }
+cynos-reactive = { version = "0.1.0", path = "crates/reactive" }
+cynos-binary = { version = "0.1.0", path = "crates/binary" }
+cynos-database = { version = "0.1.0", path = "crates/database" }
+hashbrown = { version = "0.14", default-features = false, features = ["alloc", "ahash"] }
+proptest = "1.4"
+criterion = "0.5"
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+wasm-bindgen-test = "0.3"
+
+# WASM 产物大小优化
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+strip = true

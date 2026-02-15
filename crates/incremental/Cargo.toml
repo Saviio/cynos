@@ -1,0 +1,19 @@
+[package]
+name = "cynos-incremental"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Incremental View Maintenance (IVM) for Cynos database"
+
+[dependencies]
+cynos-core = { workspace = true }
+hashbrown = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "incremental_bench"
+harness = false

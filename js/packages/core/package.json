@@ -1,0 +1,54 @@
+{
+  "name": "@cynos/core",
+  "version": "0.1.0",
+  "description": "Cynos - High-performance in-memory database for JavaScript/TypeScript",
+  "author": "Saviio",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Saviio/cynos.git",
+    "directory": "cynos/js/packages/core"
+  },
+  "homepage": "https://github.com/Saviio/cynos",
+  "bugs": {
+    "url": "https://github.com/Saviio/cynos/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build:wasm": "cd ../../../crates/database && wasm-pack build --target web --out-dir ../../js/packages/core/wasm",
+    "build:wasm:benchmark": "cd ../../../crates/database && wasm-pack build --target web --out-dir ../../js/packages/core/wasm -- --features benchmark",
+    "build:ts": "cp wasm/cynos_database.d.ts src/wasm.d.ts && tsc && rm src/wasm.d.ts",
+    "build": "pnpm run build:wasm && sleep 3 && pnpm run build:ts && cp wasm/cynos_database_bg.wasm dist/database.wasm && cp wasm/cynos_database.js dist/wasm.js && cp wasm/cynos_database.d.ts dist/wasm.d.ts",
+    "build:benchmark": "pnpm run build:wasm:benchmark && pnpm run build:ts && cp wasm/cynos_database_bg.wasm dist/database.wasm && cp wasm/cynos_database.js dist/wasm.js && cp wasm/cynos_database.d.ts dist/wasm.d.ts",
+    "prepublishOnly": "pnpm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist wasm"
+  },
+  "keywords": [
+    "database",
+    "in-memory",
+    "wasm",
+    "reactive",
+    "query"
+  ],
+  "devDependencies": {
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0",
+    "@vitest/browser": "^1.0.0",
+    "playwright": "^1.40.0"
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "cynos-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Storage layer for Cynos in-memory database"
+
+[features]
+default = []
+hash-store = ["hashbrown"]
+
+[dependencies]
+cynos-core = { workspace = true }
+cynos-index = { workspace = true }
+cynos-incremental = { workspace = true }
+hashbrown = { workspace = true, optional = true }
+
+[dev-dependencies]

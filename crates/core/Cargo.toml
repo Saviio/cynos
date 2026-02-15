@@ -1,0 +1,12 @@
+[package]
+name = "cynos-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types and schema definitions for Cynos database"
+
+[dependencies]
+# 无外部依赖
+
+[dev-dependencies]

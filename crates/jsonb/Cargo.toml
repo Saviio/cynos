@@ -1,0 +1,12 @@
+[package]
+name = "cynos-jsonb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "JSONB data type implementation for Cynos database"
+
+[dependencies]
+cynos-core = { workspace = true }
+
+[dev-dependencies]

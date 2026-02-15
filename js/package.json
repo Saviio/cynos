@@ -1,0 +1,26 @@
+{
+  "name": "@cynos/monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cynos JavaScript/TypeScript packages",
+  "author": "Saviio",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Saviio/cynos.git",
+    "directory": "cynos/js"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "build:wasm": "pnpm -r build:wasm",
+    "test": "pnpm -r test",
+    "clean": "pnpm -r clean"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18",
+    "pnpm": ">=8"
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "cynos-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Index implementations for Cynos database"
+
+[dependencies]
+cynos-core = { workspace = true }
+hashbrown = { version = "0.14", default-features = false, features = ["alloc", "ahash"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "btree_bench"
+harness = false

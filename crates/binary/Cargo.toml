@@ -1,0 +1,19 @@
+[package]
+name = "cynos-binary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Binary protocol for high-performance row serialization"
+
+[dependencies]
+cynos-core = { workspace = true }
+hashbrown = { workspace = true }
+
+# Optional WASM dependencies, gated behind "wasm" feature
+wasm-bindgen = { workspace = true, optional = true }
+js-sys = { workspace = true, optional = true }
+
+[features]
+default = []
+wasm = ["dep:wasm-bindgen", "dep:js-sys"]

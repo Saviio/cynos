@@ -1,0 +1,14 @@
+[package]
+name = "cynos-reactive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reactive query system for Cynos database"
+
+[dependencies]
+cynos-core = { workspace = true }
+cynos-incremental = { workspace = true }
+hashbrown = { workspace = true }
+
+[dev-dependencies]

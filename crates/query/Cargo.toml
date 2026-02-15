@@ -1,0 +1,28 @@
+[package]
+name = "cynos-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Query engine for Cynos in-memory database"
+
+[dependencies]
+cynos-core = { workspace = true }
+cynos-index = { workspace = true }
+cynos-storage = { workspace = true }
+cynos-jsonb = { workspace = true }
+hashbrown = { workspace = true }
+libm = "0.2"
+web-sys = { version = "0.3", features = ["console"], optional = true }
+
+[features]
+default = []
+debug-log = ["web-sys"]
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = "0.5"
+
+[[bench]]
+name = "query_bench"
+harness = false

@@ -1,0 +1,23 @@
+[package]
+name = "cynos-perf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Comprehensive performance benchmarks for Cynos"
+publish = false
+
+[[bin]]
+name = "perf"
+path = "src/main.rs"
+
+[dependencies]
+cynos-core = { workspace = true }
+cynos-index = { workspace = true }
+cynos-storage = { workspace = true }
+cynos-query = { workspace = true }
+cynos-jsonb = { workspace = true }
+cynos-incremental = { workspace = true }
+cynos-reactive = { workspace = true }
+cynos-database = { workspace = true }
+hashbrown = { workspace = true }

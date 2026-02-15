@@ -1,0 +1,15 @@
+# cargo-release configuration
+# Install: cargo install cargo-release
+# Usage: cargo release patch --execute (or minor/major)
+# Publish all crates together with same version
+shared-version = true
+# Don't push git tags automatically (let CI handle it)
+push = false
+# Create git tag
+tag = true
+tag-prefix = "rust-v"
+tag-message = "Release {{version}}"
+# Rate limit for crates.io
+[rate-limit]
+new-packages = 30
+existing-packages = 30
