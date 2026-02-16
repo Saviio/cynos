@@ -41,6 +41,7 @@
 extern crate alloc;
 
 mod error;
+pub mod pattern_match;
 mod row;
 pub mod schema;
 mod types;

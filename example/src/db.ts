@@ -7,6 +7,7 @@ import {
   ResultSet,
   type Database,
   type JsObservableQuery,
+  type JsIvmObservableQuery,
 } from '@cynos/core'
 
 export type Stock = {
@@ -98,6 +99,7 @@ export async function getDatabase(): Promise<Database> {
         .column('marketCap', JsDataType.Int64, null)
         .column('pe', JsDataType.Float64, null)
         .column('sector', JsDataType.String, null)
+        .index('idx_sector', 'sector')
 
       database.registerTable(stocksTable)
 
@@ -287,4 +289,25 @@ export function startContinuousUpdates(
   })
 
   return () => { running = false }
+}
+
+// IVM-based live query (O(delta) incremental updates)
+// Only works with incrementalizable queries (no ORDER BY / LIMIT)
+export async function createStockIvmQuery(priceThreshold?: number): Promise<JsIvmObservableQuery> {
+  const database = await getDatabase()
+  let query = database.select('*').from('stocks')
+  if (priceThreshold != null) {
+    query = query.where(col('price').gt(priceThreshold))
+  }
+  return query.trace()
+}
+
+// Re-query based live query for comparison (O(result_set) on every change)
+export async function createStockReQueryQuery(priceThreshold?: number): Promise<JsObservableQuery> {
+  const database = await getDatabase()
+  let query = database.select('*').from('stocks')
+  if (priceThreshold != null) {
+    query = query.where(col('price').gt(priceThreshold))
+  }
+  return query.observe()
 }

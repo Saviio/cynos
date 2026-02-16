@@ -346,6 +346,51 @@ export enum JsDataType {
 }
 
 /**
+ * JavaScript-friendly IVM observable query wrapper.
+ * Uses DBSP-based incremental view maintenance for O(delta) updates.
+ */
+export class JsIvmObservableQuery {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Returns the current result as a JavaScript array.
+     */
+    getResult(): any;
+    /**
+     * Returns the current result as a binary buffer for zero-copy access.
+     */
+    getResultBinary(): BinaryResult;
+    /**
+     * Returns the schema layout for decoding binary results.
+     */
+    getSchemaLayout(): SchemaLayout;
+    /**
+     * Returns whether the result is empty.
+     */
+    isEmpty(): boolean;
+    /**
+     * Subscribes to IVM query changes.
+     *
+     * The callback receives a delta object `{ added: Row[], removed: Row[] }`
+     * instead of the full result set. This is the true O(delta) path —
+     * the UI side should apply the delta to its own state.
+     *
+     * Use `getResult()` to get the initial full result before subscribing.
+     * Returns an unsubscribe function.
+     */
+    subscribe(callback: Function): Function;
+    /**
+     * Returns the number of active subscriptions.
+     */
+    subscriptionCount(): number;
+    /**
+     * Returns the number of rows in the result.
+     */
+    readonly length: number;
+}
+
+/**
  * JavaScript-friendly observable query wrapper.
  * Uses re-query strategy for optimal performance with indexes.
  */
@@ -675,6 +720,15 @@ export class SelectBuilder {
      */
     sum(column: string): SelectBuilder;
     /**
+     * Creates an IVM-based observable query using DBSP incremental dataflow.
+     *
+     * Unlike `observe()` which re-executes the full query on every change (O(result_set)),
+     * `trace()` compiles the query into a dataflow graph and propagates only deltas (O(delta)).
+     *
+     * Returns an error if the query is not incrementalizable (e.g. contains ORDER BY / LIMIT).
+     */
+    trace(): JsIvmObservableQuery;
+    /**
      * Sets the WHERE clause.
      */
     where(predicate: Expr): SelectBuilder;
@@ -789,6 +843,7 @@ export interface InitOutput {
     readonly selectbuilder_explain: (a: number, b: number) => void;
     readonly selectbuilder_observe: (a: number, b: number) => void;
     readonly selectbuilder_changes: (a: number, b: number) => void;
+    readonly selectbuilder_trace: (a: number, b: number) => void;
     readonly selectbuilder_getSchemaLayout: (a: number, b: number) => void;
     readonly selectbuilder_execBinary: (a: number) => number;
     readonly __wbg_insertbuilder_free: (a: number, b: number) => void;
@@ -809,6 +864,14 @@ export interface InitOutput {
     readonly jsobservablequery_length: (a: number) => number;
     readonly jsobservablequery_isEmpty: (a: number) => number;
     readonly jsobservablequery_subscriptionCount: (a: number) => number;
+    readonly __wbg_jsivmobservablequery_free: (a: number, b: number) => void;
+    readonly jsivmobservablequery_subscribe: (a: number, b: number) => number;
+    readonly jsivmobservablequery_getResult: (a: number) => number;
+    readonly jsivmobservablequery_getResultBinary: (a: number) => number;
+    readonly jsivmobservablequery_getSchemaLayout: (a: number) => number;
+    readonly jsivmobservablequery_length: (a: number) => number;
+    readonly jsivmobservablequery_isEmpty: (a: number) => number;
+    readonly jsivmobservablequery_subscriptionCount: (a: number) => number;
     readonly __wbg_jschangesstream_free: (a: number, b: number) => void;
     readonly jschangesstream_subscribe: (a: number, b: number) => number;
     readonly jschangesstream_getResult: (a: number) => number;
@@ -873,10 +936,10 @@ export interface InitOutput {
     readonly binaryresult_asView: (a: number) => number;
     readonly binaryresult_free: (a: number) => void;
     readonly __wasm_bindgen_func_elem_61: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1376: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1564: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1383: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_573: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_1541: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_1730: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1548: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_595: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

@@ -136,13 +136,22 @@ impl ObservableQuery {
     ///
     /// Propagates the deltas through the dataflow, updates the result,
     /// and notifies all subscribers of the changes.
+    ///
+    /// Uses `from_deltas_only` to avoid the O(result_set) clone of
+    /// `self.view.result()`. Subscribers receive only added/removed rows.
+    /// If a subscriber needs the full result, it can call `result()` explicitly.
     pub fn on_table_change(&mut self, table_id: TableId, deltas: Vec<Delta<Row>>) {
+        // Skip dataflow propagation entirely when no one is listening.
+        // The result_map will be stale, but getResult() is only called
+        // right after subscribe, at which point we re-initialize anyway.
+        if self.subscriptions.is_empty() {
+            return;
+        }
+
         let output_deltas = self.view.on_table_change(table_id, deltas);
 
         if !output_deltas.is_empty() {
-            // Get current result AFTER applying changes
-            let current_result = self.view.result();
-            let changes = ChangeSet::from_deltas(&output_deltas, current_result);
+            let changes = ChangeSet::from_deltas_only(&output_deltas);
             self.subscriptions.notify_all(&changes);
         }
     }

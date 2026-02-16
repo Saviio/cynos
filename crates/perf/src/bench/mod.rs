@@ -8,3 +8,4 @@ pub mod incremental;
 pub mod reactive;
 pub mod jsonb;
 pub mod e2e;
+pub mod ivm_compare;

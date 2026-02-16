@@ -39,6 +39,7 @@ extern crate alloc;
 
 pub mod convert;
 pub mod database;
+pub mod dataflow_compiler;
 pub mod expr;
 pub mod query_builder;
 pub mod query_engine;
@@ -51,7 +52,7 @@ pub use convert::{js_to_row, js_to_value, row_to_js, value_to_js};
 pub use database::Database;
 pub use expr::{Column, Expr};
 pub use query_builder::{DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuilder};
-pub use reactive_bridge::{JsChangesStream, JsObservableQuery};
+pub use reactive_bridge::{JsChangesStream, JsIvmObservableQuery, JsObservableQuery};
 pub use table::{JsTable, JsTableBuilder};
 pub use transaction::JsTransaction;
 pub use binary_protocol::{BinaryResult, SchemaLayout};

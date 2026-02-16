@@ -7,7 +7,8 @@ use crate::binary_protocol::{SchemaLayout, SchemaLayoutCache};
 use crate::convert::{js_array_to_rows, js_to_value, joined_rows_to_js_array, projected_rows_to_js_array, rows_to_js_array};
 use crate::expr::{Expr, ExprInner};
 use crate::query_engine::{compile_plan, execute_physical_plan, execute_plan, explain_plan};
-use crate::reactive_bridge::{JsChangesStream, JsObservableQuery, QueryRegistry, ReQueryObservable};
+use crate::dataflow_compiler::compile_to_dataflow;
+use crate::reactive_bridge::{JsChangesStream, JsIvmObservableQuery, JsObservableQuery, QueryRegistry, ReQueryObservable};
 use cynos_storage::TableCache;
 use crate::JsSortOrder;
 use alloc::boxed::Box;
@@ -20,7 +21,7 @@ use cynos_incremental::Delta;
 use cynos_query::ast::{AggregateFunc, SortOrder};
 use cynos_query::plan_cache::{compute_plan_fingerprint, PlanCache};
 use cynos_query::planner::LogicalPlan;
-use cynos_reactive::TableId;
+use cynos_reactive::{ObservableQuery, TableId};
 use core::cell::RefCell;
 use wasm_bindgen::prelude::*;
 
@@ -1043,6 +1044,86 @@ impl SelectBuilder {
         Ok(JsChangesStream::from_observable(observable))
     }
 
+    /// Creates an IVM-based observable query using DBSP incremental dataflow.
+    ///
+    /// Unlike `observe()` which re-executes the full query on every change (O(result_set)),
+    /// `trace()` compiles the query into a dataflow graph and propagates only deltas (O(delta)).
+    ///
+    /// Returns an error if the query is not incrementalizable (e.g. contains ORDER BY / LIMIT).
+    pub fn trace(&self) -> Result<JsIvmObservableQuery, JsValue> {
+        let table_name = self
+            .from_table
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("FROM table not specified"))?;
+
+        let cache_ref = self.cache.clone();
+        let cache = cache_ref.borrow();
+        let store = cache
+            .get_table(table_name)
+            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
+
+        let schema = store.schema().clone();
+
+        // Build binary layout
+        let binary_layout = if self.joins.is_empty() {
+            if let Some(cols) = self.parse_columns() {
+                SchemaLayout::from_projection(&schema, &cols)
+            } else {
+                SchemaLayout::from_schema(&schema)
+            }
+        } else {
+            let mut schemas: Vec<&Table> = Vec::with_capacity(1 + self.joins.len());
+            schemas.push(store.schema());
+            for join in &self.joins {
+                let join_store = cache.get_table(&join.table).ok_or_else(|| {
+                    JsValue::from_str(&alloc::format!("Join table not found: {}", join.table))
+                })?;
+                schemas.push(join_store.schema());
+            }
+            SchemaLayout::from_schemas(&schemas)
+        };
+
+        // Build logical plan and compile to physical plan
+        let logical_plan = self.build_logical_plan(table_name);
+        let physical_plan = compile_plan(&cache, table_name, logical_plan);
+
+        // Compile physical plan to dataflow — errors if not incrementalizable
+        let table_id_map = self.table_id_map.borrow();
+        let compile_result = compile_to_dataflow(&physical_plan, &table_id_map)
+            .ok_or_else(|| JsValue::from_str(
+                "Query is not incrementalizable (contains ORDER BY, LIMIT, or other non-streamable operators). Use observe() instead."
+            ))?;
+
+        // Get initial result using the compiled physical plan
+        let initial_rows = execute_physical_plan(&cache, &physical_plan)
+            .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
+
+        drop(cache);
+        drop(table_id_map);
+
+        // Convert Rc<Row> → Row for ObservableQuery
+        let initial_owned: Vec<Row> = initial_rows.iter().map(|rc| (**rc).clone()).collect();
+
+        // Create IVM observable with dataflow and initial result
+        let observable = ObservableQuery::with_initial(compile_result.dataflow, initial_owned);
+        let observable_rc = Rc::new(RefCell::new(observable));
+
+        // Register with query registry for IVM delta propagation
+        self.query_registry
+            .borrow_mut()
+            .register_ivm(observable_rc.clone());
+
+        // Return with appropriate column info
+        if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
+            let aggregate_cols = self.build_aggregate_column_names();
+            Ok(JsIvmObservableQuery::new_with_aggregates(observable_rc, schema, aggregate_cols, binary_layout))
+        } else if let Some(cols) = self.parse_columns() {
+            Ok(JsIvmObservableQuery::new_with_projection(observable_rc, schema, cols, binary_layout))
+        } else {
+            Ok(JsIvmObservableQuery::new(observable_rc, schema, binary_layout))
+        }
+    }
+
     /// Gets the schema layout for binary decoding.
     /// The layout can be cached by JS for repeated queries on the same table.
     #[wasm_bindgen(js_name = getSchemaLayout)]
@@ -1194,8 +1275,8 @@ impl InsertBuilder {
         let rows = js_array_to_rows(values, &schema, start_row_id)?;
         let row_count = rows.len();
 
-        // Build deltas for notification
-        let _deltas: Vec<Delta<Row>> = rows.iter().map(|r| Delta::insert(r.clone())).collect();
+        // Build deltas for IVM notification
+        let deltas: Vec<Delta<Row>> = rows.iter().map(|r| Delta::insert(r.clone())).collect();
 
         // Insert rows and collect their IDs
         let mut inserted_ids = hashbrown::HashSet::new();
@@ -1206,12 +1287,12 @@ impl InsertBuilder {
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
 
-        // Notify query registry with changed IDs
+        // Notify query registry with changed IDs and deltas
         if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
             drop(cache); // Release borrow before notifying
             self.query_registry
                 .borrow_mut()
-                .on_table_change(table_id, &inserted_ids);
+                .on_table_change_ivm(table_id, deltas, &inserted_ids);
         }
 
         Ok(JsValue::from_f64(row_count as f64))
@@ -1364,12 +1445,12 @@ impl UpdateBuilder {
             update_count += 1;
         }
 
-        // Notify query registry with changed IDs
+        // Notify query registry with changed IDs and deltas
         if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
             drop(cache);
             self.query_registry
                 .borrow_mut()
-                .on_table_change(table_id, &updated_ids);
+                .on_table_change_ivm(table_id, deltas, &updated_ids);
         }
 
         Ok(JsValue::from_f64(update_count as f64))
@@ -1460,7 +1541,7 @@ impl DeleteBuilder {
             .get_table_mut(&self.table_name)
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
 
-        let _deltas: Vec<Delta<Row>> = rows_to_delete
+        let deltas: Vec<Delta<Row>> = rows_to_delete
             .iter()
             .map(|r| Delta::delete(r.clone()))
             .collect();
@@ -1476,15 +1557,217 @@ impl DeleteBuilder {
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
 
-        // Notify query registry with changed IDs
+        // Notify query registry with changed IDs and deltas
         if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
             drop(cache);
             self.query_registry
                 .borrow_mut()
-                .on_table_change(table_id, &deleted_ids);
+                .on_table_change_ivm(table_id, deltas, &deleted_ids);
         }
 
         Ok(JsValue::from_f64(delete_count as f64))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSONB helpers for evaluate_predicate
+// ---------------------------------------------------------------------------
+
+/// Minimal JSON text parser producing `cynos_jsonb::JsonbValue`.
+///
+/// Handles: null, true, false, numbers, quoted strings, arrays, objects.
+/// This mirrors the logic in `PhysicalPlanRunner::parse_json_str` so that
+/// the re-query filter path and the query executor agree on semantics.
+fn parse_json_text(s: &str) -> Option<cynos_jsonb::JsonbValue> {
+    let s = s.trim();
+    if s == "null" {
+        return Some(cynos_jsonb::JsonbValue::Null);
+    }
+    if s == "true" {
+        return Some(cynos_jsonb::JsonbValue::Bool(true));
+    }
+    if s == "false" {
+        return Some(cynos_jsonb::JsonbValue::Bool(false));
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return Some(cynos_jsonb::JsonbValue::Number(n));
+    }
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let inner = &s[1..s.len() - 1];
+        return Some(cynos_jsonb::JsonbValue::String(
+            unescape_json(inner),
+        ));
+    }
+    if s.starts_with('{') {
+        return parse_json_object(s);
+    }
+    if s.starts_with('[') {
+        return parse_json_array(s);
+    }
+    None
+}
+
+fn unescape_json(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('/') => result.push('/'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn parse_json_object(s: &str) -> Option<cynos_jsonb::JsonbValue> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return None;
+    }
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(cynos_jsonb::JsonbValue::Object(
+            cynos_jsonb::JsonbObject::new(),
+        ));
+    }
+    let mut obj = cynos_jsonb::JsonbObject::new();
+    for pair in split_json_top_level(inner, ',') {
+        let pair = pair.trim();
+        // Find the colon separating key from value
+        let colon_pos = find_json_colon(pair)?;
+        let key_str = pair[..colon_pos].trim();
+        let val_str = pair[colon_pos + 1..].trim();
+        // Key must be a quoted string
+        if key_str.starts_with('"') && key_str.ends_with('"') && key_str.len() >= 2 {
+            let key = unescape_json(&key_str[1..key_str.len() - 1]);
+            let val = parse_json_text(val_str)?;
+            obj.insert(key, val);
+        } else {
+            return None;
+        }
+    }
+    Some(cynos_jsonb::JsonbValue::Object(obj))
+}
+
+fn parse_json_array(s: &str) -> Option<cynos_jsonb::JsonbValue> {
+    let s = s.trim();
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return None;
+    }
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(cynos_jsonb::JsonbValue::Array(Vec::new()));
+    }
+    let mut arr = Vec::new();
+    for elem in split_json_top_level(inner, ',') {
+        arr.push(parse_json_text(elem.trim())?);
+    }
+    Some(cynos_jsonb::JsonbValue::Array(arr))
+}
+
+/// Split a JSON string at top-level occurrences of `sep`,
+/// respecting nested braces, brackets, and quoted strings.
+fn split_json_top_level(s: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '{' || c == '[' {
+            depth += 1;
+        } else if c == '}' || c == ']' {
+            depth -= 1;
+        } else if c == sep && depth == 0 {
+            parts.push(&s[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    if start <= s.len() {
+        parts.push(&s[start..]);
+    }
+    parts
+}
+
+/// Find the first colon at top level (outside strings and nested structures).
+fn find_json_colon(s: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && c == ':' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Compare a `cynos_jsonb::JsonbValue` with a `cynos_core::Value`.
+fn compare_jsonb_with_value(jsonb: &cynos_jsonb::JsonbValue, value: &Value) -> bool {
+    match (jsonb, value) {
+        (cynos_jsonb::JsonbValue::Null, Value::Null) => true,
+        (cynos_jsonb::JsonbValue::Bool(a), Value::Boolean(b)) => a == b,
+        (cynos_jsonb::JsonbValue::Number(a), Value::Int32(b)) => (*a - *b as f64).abs() < f64::EPSILON,
+        (cynos_jsonb::JsonbValue::Number(a), Value::Int64(b)) => (*a - *b as f64).abs() < f64::EPSILON,
+        (cynos_jsonb::JsonbValue::Number(a), Value::Float64(b)) => (*a - *b).abs() < f64::EPSILON,
+        (cynos_jsonb::JsonbValue::String(a), Value::String(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Convert a `cynos_jsonb::JsonbValue` to its string representation.
+fn jsonb_value_to_string(v: &cynos_jsonb::JsonbValue) -> String {
+    match v {
+        cynos_jsonb::JsonbValue::Null => String::from("null"),
+        cynos_jsonb::JsonbValue::Bool(b) => if *b { String::from("true") } else { String::from("false") },
+        cynos_jsonb::JsonbValue::Number(n) => {
+            use alloc::format;
+            format!("{}", n)
+        }
+        cynos_jsonb::JsonbValue::String(s) => s.clone(),
+        _ => {
+            use alloc::format;
+            format!("{:?}", v)
+        }
     }
 }
 
@@ -1543,6 +1826,30 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
 
             row_val >= &low_val && row_val <= &high_val
         }
+        ExprInner::NotBetween { column, low, high } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let col = col.unwrap();
+            let idx = col.index();
+
+            let row_val = match row.get(idx) {
+                Some(v) => v,
+                None => return false,
+            };
+
+            let low_val = match js_to_value(low, col.data_type()) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let high_val = match js_to_value(high, col.data_type()) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+
+            row_val < &low_val || row_val > &high_val
+        }
         ExprInner::InList { column, values } => {
             let col = schema.get_column(&column.name());
             if col.is_none() {
@@ -1565,7 +1872,7 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 }
             })
         }
-        ExprInner::Like { column, pattern } => {
+        ExprInner::NotInList { column, values } => {
             let col = schema.get_column(&column.name());
             if col.is_none() {
                 return false;
@@ -1574,12 +1881,66 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
             let idx = col.index();
 
             let row_val = match row.get(idx) {
-                Some(Value::String(s)) => s,
-                _ => return false,
+                Some(v) => v,
+                None => return false,
             };
 
-            // Simple LIKE implementation (% = any, _ = single char)
-            like_match(row_val, pattern)
+            let arr = js_sys::Array::from(values);
+            !arr.iter().any(|v| {
+                if let Ok(cmp_val) = js_to_value(&v, col.data_type()) {
+                    row_val == &cmp_val
+                } else {
+                    false
+                }
+            })
+        }
+        ExprInner::Like { column, pattern } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let idx = col.unwrap().index();
+
+            match row.get(idx) {
+                Some(Value::String(s)) => cynos_core::pattern_match::like(s, pattern),
+                _ => false,
+            }
+        }
+        ExprInner::NotLike { column, pattern } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let idx = col.unwrap().index();
+
+            match row.get(idx) {
+                Some(Value::String(s)) => !cynos_core::pattern_match::like(s, pattern),
+                _ => false,
+            }
+        }
+        ExprInner::Match { column, pattern } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let idx = col.unwrap().index();
+
+            match row.get(idx) {
+                Some(Value::String(s)) => cynos_core::pattern_match::regex(s, pattern),
+                _ => false,
+            }
+        }
+        ExprInner::NotMatch { column, pattern } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let idx = col.unwrap().index();
+
+            match row.get(idx) {
+                Some(Value::String(s)) => !cynos_core::pattern_match::regex(s, pattern),
+                _ => false,
+            }
         }
         ExprInner::IsNull { column } => {
             let col = schema.get_column(&column.name());
@@ -1605,6 +1966,110 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 _ => true,
             }
         }
+        ExprInner::JsonbEq { column, path, value } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let idx = col.unwrap().index();
+
+            let jsonb_val = match row.get(idx) {
+                Some(Value::Jsonb(j)) => j,
+                _ => return false,
+            };
+
+            // Parse JSON text bytes → cynos_jsonb::JsonbValue, then query path
+            let json_str = match core::str::from_utf8(&jsonb_val.0) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let parsed = match parse_json_text(json_str) {
+                Some(v) => v,
+                None => return false,
+            };
+            let json_path = match cynos_jsonb::JsonPath::parse(path) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let results = parsed.query(&json_path);
+            if results.is_empty() {
+                return false;
+            }
+
+            // Compare first result with expected value
+            if let Ok(cmp_val) = js_to_value(value, DataType::String) {
+                compare_jsonb_with_value(results[0], &cmp_val)
+            } else {
+                false
+            }
+        }
+        ExprInner::JsonbContains { column, path, value } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let idx = col.unwrap().index();
+
+            let jsonb_val = match row.get(idx) {
+                Some(Value::Jsonb(j)) => j,
+                _ => return false,
+            };
+
+            let json_str = match core::str::from_utf8(&jsonb_val.0) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let parsed = match parse_json_text(json_str) {
+                Some(v) => v,
+                None => return false,
+            };
+            let json_path = match cynos_jsonb::JsonPath::parse(path) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            let results = parsed.query(&json_path);
+            if results.is_empty() {
+                return false;
+            }
+
+            if let Ok(cmp_val) = js_to_value(value, DataType::String) {
+                if let Value::String(s) = &cmp_val {
+                    // Check if the extracted value's string representation contains the search string
+                    let extracted_str = jsonb_value_to_string(results[0]);
+                    extracted_str.contains(s.as_str())
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        }
+        ExprInner::JsonbExists { column, path } => {
+            let col = schema.get_column(&column.name());
+            if col.is_none() {
+                return false;
+            }
+            let idx = col.unwrap().index();
+
+            let jsonb_val = match row.get(idx) {
+                Some(Value::Jsonb(j)) => j,
+                _ => return false,
+            };
+
+            let json_str = match core::str::from_utf8(&jsonb_val.0) {
+                Ok(s) => s,
+                Err(_) => return false,
+            };
+            let parsed = match parse_json_text(json_str) {
+                Some(v) => v,
+                None => return false,
+            };
+            let json_path = match cynos_jsonb::JsonPath::parse(path) {
+                Ok(p) => p,
+                Err(_) => return false,
+            };
+            !parsed.query(&json_path).is_empty()
+        }
         ExprInner::And { left, right } => {
             evaluate_predicate(left, row, schema) && evaluate_predicate(right, row, schema)
         }
@@ -1613,87 +2078,49 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
         }
         ExprInner::Not { inner } => !evaluate_predicate(inner, row, schema),
         ExprInner::True => true,
-        _ => true, // Default to true for unsupported expressions
+        // ColumnRef / Literal are value expressions, not predicates.
+        // Treating them as `true` preserves backward compatibility.
+        ExprInner::ColumnRef { .. } | ExprInner::Literal { .. } => true,
     }
-}
-
-/// Simple LIKE pattern matching.
-fn like_match(s: &str, pattern: &str) -> bool {
-    let mut s_chars = s.chars().peekable();
-    let mut p_chars = pattern.chars().peekable();
-
-    while let Some(p) = p_chars.next() {
-        match p {
-            '%' => {
-                // Match any sequence
-                if p_chars.peek().is_none() {
-                    return true; // % at end matches everything
-                }
-                // Try matching rest of pattern at each position
-                let rest_pattern: String = p_chars.collect();
-                while s_chars.peek().is_some() {
-                    let rest_s: String = s_chars.clone().collect();
-                    if like_match(&rest_s, &rest_pattern) {
-                        return true;
-                    }
-                    s_chars.next();
-                }
-                return like_match("", &rest_pattern);
-            }
-            '_' => {
-                // Match single character
-                if s_chars.next().is_none() {
-                    return false;
-                }
-            }
-            c => {
-                // Match exact character
-                if s_chars.next() != Some(c) {
-                    return false;
-                }
-            }
-        }
-    }
-
-    s_chars.peek().is_none()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    use cynos_core::pattern_match;
+
     #[wasm_bindgen_test]
     fn test_like_match_exact() {
-        assert!(like_match("hello", "hello"));
-        assert!(!like_match("hello", "world"));
+        assert!(pattern_match::like("hello", "hello"));
+        assert!(!pattern_match::like("hello", "world"));
     }
 
     #[wasm_bindgen_test]
     fn test_like_match_percent() {
-        assert!(like_match("hello", "%"));
-        assert!(like_match("hello", "h%"));
-        assert!(like_match("hello", "%o"));
-        assert!(like_match("hello", "h%o"));
-        assert!(like_match("hello", "%ell%"));
-        assert!(!like_match("hello", "x%"));
+        assert!(pattern_match::like("hello", "%"));
+        assert!(pattern_match::like("hello", "h%"));
+        assert!(pattern_match::like("hello", "%o"));
+        assert!(pattern_match::like("hello", "h%o"));
+        assert!(pattern_match::like("hello", "%ell%"));
+        assert!(!pattern_match::like("hello", "x%"));
     }
 
     #[wasm_bindgen_test]
     fn test_like_match_underscore() {
-        assert!(like_match("hello", "_ello"));
-        assert!(like_match("hello", "h_llo"));
-        assert!(like_match("hello", "hell_"));
-        assert!(like_match("hello", "_____"));
-        assert!(!like_match("hello", "______"));
+        assert!(pattern_match::like("hello", "_ello"));
+        assert!(pattern_match::like("hello", "h_llo"));
+        assert!(pattern_match::like("hello", "hell_"));
+        assert!(pattern_match::like("hello", "_____"));
+        assert!(!pattern_match::like("hello", "______"));
     }
 
     #[wasm_bindgen_test]
     fn test_like_match_combined() {
-        assert!(like_match("hello", "h%_o"));
-        assert!(like_match("hello world", "hello%"));
-        assert!(like_match("hello world", "%world"));
+        assert!(pattern_match::like("hello", "h%_o"));
+        assert!(pattern_match::like("hello world", "hello%"));
+        assert!(pattern_match::like("hello world", "%world"));
     }
 }

@@ -4,9 +4,12 @@
 //! system, enabling observable queries that update automatically when
 //! underlying data changes.
 //!
-//! Uses re-query strategy: when data changes, re-execute the query using
-//! the query optimizer and indexes for optimal performance.
-//! Physical plans are cached to avoid repeated optimization overhead.
+//! Two strategies are supported:
+//! 1. Re-query: re-execute the cached physical plan on each change (original)
+//! 2. IVM (DBSP): propagate deltas through a compiled dataflow graph (new)
+//!
+//! The IVM path is used when the query is incrementalizable (no Sort/Limit/TopN).
+//! Otherwise, falls back to re-query.
 
 use crate::convert::{row_to_js, value_to_js};
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
@@ -18,8 +21,9 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use cynos_core::schema::Table;
 use cynos_core::Row;
+use cynos_incremental::{Delta, TableId};
 use cynos_query::planner::PhysicalPlan;
-use cynos_reactive::TableId;
+use cynos_reactive::ObservableQuery;
 use core::cell::RefCell;
 use hashbrown::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
@@ -182,12 +186,19 @@ impl ReQueryObservable {
 pub struct QueryRegistry {
     /// Map from table ID to list of queries that depend on it
     queries: HashMap<TableId, Vec<Rc<RefCell<ReQueryObservable>>>>,
+    /// Map from table ID to IVM-based queries
+    ivm_queries: HashMap<TableId, Vec<Rc<RefCell<ObservableQuery>>>>,
     /// Pending changes to be flushed (table_id -> accumulated changed_ids)
     pending_changes: Rc<RefCell<HashMap<TableId, HashSet<u64>>>>,
+    /// Pending IVM deltas (table_id -> accumulated deltas)
+    pending_ivm_deltas: Rc<RefCell<HashMap<TableId, Vec<Delta<Row>>>>>,
     /// Whether a flush is already scheduled
     flush_scheduled: Rc<RefCell<bool>>,
     /// Self reference for scheduling flush callback
     self_ref: Option<Rc<RefCell<QueryRegistry>>>,
+    /// Reusable flush closure to avoid Closure::once + forget() leak per DML
+    #[cfg(target_arch = "wasm32")]
+    flush_closure: Option<Closure<dyn FnMut(JsValue)>>,
 }
 
 impl QueryRegistry {
@@ -195,9 +206,13 @@ impl QueryRegistry {
     pub fn new() -> Self {
         Self {
             queries: HashMap::new(),
+            ivm_queries: HashMap::new(),
             pending_changes: Rc::new(RefCell::new(HashMap::new())),
+            pending_ivm_deltas: Rc::new(RefCell::new(HashMap::new())),
             flush_scheduled: Rc::new(RefCell::new(false)),
             self_ref: None,
+            #[cfg(target_arch = "wasm32")]
+            flush_closure: None,
         }
     }
 
@@ -207,7 +222,7 @@ impl QueryRegistry {
         self.self_ref = Some(self_ref);
     }
 
-    /// Registers a query with its dependent table.
+    /// Registers a re-query observable with its dependent table.
     pub fn register(&mut self, query: Rc<RefCell<ReQueryObservable>>, table_id: TableId) {
         self.queries
             .entry(table_id)
@@ -215,10 +230,22 @@ impl QueryRegistry {
             .push(query);
     }
 
+    /// Registers an IVM-based observable query.
+    /// The query's dependencies are automatically extracted from its dataflow.
+    pub fn register_ivm(&mut self, query: Rc<RefCell<ObservableQuery>>) {
+        let deps: Vec<TableId> = query.borrow().dependencies().to_vec();
+        for table_id in deps {
+            self.ivm_queries
+                .entry(table_id)
+                .or_insert_with(Vec::new)
+                .push(query.clone());
+        }
+    }
+
     /// Handles table changes by batching and scheduling a flush.
-    /// Multiple rapid changes are coalesced into a single re-query.
+    /// Multiple rapid changes are coalesced into a single re-query/propagation.
     pub fn on_table_change(&mut self, table_id: TableId, changed_ids: &HashSet<u64>) {
-        // Accumulate changes
+        // Accumulate changes for re-query observables
         {
             let mut pending = self.pending_changes.borrow_mut();
             pending
@@ -236,34 +263,95 @@ impl QueryRegistry {
         }
     }
 
+    /// Handles table changes with IVM deltas.
+    /// This is the new DBSP-based path that propagates deltas incrementally.
+    pub fn on_table_change_ivm(
+        &mut self,
+        table_id: TableId,
+        deltas: Vec<Delta<Row>>,
+        changed_ids: &HashSet<u64>,
+    ) {
+        // Accumulate IVM deltas
+        {
+            let mut pending = self.pending_ivm_deltas.borrow_mut();
+            pending
+                .entry(table_id)
+                .or_insert_with(Vec::new)
+                .extend(deltas);
+        }
+
+        // Also accumulate for re-query observables
+        {
+            let mut pending = self.pending_changes.borrow_mut();
+            pending
+                .entry(table_id)
+                .or_insert_with(HashSet::new)
+                .extend(changed_ids.iter().copied());
+        }
+
+        let mut scheduled = self.flush_scheduled.borrow_mut();
+        if !*scheduled {
+            *scheduled = true;
+            drop(scheduled);
+            self.schedule_flush();
+        }
+    }
+
     /// Schedules a flush to run after the current microtask.
-    fn schedule_flush(&self) {
+    fn schedule_flush(&mut self) {
         #[cfg(target_arch = "wasm32")]
         {
-            if let Some(ref self_ref) = self.self_ref {
-                let self_ref_clone = self_ref.clone();
-                let pending_changes = self.pending_changes.clone();
-                let flush_scheduled = self.flush_scheduled.clone();
+            // Lazily create the reusable flush closure once
+            if self.flush_closure.is_none() {
+                if let Some(ref self_ref) = self.self_ref {
+                    let self_ref_clone = self_ref.clone();
+                    let pending_changes = self.pending_changes.clone();
+                    let pending_ivm_deltas = self.pending_ivm_deltas.clone();
+                    let flush_scheduled = self.flush_scheduled.clone();
 
-                // Use queueMicrotask via Promise.resolve().then()
-                let closure = Closure::once(Box::new(move |_: JsValue| {
-                    *flush_scheduled.borrow_mut() = false;
-                    let changes: HashMap<TableId, HashSet<u64>> =
-                        pending_changes.borrow_mut().drain().collect();
+                    self.flush_closure = Some(Closure::new(move |_: JsValue| {
+                        *flush_scheduled.borrow_mut() = false;
 
-                    let registry = self_ref_clone.borrow();
-                    for (table_id, changed_ids) in changes {
-                        if let Some(queries) = registry.queries.get(&table_id) {
-                            for query in queries {
-                                query.borrow_mut().on_change(&changed_ids);
+                        // Flush IVM deltas first (O(delta) path)
+                        let ivm_changes: HashMap<TableId, Vec<Delta<Row>>> =
+                            pending_ivm_deltas.borrow_mut().drain().collect();
+                        {
+                            let registry = self_ref_clone.borrow();
+                            for (table_id, deltas) in &ivm_changes {
+                                if let Some(queries) = registry.ivm_queries.get(table_id) {
+                                    for query in queries {
+                                        query.borrow_mut().on_table_change(*table_id, deltas.clone());
+                                    }
+                                }
                             }
                         }
-                    }
-                }) as Box<dyn FnOnce(JsValue)>);
 
+                        // Then flush re-query changes (O(result_set) path)
+                        let changes: HashMap<TableId, HashSet<u64>> =
+                            pending_changes.borrow_mut().drain().collect();
+                        {
+                            let registry = self_ref_clone.borrow();
+                            for (table_id, changed_ids) in changes {
+                                if let Some(queries) = registry.queries.get(&table_id) {
+                                    for query in queries {
+                                        query.borrow_mut().on_change(&changed_ids);
+                                    }
+                                }
+                            }
+                        }
+
+                        // GC: remove queries with no subscribers to prevent memory leaks
+                        {
+                            let mut registry = self_ref_clone.borrow_mut();
+                            registry.gc_dead_queries();
+                        }
+                    }));
+                }
+            }
+
+            if let Some(ref closure) = self.flush_closure {
                 let promise = js_sys::Promise::resolve(&JsValue::UNDEFINED);
-                let _ = promise.then(&closure);
-                closure.forget();
+                let _ = promise.then(closure);
             }
         }
 
@@ -276,11 +364,23 @@ impl QueryRegistry {
 
     /// Synchronous flush for testing in non-WASM environment.
     #[cfg(not(target_arch = "wasm32"))]
-    fn flush_sync(&self) {
+    fn flush_sync(&mut self) {
         *self.flush_scheduled.borrow_mut() = false;
+
+        // Flush IVM deltas
+        let ivm_changes: HashMap<TableId, Vec<Delta<Row>>> =
+            self.pending_ivm_deltas.borrow_mut().drain().collect();
+        for (table_id, deltas) in &ivm_changes {
+            if let Some(queries) = self.ivm_queries.get(table_id) {
+                for query in queries {
+                    query.borrow_mut().on_table_change(*table_id, deltas.clone());
+                }
+            }
+        }
+
+        // Flush re-query changes
         let changes: HashMap<TableId, HashSet<u64>> =
             self.pending_changes.borrow_mut().drain().collect();
-
         for (table_id, changed_ids) in changes {
             if let Some(queries) = self.queries.get(&table_id) {
                 for query in queries {
@@ -288,15 +388,29 @@ impl QueryRegistry {
                 }
             }
         }
+
+        self.gc_dead_queries();
     }
 
     /// Forces an immediate flush of all pending changes.
-    /// Useful for testing or when you need synchronous behcynos.
-    pub fn flush(&self) {
+    /// Useful for testing or when you need synchronous behavior.
+    pub fn flush(&mut self) {
         *self.flush_scheduled.borrow_mut() = false;
+
+        // Flush IVM deltas
+        let ivm_changes: HashMap<TableId, Vec<Delta<Row>>> =
+            self.pending_ivm_deltas.borrow_mut().drain().collect();
+        for (table_id, deltas) in &ivm_changes {
+            if let Some(queries) = self.ivm_queries.get(table_id) {
+                for query in queries {
+                    query.borrow_mut().on_table_change(*table_id, deltas.clone());
+                }
+            }
+        }
+
+        // Flush re-query changes
         let changes: HashMap<TableId, HashSet<u64>> =
             self.pending_changes.borrow_mut().drain().collect();
-
         for (table_id, changed_ids) in changes {
             if let Some(queries) = self.queries.get(&table_id) {
                 for query in queries {
@@ -304,11 +418,29 @@ impl QueryRegistry {
                 }
             }
         }
+
+        self.gc_dead_queries();
     }
 
-    /// Returns the number of registered queries.
+    /// Removes queries with no active subscribers from the registry.
+    /// Called after each flush to prevent memory leaks from abandoned queries.
+    fn gc_dead_queries(&mut self) {
+        for queries in self.ivm_queries.values_mut() {
+            queries.retain(|q| q.borrow().subscription_count() > 0);
+        }
+        self.ivm_queries.retain(|_, v| !v.is_empty());
+
+        for queries in self.queries.values_mut() {
+            queries.retain(|q| q.borrow().subscription_count() > 0);
+        }
+        self.queries.retain(|_, v| !v.is_empty());
+    }
+
+    /// Returns the number of registered queries (both re-query and IVM).
     pub fn query_count(&self) -> usize {
-        self.queries.values().map(|v| v.len()).sum()
+        let requery_count: usize = self.queries.values().map(|v| v.len()).sum();
+        let ivm_count: usize = self.ivm_queries.values().map(|v| v.len()).sum();
+        requery_count + ivm_count
     }
 
     /// Returns whether there are pending changes waiting to be flushed.
@@ -410,11 +542,15 @@ impl JsObservableQuery {
 
         // Create unsubscribe function
         let inner_unsub = self.inner.clone();
-        let unsubscribe = Closure::once_into_js(move || {
-            inner_unsub.borrow_mut().unsubscribe(sub_id);
-        });
-
-        unsubscribe.unchecked_into()
+        let called = Rc::new(RefCell::new(false));
+        let called_c = called.clone();
+        let unsubscribe = Closure::wrap(Box::new(move || {
+            let mut c = called_c.borrow_mut();
+            if !*c { *c = true; inner_unsub.borrow_mut().unsubscribe(sub_id); }
+        }) as Box<dyn FnMut()>);
+        let js_fn: js_sys::Function = unsubscribe.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        unsubscribe.forget();
+        js_fn
     }
 
     /// Returns the current result as a JavaScript array.
@@ -463,6 +599,184 @@ impl JsObservableQuery {
     pub fn subscription_count(&self) -> usize {
         self.inner.borrow().subscription_count()
     }
+}
+
+/// JavaScript-friendly IVM observable query wrapper.
+/// Uses DBSP-based incremental view maintenance for O(delta) updates.
+#[wasm_bindgen]
+pub struct JsIvmObservableQuery {
+    inner: Rc<RefCell<ObservableQuery>>,
+    schema: Table,
+    /// Optional projected column names.
+    projected_columns: Option<Vec<String>>,
+    /// Pre-computed binary layout for getResultBinary().
+    binary_layout: SchemaLayout,
+    /// Optional aggregate column names.
+    aggregate_columns: Option<Vec<String>>,
+}
+
+impl JsIvmObservableQuery {
+    pub(crate) fn new(
+        inner: Rc<RefCell<ObservableQuery>>,
+        schema: Table,
+        binary_layout: SchemaLayout,
+    ) -> Self {
+        Self { inner, schema, projected_columns: None, binary_layout, aggregate_columns: None }
+    }
+
+    pub(crate) fn new_with_projection(
+        inner: Rc<RefCell<ObservableQuery>>,
+        schema: Table,
+        projected_columns: Vec<String>,
+        binary_layout: SchemaLayout,
+    ) -> Self {
+        Self { inner, schema, projected_columns: Some(projected_columns), binary_layout, aggregate_columns: None }
+    }
+
+    pub(crate) fn new_with_aggregates(
+        inner: Rc<RefCell<ObservableQuery>>,
+        schema: Table,
+        aggregate_columns: Vec<String>,
+        binary_layout: SchemaLayout,
+    ) -> Self {
+        Self { inner, schema, projected_columns: None, binary_layout, aggregate_columns: Some(aggregate_columns) }
+    }
+}
+
+#[wasm_bindgen]
+impl JsIvmObservableQuery {
+    /// Subscribes to IVM query changes.
+    ///
+    /// The callback receives a delta object `{ added: Row[], removed: Row[] }`
+    /// instead of the full result set. This is the true O(delta) path —
+    /// the UI side should apply the delta to its own state.
+    ///
+    /// Use `getResult()` to get the initial full result before subscribing.
+    /// Returns an unsubscribe function.
+    pub fn subscribe(&mut self, callback: js_sys::Function) -> js_sys::Function {
+        let schema = self.schema.clone();
+        let projected_columns = self.projected_columns.clone();
+        let aggregate_columns = self.aggregate_columns.clone();
+
+        let sub_id = self.inner.borrow_mut().subscribe(move |change_set| {
+            let delta_obj = js_sys::Object::new();
+
+            // Serialize only added rows
+            let added = if let Some(ref cols) = aggregate_columns {
+                ivm_rows_to_js_array(&change_set.added, cols)
+            } else if let Some(ref cols) = projected_columns {
+                ivm_rows_to_js_array(&change_set.added, cols)
+            } else {
+                ivm_full_rows_to_js_array(&change_set.added, &schema)
+            };
+
+            // Serialize only removed rows
+            let removed = if let Some(ref cols) = aggregate_columns {
+                ivm_rows_to_js_array(&change_set.removed, cols)
+            } else if let Some(ref cols) = projected_columns {
+                ivm_rows_to_js_array(&change_set.removed, cols)
+            } else {
+                ivm_full_rows_to_js_array(&change_set.removed, &schema)
+            };
+
+            js_sys::Reflect::set(&delta_obj, &JsValue::from_str("added"), &added).ok();
+            js_sys::Reflect::set(&delta_obj, &JsValue::from_str("removed"), &removed).ok();
+
+            callback.call1(&JsValue::NULL, &delta_obj).ok();
+        });
+
+        let inner_unsub = self.inner.clone();
+        let called = Rc::new(RefCell::new(false));
+        let called_c = called.clone();
+        let unsubscribe = Closure::wrap(Box::new(move || {
+            let mut c = called_c.borrow_mut();
+            if !*c { *c = true; inner_unsub.borrow_mut().unsubscribe(sub_id); }
+        }) as Box<dyn FnMut()>);
+        let js_fn: js_sys::Function = unsubscribe.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        unsubscribe.forget();
+        js_fn
+    }
+
+    /// Returns the current result as a JavaScript array.
+    #[wasm_bindgen(js_name = getResult)]
+    pub fn get_result(&self) -> JsValue {
+        let inner = self.inner.borrow();
+        let rows = inner.result();
+        if let Some(ref cols) = self.aggregate_columns {
+            ivm_rows_to_js_array(&rows, cols)
+        } else if let Some(ref cols) = self.projected_columns {
+            ivm_rows_to_js_array(&rows, cols)
+        } else {
+            ivm_full_rows_to_js_array(&rows, &self.schema)
+        }
+    }
+
+    /// Returns the current result as a binary buffer for zero-copy access.
+    #[wasm_bindgen(js_name = getResultBinary)]
+    pub fn get_result_binary(&self) -> BinaryResult {
+        let inner = self.inner.borrow();
+        let rows = inner.result();
+        let rc_rows: Vec<Rc<Row>> = rows.into_iter().map(Rc::new).collect();
+        let mut encoder = BinaryEncoder::new(self.binary_layout.clone(), rc_rows.len());
+        encoder.encode_rows(&rc_rows);
+        BinaryResult::new(encoder.finish())
+    }
+
+    /// Returns the schema layout for decoding binary results.
+    #[wasm_bindgen(js_name = getSchemaLayout)]
+    pub fn get_schema_layout(&self) -> SchemaLayout {
+        self.binary_layout.clone()
+    }
+
+    /// Returns the number of rows in the result.
+    #[wasm_bindgen(getter)]
+    pub fn length(&self) -> usize {
+        self.inner.borrow().len()
+    }
+
+    /// Returns whether the result is empty.
+    #[wasm_bindgen(js_name = isEmpty)]
+    pub fn is_empty(&self) -> bool {
+        self.inner.borrow().is_empty()
+    }
+
+    /// Returns the number of active subscriptions.
+    #[wasm_bindgen(js_name = subscriptionCount)]
+    pub fn subscription_count(&self) -> usize {
+        self.inner.borrow().subscription_count()
+    }
+}
+
+/// Converts IVM rows (owned Row, not Rc<Row>) to a JavaScript array using projected columns.
+fn ivm_rows_to_js_array(rows: &[Row], column_names: &[String]) -> JsValue {
+    let arr = js_sys::Array::new_with_length(rows.len() as u32);
+    for (i, row) in rows.iter().enumerate() {
+        let obj = js_sys::Object::new();
+        for (col_idx, col_name) in column_names.iter().enumerate() {
+            if let Some(value) = row.get(col_idx) {
+                let js_val = value_to_js(value);
+                js_sys::Reflect::set(&obj, &JsValue::from_str(col_name), &js_val).ok();
+            }
+        }
+        arr.set(i as u32, obj.into());
+    }
+    arr.into()
+}
+
+/// Converts IVM rows (owned Row, not Rc<Row>) to a JavaScript array using full schema.
+fn ivm_full_rows_to_js_array(rows: &[Row], schema: &Table) -> JsValue {
+    let arr = js_sys::Array::new_with_length(rows.len() as u32);
+    for (i, row) in rows.iter().enumerate() {
+        let obj = js_sys::Object::new();
+        for col in schema.columns() {
+            if let Some(value) = row.get(col.index()) {
+                let js_val = value_to_js(value);
+                js_sys::Reflect::set(&obj, &JsValue::from_str(col.name()), &js_val).ok();
+            }
+        }
+        arr.set(i as u32, obj.into());
+    }
+    arr.into()
 }
 
 /// JavaScript-friendly changes stream.
@@ -526,11 +840,15 @@ impl JsChangesStream {
         });
 
         // Create unsubscribe function
-        let unsubscribe = Closure::once_into_js(move || {
-            inner.borrow_mut().unsubscribe(sub_id);
-        });
-
-        unsubscribe.unchecked_into()
+        let called = Rc::new(RefCell::new(false));
+        let called_c = called.clone();
+        let unsubscribe = Closure::wrap(Box::new(move || {
+            let mut c = called_c.borrow_mut();
+            if !*c { *c = true; inner.borrow_mut().unsubscribe(sub_id); }
+        }) as Box<dyn FnMut()>);
+        let js_fn: js_sys::Function = unsubscribe.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        unsubscribe.forget();
+        js_fn
     }
 
     /// Returns the current result.

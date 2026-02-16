@@ -12,10 +12,11 @@ This crate provides a comprehensive benchmark suite for measuring Cynos database
 2. **Storage Performance** - Row store operations, table cache
 3. **Query Execution** - Filter, project, sort, limit operations
 4. **Join Performance** - Hash join, merge join, nested loop join
-5. **Incremental Computation** - IVM delta propagation
+5. **Incremental Computation** - IVM delta propagation, materialized view
 6. **Reactive Query** - Subscription and change notification
 7. **JSONB Performance** - JSON operations and path queries
 8. **End-to-End Scenarios** - Real-world usage patterns
+9. **IVM vs Re-query Comparison** - Side-by-side correctness + performance comparison across 6 query scenarios (filter, inner join, left outer join, COUNT/SUM, MIN/MAX, filter+join)
 
 ## Running Benchmarks
 

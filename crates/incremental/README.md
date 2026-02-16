@@ -4,28 +4,30 @@ Incremental View Maintenance (IVM) for Cynos database.
 
 ## Overview
 
-This crate implements Incremental View Maintenance based on Differential Dataflow concepts. It allows query results to be updated incrementally when underlying data changes, rather than recomputing from scratch.
+This crate implements Incremental View Maintenance (IVM) based on DBSP (Database Stream Processing) theory. Instead of recomputing query results from scratch on every data change, it propagates only deltas through a dataflow graph — achieving O(|Δoutput|) complexity per update rather than O(|result_set|).
 
 ## Core Concepts
 
 - `Delta<T>`: Represents a change to data (+1 for insert, -1 for delete)
 - `DiffCollection<T>`: A collection that tracks both snapshot and pending changes
-- `DataflowNode`: Nodes in a dataflow graph representing query operations
-- `MaterializedView`: A cached query result that updates incrementally
+- `DataflowNode`: Composable nodes in a dataflow graph representing query operators (filter, map, join, aggregate)
+- `MaterializedView`: A cached query result that updates incrementally via delta propagation
 
 ## Incremental Operators
 
-- `filter_incremental`: Filters deltas based on a predicate
-- `map_incremental`: Transforms deltas using a mapper function
-- `project_incremental`: Projects specific columns from row deltas
-- `IncrementalHashJoin`: Maintains join results incrementally
-- `IncrementalCount/Sum/Avg/Min/Max`: Incremental aggregate functions
+- `filter_incremental`: Filters deltas based on a predicate — O(|Δinput|)
+- `map_incremental`: Transforms deltas using a mapper function — O(|Δinput|)
+- `project_incremental`: Projects specific columns from row deltas — O(|Δinput|)
+- `IncrementalHashJoin`: Maintains join results incrementally with hash-indexed state — O(|Δinput| × |matching keys|)
+- `IncrementalCount/Sum/Avg`: Incremental aggregate functions — O(|Δinput|) per group
+- `IncrementalMin/Max`: Incremental min/max with fallback re-scan on current-extremum deletion
 
 ## Features
 
 - `#![no_std]` compatible
-- Efficient delta propagation through dataflow graphs
+- DBSP-based delta propagation through composable dataflow graphs
 - Support for complex query patterns (filter, map, join, aggregate)
+- Composable operators: `Filter → Join → Aggregate` pipelines work incrementally end-to-end
 
 ## Usage
 

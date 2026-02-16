@@ -52,9 +52,9 @@ pub mod materialize;
 pub mod operators;
 
 pub use collection::{ConsolidatedCollection, DiffCollection};
-pub use dataflow::{AggregateType, ColumnId, DataflowGraph, DataflowNode, KeyExtractorFn, NodeId, TableId};
+pub use dataflow::{AggregateType, ColumnId, DataflowGraph, DataflowNode, JoinType, KeyExtractorFn, NodeId, TableId};
 pub use delta::{Delta, DeltaBatch, DeltaBatchExt};
-pub use materialize::{JoinState, MaterializedView, MaterializedViewBuilder};
+pub use materialize::{AggregateState, GroupAggregateState, JoinState, MaterializedView, MaterializedViewBuilder};
 pub use operators::{
     filter_incremental, map_incremental, project_incremental, IncrementalAvg, IncrementalCount,
     IncrementalHashJoin, IncrementalMax, IncrementalMin, IncrementalSum,

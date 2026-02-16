@@ -49,6 +49,22 @@ impl ChangeSet {
         changes
     }
 
+    /// Creates a change set from deltas without computing current_result.
+    ///
+    /// This is the O(delta) path — avoids the expensive result() clone.
+    /// Consumers that only need added/removed should use this.
+    pub fn from_deltas_only(deltas: &[Delta<Row>]) -> Self {
+        let mut changes = Self::new();
+        for delta in deltas {
+            if delta.is_insert() {
+                changes.added.push(delta.data.clone());
+            } else if delta.is_delete() {
+                changes.removed.push(delta.data.clone());
+            }
+        }
+        changes
+    }
+
     /// Creates a change set representing an initial result set.
     ///
     /// All rows are treated as additions.

@@ -972,6 +972,95 @@ export const JsDataType = Object.freeze({
 });
 
 /**
+ * JavaScript-friendly IVM observable query wrapper.
+ * Uses DBSP-based incremental view maintenance for O(delta) updates.
+ */
+export class JsIvmObservableQuery {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(JsIvmObservableQuery.prototype);
+        obj.__wbg_ptr = ptr;
+        JsIvmObservableQueryFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        JsIvmObservableQueryFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_jsivmobservablequery_free(ptr, 0);
+    }
+    /**
+     * Returns the current result as a JavaScript array.
+     * @returns {any}
+     */
+    getResult() {
+        const ret = wasm.jsivmobservablequery_getResult(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * Returns the current result as a binary buffer for zero-copy access.
+     * @returns {BinaryResult}
+     */
+    getResultBinary() {
+        const ret = wasm.jsivmobservablequery_getResultBinary(this.__wbg_ptr);
+        return BinaryResult.__wrap(ret);
+    }
+    /**
+     * Returns the schema layout for decoding binary results.
+     * @returns {SchemaLayout}
+     */
+    getSchemaLayout() {
+        const ret = wasm.jsivmobservablequery_getSchemaLayout(this.__wbg_ptr);
+        return SchemaLayout.__wrap(ret);
+    }
+    /**
+     * Returns whether the result is empty.
+     * @returns {boolean}
+     */
+    isEmpty() {
+        const ret = wasm.jsivmobservablequery_isEmpty(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Returns the number of rows in the result.
+     * @returns {number}
+     */
+    get length() {
+        const ret = wasm.jsivmobservablequery_length(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * Subscribes to IVM query changes.
+     *
+     * The callback receives a delta object `{ added: Row[], removed: Row[] }`
+     * instead of the full result set. This is the true O(delta) path —
+     * the UI side should apply the delta to its own state.
+     *
+     * Use `getResult()` to get the initial full result before subscribing.
+     * Returns an unsubscribe function.
+     * @param {Function} callback
+     * @returns {Function}
+     */
+    subscribe(callback) {
+        const ret = wasm.jsivmobservablequery_subscribe(this.__wbg_ptr, addHeapObject(callback));
+        return takeObject(ret);
+    }
+    /**
+     * Returns the number of active subscriptions.
+     * @returns {number}
+     */
+    subscriptionCount() {
+        const ret = wasm.jsivmobservablequery_subscriptionCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) JsIvmObservableQuery.prototype[Symbol.dispose] = JsIvmObservableQuery.prototype.free;
+
+/**
  * JavaScript-friendly observable query wrapper.
  * Uses re-query strategy for optimal performance with indexes.
  */
@@ -1966,6 +2055,30 @@ export class SelectBuilder {
         return SelectBuilder.__wrap(ret);
     }
     /**
+     * Creates an IVM-based observable query using DBSP incremental dataflow.
+     *
+     * Unlike `observe()` which re-executes the full query on every change (O(result_set)),
+     * `trace()` compiles the query into a dataflow graph and propagates only deltas (O(delta)).
+     *
+     * Returns an error if the query is not incrementalizable (e.g. contains ORDER BY / LIMIT).
+     * @returns {JsIvmObservableQuery}
+     */
+    trace() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.selectbuilder_trace(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return JsIvmObservableQuery.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Sets the WHERE clause.
      * @param {Expr} predicate
      * @returns {SelectBuilder}
@@ -2203,7 +2316,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_1564(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_1730(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -2300,12 +2413,12 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_61, __wasm_bindgen_func_elem_573);
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_61, __wasm_bindgen_func_elem_595);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 127, function: Function { arguments: [Externref], shim_idx: 128, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1376, __wasm_bindgen_func_elem_1383);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 162, function: Function { arguments: [Externref], shim_idx: 163, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_1541, __wasm_bindgen_func_elem_1548);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000003: function(arg0) {
@@ -2336,16 +2449,16 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_573(arg0, arg1) {
-    wasm.__wasm_bindgen_func_elem_573(arg0, arg1);
+function __wasm_bindgen_func_elem_595(arg0, arg1) {
+    wasm.__wasm_bindgen_func_elem_595(arg0, arg1);
 }
 
-function __wasm_bindgen_func_elem_1383(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_1383(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_1548(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_1548(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_1564(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_1564(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_1730(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_1730(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const BinaryResultFinalization = (typeof FinalizationRegistry === 'undefined')
@@ -2372,6 +2485,9 @@ const InsertBuilderFinalization = (typeof FinalizationRegistry === 'undefined')
 const JsChangesStreamFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_jschangesstream_free(ptr >>> 0, 1));
+const JsIvmObservableQueryFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_jsivmobservablequery_free(ptr >>> 0, 1));
 const JsObservableQueryFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_jsobservablequery_free(ptr >>> 0, 1));
@@ -2653,7 +2769,7 @@ async function __wbg_init(module_or_path) {
     }
 
     if (module_or_path === undefined) {
-        module_or_path = new URL('cynos_database_bg.wasm', import.meta.url);
+        module_or_path = new URL('cynos.wasm', import.meta.url);
     }
     const imports = __wbg_get_imports();
 

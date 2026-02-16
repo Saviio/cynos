@@ -1,4 +1,7 @@
 //! Dataflow node definitions.
+//!
+//! Based on DBSP (Database Stream Processing) theory, each node represents
+//! a lifted relational operator that processes Z-set deltas incrementally.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -29,9 +32,20 @@ pub enum AggregateType {
     Max,
 }
 
+/// Join type for dataflow join nodes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    LeftOuter,
+    RightOuter,
+    FullOuter,
+}
+
 /// A node in the dataflow graph.
 ///
 /// Each node represents an operation that can process incremental changes.
+/// Based on DBSP, each operator is "lifted" to work on Z-sets (multisets with
+/// integer multiplicities), enabling automatic incrementalization.
 pub enum DataflowNode {
     /// Source table - entry point for changes
     Source { table_id: TableId },
@@ -54,15 +68,20 @@ pub enum DataflowNode {
         mapper: MapperFn,
     },
 
-    /// Join operation - combines two inputs
+    /// Join operation - combines two inputs.
+    /// Supports Inner, Left, Right, and Full Outer joins.
+    /// Outer joins are decomposed as: LEFT JOIN = INNER JOIN ∪ ANTIJOIN
     Join {
         left: Box<DataflowNode>,
         right: Box<DataflowNode>,
         left_key: KeyExtractorFn,
         right_key: KeyExtractorFn,
+        join_type: JoinType,
     },
 
-    /// Aggregate operation - computes aggregates
+    /// Aggregate operation - computes aggregates per group.
+    /// Uses DBSP indexed Z-set approach: group by key partitions the Z-set,
+    /// then each partition is aggregated incrementally.
     Aggregate {
         input: Box<DataflowNode>,
         group_by: Vec<ColumnId>,
@@ -103,6 +122,39 @@ impl DataflowNode {
         DataflowNode::Map {
             input: Box::new(input),
             mapper: Box::new(mapper),
+        }
+    }
+
+    /// Creates an inner join node (backward compatible).
+    pub fn join(
+        left: DataflowNode,
+        right: DataflowNode,
+        left_key: KeyExtractorFn,
+        right_key: KeyExtractorFn,
+    ) -> Self {
+        DataflowNode::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key,
+            right_key,
+            join_type: JoinType::Inner,
+        }
+    }
+
+    /// Creates a join node with explicit join type.
+    pub fn join_with_type(
+        left: DataflowNode,
+        right: DataflowNode,
+        left_key: KeyExtractorFn,
+        right_key: KeyExtractorFn,
+        join_type: JoinType,
+    ) -> Self {
+        DataflowNode::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            left_key,
+            right_key,
+            join_type,
         }
     }
 

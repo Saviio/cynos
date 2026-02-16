@@ -341,6 +341,7 @@ mod tests {
             right: Box::new(DataflowNode::source(2)),
             left_key: Box::new(|_| vec![]),
             right_key: Box::new(|_| vec![]),
+            join_type: cynos_incremental::JoinType::Inner,
         };
 
         let query = Rc::new(RefCell::new(ObservableQuery::new(dataflow)));

@@ -4,20 +4,19 @@ Reactive query system for Cynos database.
 
 ## Overview
 
-This crate implements a reactive query system that allows subscribing to query result changes. When underlying data changes, subscribers are notified with the incremental changes (additions, removals, modifications).
+This crate implements the reactive query layer that bridges `cynos-incremental` (DBSP dataflow) with subscriber notifications. It wraps `MaterializedView` into `ObservableQuery`, managing subscriptions and delivering `ChangeSet` deltas to callbacks.
 
 ## Core Concepts
 
-- `ChangeSet`: Represents changes to query results (added, removed, modified rows)
-- `ObservableQuery`: A query that tracks changes and notifies subscribers
-- `SubscriptionManager`: Manages subscriptions to query changes
-- `QueryRegistry`: Routes table changes to dependent queries
+- `ChangeSet`: Delta output from IVM — contains `added` and `removed` rows after a table change
+- `ObservableQuery`: Wraps a `MaterializedView`, manages subscriptions, and delivers `ChangeSet` to callbacks on each table change
+- `QueryRegistry`: Routes table-level DML events to dependent `ObservableQuery` instances; supports both IVM and re-query paths
 
-## Key Features
+## Key APIs
 
-- `observe()`: Subscribe to query changes with a callback
-- `changes()`: Get an iterator that yields initial result + incremental changes
-- Automatic dependency tracking between queries and tables
+- `ObservableQuery::subscribe(callback)`: Register a callback that receives `ChangeSet` on each delta propagation
+- `ObservableQuery::on_table_change(table_id, deltas)`: Feed deltas from DML into the dataflow, propagate, and notify subscribers
+- `ObservableQuery::result()`: Get the current materialized result set
 
 ## Features
 
@@ -29,9 +28,10 @@ This crate implements a reactive query system that allows subscribing to query r
 
 ```rust
 use cynos_reactive::{ObservableQuery, ChangeSet};
-use cynos_incremental::DataflowNode;
+use cynos_incremental::{DataflowNode, Delta};
+use cynos_core::{Row, Value};
 
-// Create an observable query
+// Create an observable query with a filter dataflow
 let dataflow = DataflowNode::filter(
     DataflowNode::source(1),
     |row| row.get(1).and_then(|v| v.as_i64()).map(|age| age > 18).unwrap_or(false)
@@ -39,15 +39,14 @@ let dataflow = DataflowNode::filter(
 
 let mut query = ObservableQuery::new(dataflow);
 
-// Subscribe to changes (observe pattern)
-query.subscribe(|changes| {
-    println!("Added: {}, Removed: {}", changes.added.len(), changes.removed.len());
+// Subscribe to delta changes
+query.subscribe(|change_set: &ChangeSet| {
+    println!("Added: {}, Removed: {}", change_set.added.len(), change_set.removed.len());
 });
 
-// Or use the changes() API for initial + incremental
-let mut changes = query.changes();
-let initial = changes.initial(); // First push: initial result
-let delta_changes = changes.process(1, deltas); // Subsequent: incremental changes
+// Feed a table change — delta propagates through dataflow, subscribers notified
+let deltas = vec![Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(25)]))];
+query.on_table_change(1, deltas);
 ```
 
 ## License

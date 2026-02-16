@@ -10,9 +10,11 @@ This crate provides the public API for the Cynos in-memory database, including W
 
 - `Database`: Main entry point for database operations
 - `TableBuilder`: Builder for creating table schemas
-- `SelectBuilder`: Query builder for SELECT statements
+- `SelectBuilder`: Query builder for SELECT statements with reactive query support
 - `InsertBuilder`, `UpdateBuilder`, `DeleteBuilder`: DML builders
-- `JsObservableQuery`: Observable query with subscription support
+- `JsObservableQuery`: Re-query observable — re-executes cached physical plan on each change, O(result_set)
+- `JsIvmObservableQuery`: IVM observable — propagates DBSP deltas through dataflow, O(Δoutput)
+- `JsChangesStream`: Convenience wrapper over re-query with immediate initial emission
 
 ## Features
 
@@ -47,15 +49,31 @@ const results = await db.select()
 
 ## Reactive Queries
 
+Two reactive query strategies with explicit API:
+
 ```javascript
-const query = db.select()
+// IVM path — O(Δoutput), delta-based via DBSP dataflow
+// Only supports incrementalizable operators (no ORDER BY / LIMIT)
+const ivm = db.select('*')
   .from('users')
   .where(col('age').gt(18))
-  .observe();
+  .trace();
 
-query.subscribe((changes) => {
-  console.log('Added:', changes.added);
-  console.log('Removed:', changes.removed);
+ivm.subscribe((delta) => {
+  console.log('Added:', delta.added);   // only new rows
+  console.log('Removed:', delta.removed); // only removed rows
+});
+
+// Re-query path — O(result_set), re-executes full query on each change
+// Supports all operators including ORDER BY / LIMIT
+const requery = db.select('*')
+  .from('users')
+  .where(col('age').gt(18))
+  .orderBy('name')
+  .changes();
+
+requery.subscribe((rows) => {
+  console.log('Current result:', rows); // full result set
 });
 ```
 
