@@ -453,7 +453,7 @@ export default function IvmDemo() {
               </span>
             </div>
             <p className="px-4 py-2 text-[10px] text-white/30 border-b border-white/5">
-              Showing {stocks.length} of {matchCount} matching rows. Re-query fetches all {matchCount} rows on every change (no LIMIT).
+              Showing {stocks.length} of {matchCount} matching rows. Full dataset will be queried, all {matchCount} rows on every change (no LIMIT).
             </p>
             <div className="max-h-[400px] overflow-auto">
               <table className="w-full">
