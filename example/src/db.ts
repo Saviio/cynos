@@ -311,3 +311,19 @@ export async function createStockReQueryQuery(priceThreshold?: number): Promise<
   }
   return query.observe()
 }
+
+// Clear all stocks and reset count
+export async function clearAllStocks(): Promise<void> {
+  const database = await getDatabase()
+  await database.delete('stocks').exec()
+  stockCount = 0
+}
+
+// Delete stocks keeping only first N rows
+export async function deleteStocksKeepFirst(keepCount: number): Promise<void> {
+  const database = await getDatabase()
+  if (stockCount > keepCount) {
+    await database.delete('stocks').where(col('id').gt(keepCount)).exec()
+    stockCount = keepCount
+  }
+}

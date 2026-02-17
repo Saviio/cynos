@@ -6,6 +6,8 @@ import {
   createStockIvmQuery,
   createStockReQueryQuery,
   insertStocks,
+  clearAllStocks,
+  deleteStocksKeepFirst,
 } from './db'
 import { col } from '@cynos/core'
 import { Button } from '@/components/ui/button'
@@ -71,16 +73,18 @@ const fmtVal = (col: keyof Stock, value: Stock[keyof Stock]) => {
 }
 
 export default function IvmDemo() {
-  const [priceThreshold, setPriceThreshold] = useState('500')
+  const [priceThreshold, setPriceThreshold] = useState('100')
   const [totalCount, setTotalCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [inserting, setInserting] = useState(false)
   const [benchRunning, setBenchRunning] = useState(false)
   const [benchDuration, setBenchDuration] = useState('3')
+  const [benchDataScale, setBenchDataScale] = useState('10000')
   const [currentMode, setCurrentMode] = useState<Mode | null>(null)
   const [liveUps, setLiveUps] = useState(0)
   const [liveNotifications, setLiveNotifications] = useState(0)
   const [results, setResults] = useState<BenchResult[]>([])
+  const [benchMatchCount, setBenchMatchCount] = useState(0)
 
   const [stocks, setStocks] = useState<Stock[]>([])
   const [changedCells, setChangedCells] = useState<Set<string>>(new Set())
@@ -319,23 +323,52 @@ export default function IvmDemo() {
     setBenchRunning(true)
     setResults([])
 
+    // Step 1: Clear table and prepare 100k rows
+    unsubLiveRef.current?.()
+    unsubLiveRef.current = null
+    stockMapRef.current.clear()
+    sortedCacheRef.current = []
+    setStocks([])
+
     setCurrentMode('ivm')
     setLiveUps(0)
     setLiveNotifications(0)
+
+    await clearAllStocks()
+    await insertStocks(Number(benchDataScale))
+    setTotalCount(getStockCount())
+
+    // Step 2: Subscribe to live updates
+    await subscribeLive()
+
+    // Record matching rows count for results display
+    setBenchMatchCount(stockMapRef.current.size)
+
+    // Step 3: Run IVM benchmark
     const ivmResult = await runBench('ivm', Number(benchDuration))
     setResults(r => [...r, ivmResult])
 
     await new Promise(r => setTimeout(r, 500))
 
+    // Step 4: Run Re-query benchmark
     setCurrentMode('requery')
     setLiveUps(0)
     setLiveNotifications(0)
     const reqResult = await runBench('requery', Number(benchDuration))
     setResults(r => [...r, reqResult])
 
+    // Step 5: Cleanup - keep only 100 rows
+    unsubLiveRef.current?.()
+    unsubLiveRef.current = null
+    await deleteStocksKeepFirst(100)
+    setTotalCount(getStockCount())
+    stockMapRef.current.clear()
+    sortedCacheRef.current = []
+    await subscribeLive()
+
     setCurrentMode(null)
     setBenchRunning(false)
-  }, [runBench, benchDuration])
+  }, [runBench, benchDuration, benchDataScale, subscribeLive])
 
   const handleInsert = async (count: number) => {
     setInserting(true)
@@ -507,6 +540,18 @@ export default function IvmDemo() {
                   </SelectContent>
                 </Select>
 
+                <Select value={benchDataScale} onValueChange={setBenchDataScale} disabled={benchRunning}>
+                  <SelectTrigger className="w-[120px] uppercase text-xs tracking-wider">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="100">100 ROWS</SelectItem>
+                    <SelectItem value="2000">2K ROWS</SelectItem>
+                    <SelectItem value="10000">10K ROWS</SelectItem>
+                    <SelectItem value="100000">100K ROWS</SelectItem>
+                  </SelectContent>
+                </Select>
+
                 <Button
                   onClick={handleRunBench}
                   disabled={benchRunning}
@@ -518,12 +563,12 @@ export default function IvmDemo() {
                   {benchRunning ? (
                     <>
                       <Loader2 className="w-3 h-3 animate-spin" />
-                      {currentMode === 'ivm' ? 'IVM...' : 'RE-QUERY...'}
+                      {currentMode === 'ivm' ? 'IVM...' : currentMode === 'requery' ? 'RE-QUERY...' : 'PREPARING...'}
                     </>
                   ) : (
                     <>
                       <Play className="w-3 h-3" />
-                      RUN BENCHMARK
+                      RUN COMPARISON
                     </>
                   )}
                 </Button>
@@ -603,6 +648,9 @@ export default function IvmDemo() {
                   </div>
                   <div className="text-xs text-white/30 mt-2">
                     {ivmResult.ups.toLocaleString()} vs {reqResult.ups.toLocaleString()} UPS
+                  </div>
+                  <div className="text-[10px] text-white/20 mt-3">
+                    Data scale: {benchMatchCount.toLocaleString()} matching rows
                   </div>
                 </div>
               )}

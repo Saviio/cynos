@@ -84,7 +84,7 @@ export default function App() {
 
   const [liveEnabled, setLiveEnabled] = useState(false)
   const [autoUpdate, setAutoUpdate] = useState(false)
-  const [batchSize, setBatchSize] = useState('10')
+  const [batchSize, setBatchSize] = useState('50')
   const [highlightedCells, setHighlightedCells] = useState<Set<CellKey>>(new Set())
   const [perfResults, setPerfResults] = useState<PerfResult[] | null>(null)
   const [perfRunning, setPerfRunning] = useState(false)
