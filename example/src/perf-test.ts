@@ -200,8 +200,12 @@ export async function runPerfTest() {
   const testConfigs = [
     { rows: 1000, batch: 1 },
     { rows: 1000, batch: 10 },
+    { rows: 1000, batch: 50 },
+    { rows: 1000, batch: 100 },
     { rows: 100000, batch: 1 },
     { rows: 100000, batch: 10 },
+    { rows: 100000, batch: 50 },
+    { rows: 100000, batch: 100 },
   ]
 
   console.log('\n--- Test 1: Raw Update (No Live Query) ---')

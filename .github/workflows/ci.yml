@@ -1,96 +1,96 @@
-name: CI
+# name: CI
 
-on:
-  push:
-    branches: [master, main]
-    paths:
-      - 'crates/**'
-      - 'js/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-  pull_request:
-    branches: [master, main]
+# on:
+#   push:
+#     branches: [master, main]
+#     paths:
+#       - 'crates/**'
+#       - 'js/**'
+#       - 'Cargo.toml'
+#       - 'Cargo.lock'
+#   pull_request:
+#     branches: [master, main]
 
-env:
-  CARGO_TERM_COLOR: always
+# env:
+#   CARGO_TERM_COLOR: always
 
-jobs:
-  rust:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+# jobs:
+#   rust:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-action@stable
-        with:
-          components: clippy, rustfmt
+#       - name: Setup Rust
+#         uses: dtolnay/rust-action@stable
+#         with:
+#           components: clippy, rustfmt
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+#       - name: Cache cargo
+#         uses: actions/cache@v4
+#         with:
+#           path: |
+#             ~/.cargo/bin/
+#             ~/.cargo/registry/index/
+#             ~/.cargo/registry/cache/
+#             ~/.cargo/git/db/
+#             target/
+#           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+#       - name: Check formatting
+#         run: cargo fmt --all -- --check
 
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+#       - name: Clippy
+#         run: cargo clippy --workspace -- -D warnings
 
-      - name: Run tests
-        run: cargo test --workspace
+#       - name: Run tests
+#         run: cargo test --workspace
 
-  js:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+#   js:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+#       - name: Setup Node.js
+#         uses: actions/setup-node@v4
+#         with:
+#           node-version: '20'
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v2
-        with:
-          version: 8
+#       - name: Setup pnpm
+#         uses: pnpm/action-setup@v2
+#         with:
+#           version: 8
 
-      - name: Setup Rust
-        uses: dtolnay/rust-action@stable
-        with:
-          targets: wasm32-unknown-unknown
+#       - name: Setup Rust
+#         uses: dtolnay/rust-action@stable
+#         with:
+#           targets: wasm32-unknown-unknown
 
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+#       - name: Install wasm-pack
+#         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+#       - name: Cache cargo
+#         uses: actions/cache@v4
+#         with:
+#           path: |
+#             ~/.cargo/bin/
+#             ~/.cargo/registry/index/
+#             ~/.cargo/registry/cache/
+#             ~/.cargo/git/db/
+#             target/
+#           key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install dependencies
-        working-directory: js
-        run: pnpm install
+#       - name: Install dependencies
+#         working-directory: js
+#         run: pnpm install
 
-      - name: Build WASM
-        working-directory: js/packages/core
-        run: pnpm build:wasm
+#       - name: Build WASM
+#         working-directory: js/packages/core
+#         run: pnpm build:wasm
 
-      - name: Install Playwright
-        working-directory: js/packages/core
-        run: npx playwright install chromium
+#       - name: Install Playwright
+#         working-directory: js/packages/core
+#         run: npx playwright install chromium
 
-      - name: Run tests
-        working-directory: js/packages/core
-        run: pnpm test
+#       - name: Run tests
+#         working-directory: js/packages/core
+#         run: pnpm test

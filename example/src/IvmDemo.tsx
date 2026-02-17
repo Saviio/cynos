@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, memo } from 'react'
 import {
   type Stock,
   getDatabase,
@@ -8,11 +8,13 @@ import {
   insertStocks,
 } from './db'
 import { col } from '@cynos/core'
+import { Button } from '@/components/ui/button'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Loader2, Play, Square, Database, Zap } from 'lucide-react'
+import { cn } from '@/lib/utils'
 
 const PRICE_THRESHOLDS = [100, 200, 300, 500, 700, 900]
-
 const DISPLAY_COLS: (keyof Stock)[] = ['id', 'symbol', 'name', 'price', 'change', 'volume', 'high', 'low', 'pe']
-
 const DISPLAY_LIMIT = 100
 
 type Mode = 'ivm' | 'requery'
@@ -25,43 +27,80 @@ interface BenchResult {
   notifications: number
 }
 
-type CellKey = string
+// Memoized table row for better performance
+const StockRow = memo(function StockRow({
+  stock,
+  changedCells
+}: {
+  stock: Stock
+  changedCells: Set<string>
+}) {
+  return (
+    <tr className="border-b border-white/5 hover:bg-white/[0.02]">
+      {DISPLAY_COLS.map(c => {
+        const key = `${stock.id}-${c}`
+        const isChanged = changedCells.has(key)
+        return (
+          <td
+            key={c}
+            className={cn(
+              "font-mono text-xs whitespace-nowrap py-2 px-4",
+              c === 'id' || c === 'symbol' || c === 'name' ? 'text-left' : 'text-right',
+              c === 'id' && 'text-white/30',
+              c === 'symbol' && 'font-medium',
+              c === 'name' && 'text-white/50',
+              isChanged && 'animate-cell-flash'
+            )}
+          >
+            {fmtVal(c, stock[c])}
+          </td>
+        )
+      })}
+    </tr>
+  )
+})
+
+const fmtVal = (col: keyof Stock, value: Stock[keyof Stock]) => {
+  if (col === 'price' || col === 'high' || col === 'low')
+    return `$${(value as number).toFixed(2)}`
+  if (col === 'change')
+    return (value as number) >= 0 ? `+${(value as number).toFixed(2)}` : (value as number).toFixed(2)
+  if (col === 'volume')
+    return (value as number).toLocaleString()
+  return String(value)
+}
 
 export default function IvmDemo() {
-  const [priceThreshold, setPriceThreshold] = useState(500)
+  const [priceThreshold, setPriceThreshold] = useState('500')
   const [totalCount, setTotalCount] = useState(0)
   const [loading, setLoading] = useState(true)
   const [inserting, setInserting] = useState(false)
   const [benchRunning, setBenchRunning] = useState(false)
-  const [benchDuration, setBenchDuration] = useState(3)
+  const [benchDuration, setBenchDuration] = useState('3')
   const [currentMode, setCurrentMode] = useState<Mode | null>(null)
   const [liveUps, setLiveUps] = useState(0)
   const [liveNotifications, setLiveNotifications] = useState(0)
   const [results, setResults] = useState<BenchResult[]>([])
 
-  // Live data state (delta-driven)
   const [stocks, setStocks] = useState<Stock[]>([])
-  const changedCellsRef = useRef<Map<CellKey, number>>(new Map())
+  const [changedCells, setChangedCells] = useState<Set<string>>(new Set())
   const stockMapRef = useRef<Map<number, Stock>>(new Map())
-  // Sorted display cache — only re-sort when rows are added/removed, not on updates
   const sortedCacheRef = useRef<Stock[]>([])
   const unsubLiveRef = useRef<(() => void) | null>(null)
   const highlightCounter = useRef(0)
+  const pendingChangedKeys = useRef<string[]>([])
 
-  // Apply delta to stockMap, detect changed cells, update state
   const applyDelta = useCallback((delta: { added: Stock[], removed: Stock[] }) => {
     const map = stockMapRef.current
     const tick = ++highlightCounter.current
     let needResort = false
     const changedKeys: string[] = []
 
-    // Build removed lookup (update = delete old + insert new with same id)
     const removedById = new Map<number, Stock>()
     for (const row of delta.removed) {
       removedById.set(row.id, row)
     }
 
-    // Pure deletes (not part of an update)
     for (const row of delta.removed) {
       if (!delta.added.some(a => a.id === row.id)) {
         map.delete(row.id)
@@ -69,37 +108,28 @@ export default function IvmDemo() {
       }
     }
 
-    // Process added
     for (const row of delta.added) {
       const prev = removedById.get(row.id)
       if (prev) {
-        // Update: diff fields
         for (const c of DISPLAY_COLS) {
           if (prev[c] !== row[c]) {
-            const k = `${row.id}-${c}`
-            changedCellsRef.current.set(k, tick)
-            changedKeys.push(k)
+            changedKeys.push(`${row.id}-${c}`)
           }
         }
       } else {
-        // Truly new row
         if (!map.has(row.id)) {
           needResort = true
           for (const c of DISPLAY_COLS) {
-            const k = `${row.id}-${c}`
-            changedCellsRef.current.set(k, tick)
-            changedKeys.push(k)
+            changedKeys.push(`${row.id}-${c}`)
           }
         }
       }
       map.set(row.id, row)
     }
 
-    // Only re-sort when membership changes; otherwise just patch the cached slice
     if (needResort || sortedCacheRef.current.length === 0) {
       sortedCacheRef.current = Array.from(map.values()).sort((a, b) => a.id - b.id).slice(0, DISPLAY_LIMIT)
     } else {
-      // Patch in-place: update rows that are in the display window
       const display = sortedCacheRef.current
       for (let i = 0; i < display.length; i++) {
         const fresh = map.get(display[i].id)
@@ -107,35 +137,36 @@ export default function IvmDemo() {
       }
     }
 
-    setStocks([...sortedCacheRef.current])
+    // Batch state updates
+    setStocks(sortedCacheRef.current.slice())
+
     if (changedKeys.length > 0) {
+      pendingChangedKeys.current.push(...changedKeys)
+      setChangedCells(new Set(pendingChangedKeys.current))
+
       setTimeout(() => {
-        for (const k of changedKeys) {
-          if (changedCellsRef.current.get(k) === tick) changedCellsRef.current.delete(k)
-        }
+        pendingChangedKeys.current = pendingChangedKeys.current.filter(k => !changedKeys.includes(k))
+        setChangedCells(new Set(pendingChangedKeys.current))
       }, 400)
     }
   }, [])
 
-  // Subscribe to live IVM query for the selected price threshold
   const subscribeLive = useCallback(async () => {
     unsubLiveRef.current?.()
     unsubLiveRef.current = null
     stockMapRef.current.clear()
     sortedCacheRef.current = []
 
-    const obs = await createStockIvmQuery(priceThreshold)
+    const obs = await createStockIvmQuery(Number(priceThreshold))
     const initial = obs.getResult() as Stock[]
     for (const row of initial) stockMapRef.current.set(row.id, row)
     sortedCacheRef.current = Array.from(stockMapRef.current.values()).sort((a, b) => a.id - b.id).slice(0, DISPLAY_LIMIT)
-    setStocks([...sortedCacheRef.current])
+    setStocks(sortedCacheRef.current.slice())
 
-    // Throttle delta processing to once per animation frame
     let pendingDelta: { added: Stock[], removed: Stock[] } | null = null
     let rafId: number | null = null
 
     const unsub = obs.subscribe((delta: { added: Stock[], removed: Stock[] }) => {
-      // Merge into pending delta — use for..of to avoid spread allocation
       if (pendingDelta) {
         for (const r of delta.added) pendingDelta.added.push(r)
         for (const r of delta.removed) pendingDelta.removed.push(r)
@@ -168,7 +199,6 @@ export default function IvmDemo() {
     return () => { unsubLiveRef.current?.() }
   }, [])
 
-  // Re-subscribe when price threshold changes
   useEffect(() => {
     if (!loading) subscribeLive()
   }, [priceThreshold])
@@ -178,8 +208,6 @@ export default function IvmDemo() {
   const [updating, setUpdating] = useState(false)
   const [updateUps, setUpdateUps] = useState(0)
 
-  // Continuous random updates for live table demo
-  // Uses 16ms tight loop (like runBench) + setTimeout yield for smooth UI
   const startUpdates = useCallback(async () => {
     if (updatingRef.current) return
     updatingRef.current = true
@@ -207,15 +235,13 @@ export default function IvmDemo() {
         await db.update('stocks').set(field, val).where(col('id').eq(id)).exec()
         windowUpdates++
       }
-      // Sliding window UPS: reset every 1s for stable instantaneous reading
       const now = performance.now()
       const windowElapsed = now - windowStart
-      if (windowElapsed >= 1000) {
+      if (windowElapsed >= 500) { // Update UI every 500ms instead of 1000ms
         setUpdateUps(Math.round(windowUpdates / (windowElapsed / 1000)))
         windowUpdates = 0
         windowStart = now
       }
-      // Yield to event loop for UI rendering
       await new Promise(r => setTimeout(r, 0))
     }
     setUpdating(false)
@@ -234,17 +260,15 @@ export default function IvmDemo() {
 
     let unsub: (() => void) | null = null
     if (mode === 'ivm') {
-      const obs = await createStockIvmQuery(priceThreshold)
+      const obs = await createStockIvmQuery(Number(priceThreshold))
       const u = obs.subscribe((_delta: { added: Stock[], removed: Stock[] }) => {
         notifications++
-        setLiveNotifications(notifications)
       })
       unsub = () => u()
     } else {
-      const obs = await createStockReQueryQuery(priceThreshold)
+      const obs = await createStockReQueryQuery(Number(priceThreshold))
       const u = obs.subscribe((_data: Stock[]) => {
         notifications++
-        setLiveNotifications(notifications)
       })
       unsub = () => u()
     }
@@ -253,6 +277,7 @@ export default function IvmDemo() {
     const startTime = performance.now()
     const endTime = startTime + durationSec * 1000
     stopRef.current = false
+    let lastUiUpdate = startTime
 
     while (performance.now() < endTime && !stopRef.current) {
       const batchStart = performance.now()
@@ -271,8 +296,16 @@ export default function IvmDemo() {
         await db.update('stocks').set(field, val).where(col('id').eq(id)).exec()
         totalUpdates++
       }
-      const elapsed = performance.now() - startTime
-      setLiveUps(Math.round(totalUpdates / (elapsed / 1000)))
+
+      // Update UI less frequently - every 200ms
+      const now = performance.now()
+      if (now - lastUiUpdate >= 200) {
+        const elapsed = now - startTime
+        setLiveUps(Math.round(totalUpdates / (elapsed / 1000)))
+        setLiveNotifications(notifications)
+        lastUiUpdate = now
+      }
+
       await new Promise(r => setTimeout(r, 0))
     }
 
@@ -282,7 +315,6 @@ export default function IvmDemo() {
   }, [priceThreshold])
 
   const handleRunBench = useCallback(async () => {
-    // Stop live updates during benchmark
     updatingRef.current = false
     setBenchRunning(true)
     setResults([])
@@ -290,7 +322,7 @@ export default function IvmDemo() {
     setCurrentMode('ivm')
     setLiveUps(0)
     setLiveNotifications(0)
-    const ivmResult = await runBench('ivm', benchDuration)
+    const ivmResult = await runBench('ivm', Number(benchDuration))
     setResults(r => [...r, ivmResult])
 
     await new Promise(r => setTimeout(r, 500))
@@ -298,7 +330,7 @@ export default function IvmDemo() {
     setCurrentMode('requery')
     setLiveUps(0)
     setLiveNotifications(0)
-    const reqResult = await runBench('requery', benchDuration)
+    const reqResult = await runBench('requery', Number(benchDuration))
     setResults(r => [...r, reqResult])
 
     setCurrentMode(null)
@@ -307,149 +339,277 @@ export default function IvmDemo() {
 
   const handleInsert = async (count: number) => {
     setInserting(true)
-    // Pause live subscription during bulk insert to avoid per-batch dataflow overhead
     unsubLiveRef.current?.()
     unsubLiveRef.current = null
     const t0 = performance.now()
     await insertStocks(count)
     const dt = performance.now() - t0
     setTotalCount(getStockCount())
-    // Re-subscribe to pick up new data
     await subscribeLive()
     setInserting(false)
     alert(`Inserted ${count.toLocaleString()} rows in ${(dt / 1000).toFixed(2)}s — total: ${getStockCount().toLocaleString()}`)
   }
 
   if (loading) {
-    return <div className="loading">Initializing Cynos Database...</div>
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4">
+        <Loader2 className="w-8 h-8 animate-spin" />
+        <p className="text-white/40 text-sm tracking-wider uppercase">Initializing Database...</p>
+      </div>
+    )
   }
 
   const ivmResult = results.find(r => r.mode === 'ivm')
   const reqResult = results.find(r => r.mode === 'requery')
+  const matchCount = stockMapRef.current.size
 
   return (
-    <div className="app">
-      <h1>IVM Live Query Demo</h1>
-
-      <div className="section">
-        <div className="form-row">
-          <select value={priceThreshold} onChange={e => setPriceThreshold(Number(e.target.value))} disabled={benchRunning}>
-            {PRICE_THRESHOLDS.map(t => <option key={t} value={t}>price &gt; {t}</option>)}
-          </select>
-          <button className={updating ? 'primary' : 'secondary'} onClick={updating ? stopUpdates : startUpdates} disabled={benchRunning}>
-            {updating ? 'Stop Updates' : 'Start Updates'}
-          </button>
-          {updating && <span style={{ color: '#aaa' }}>{updateUps} ups</span>}
-          <span style={{ color: '#aaa' }}>Total: {totalCount.toLocaleString()} rows</span>
-          <button className="secondary" onClick={() => handleInsert(100_000)} disabled={inserting || benchRunning}>
-            {inserting ? 'Inserting...' : '+100K Rows'}
-          </button>
-          <button className="secondary" onClick={() => handleInsert(500_000)} disabled={inserting || benchRunning}>
-            {inserting ? 'Inserting...' : '+500K Rows'}
-          </button>
-        </div>
+    <div className="container mx-auto px-4 py-8 max-w-7xl">
+      {/* Header */}
+      <div className="mb-8">
+        <h1 className="text-2xl font-bold tracking-tight uppercase mb-2">IVM vs Re-query</h1>
+        <p className="text-white/40 text-sm">Compare incremental view maintenance with traditional re-query</p>
       </div>
 
-      {/* Live data table — delta-driven via IVM trace() */}
-      <div className="section">
-        <h2>
-          Live Data <span className="badge live">IVM trace()</span>
-          <span style={{ color: '#aaa', fontSize: 14, fontWeight: 'normal', marginLeft: 8 }}>
-            {stocks.length > 0 ? `showing ${Math.min(20, stockMapRef.current.size)} of ${stockMapRef.current.size} rows where price > ${priceThreshold}` : ''}
-          </span>
-        </h2>
-        <div className="table-container" style={{ maxHeight: 460 }}>
-          <table className="stock-table">
-            <thead>
-              <tr>{DISPLAY_COLS.map(c => <th key={c}>{c}</th>)}</tr>
-            </thead>
-            <tbody>
-              {stocks.map(stock => (
-                <tr key={stock.id}>
-                  {DISPLAY_COLS.map(c => {
-                    const key = `${stock.id}-${c}`
-                    const tick = changedCellsRef.current.get(key)
-                    return (
-                      <td key={tick != null ? `${key}-${tick}` : key} className={tick != null ? 'highlight' : ''}>
-                        {fmtVal(c, stock[c])}
-                      </td>
-                    )
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      {/* Two Column Layout */}
+      <div className="grid lg:grid-cols-2 gap-6 mb-8">
+        {/* Left: Controls & Data */}
+        <div className="space-y-6 min-w-0">
+          {/* Control Panel */}
+          <div className="border border-white/10">
+            <div className="border-b border-white/10 px-4 py-3">
+              <span className="text-xs tracking-widest uppercase text-white/40">// CONTROLS</span>
+            </div>
+            <div className="p-4 space-y-4">
+              {/* Filter & Updates */}
+              <div className="flex flex-wrap gap-3">
+                <Select value={priceThreshold} onValueChange={setPriceThreshold} disabled={benchRunning}>
+                  <SelectTrigger className="w-[130px] uppercase text-xs tracking-wider">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {PRICE_THRESHOLDS.map(t => (
+                      <SelectItem key={t} value={String(t)}>PRICE &gt; {t}</SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
 
-      {/* Benchmark section */}
-      <div className="section">
-        <h2>Benchmark</h2>
-        <p style={{ color: '#aaa', margin: '0 0 12px', fontSize: 13 }}>
-          Runs DML for {benchDuration}s with IVM, then {benchDuration}s with Re-query.
-          IVM subscribe = O(delta), Re-query subscribe = O(result_set).
-        </p>
-        <div className="form-row">
-          <select value={benchDuration} onChange={e => setBenchDuration(Number(e.target.value))} disabled={benchRunning}>
-            <option value={2}>2s per mode</option>
-            <option value={3}>3s per mode</option>
-            <option value={5}>5s per mode</option>
-            <option value={10}>10s per mode</option>
-          </select>
-          <button className="primary" onClick={handleRunBench} disabled={benchRunning}>
-            {benchRunning ? `Running ${currentMode === 'ivm' ? 'IVM' : 'Re-query'}...` : 'Run Benchmark'}
-          </button>
-          {currentMode && (
-            <span style={{ color: '#aaa' }}>
-              UPS: {liveUps.toLocaleString()} | Notifications: {liveNotifications}
-            </span>
-          )}
-        </div>
-      </div>
+                <Button
+                  variant={updating ? 'default' : 'outline'}
+                  onClick={updating ? stopUpdates : startUpdates}
+                  disabled={benchRunning}
+                  className={cn(
+                    "uppercase tracking-wider text-xs gap-2",
+                    updating && "bg-white text-black hover:bg-white/90"
+                  )}
+                >
+                  {updating ? <Square className="w-3 h-3" /> : <Play className="w-3 h-3" />}
+                  {updating ? 'STOP' : 'UPDATE'}
+                </Button>
 
-      {results.length > 0 && (
-        <div className="section">
-          <h2>Results</h2>
-          <div style={{ display: 'flex', gap: 24 }}>
-            {ivmResult && (
-              <div style={{ flex: 1 }} className="info-box">
-                <h3 style={{ margin: '0 0 8px' }}>
-                  IVM (trace) <span className="badge live">O(delta)</span>
-                </h3>
-                <div>Updates/sec: <strong>{ivmResult.ups.toLocaleString()}</strong></div>
-                <div>Total updates: {ivmResult.totalUpdates.toLocaleString()}</div>
-                <div>Notifications: {ivmResult.notifications}</div>
+                {updating && (
+                  <span className="text-xs text-white/50 self-center">{updateUps} UPS</span>
+                )}
               </div>
-            )}
-            {reqResult && (
-              <div style={{ flex: 1 }} className="info-box">
-                <h3 style={{ margin: '0 0 8px' }}>
-                  Re-query (observe) <span className="badge">O(result)</span>
-                </h3>
-                <div>Updates/sec: <strong>{reqResult.ups.toLocaleString()}</strong></div>
-                <div>Total updates: {reqResult.totalUpdates.toLocaleString()}</div>
-                <div>Notifications: {reqResult.notifications}</div>
+
+              {/* Data Controls */}
+              <div className="flex flex-wrap gap-3">
+                <span className="text-xs text-white/40 self-center">
+                  {totalCount.toLocaleString()} ROWS
+                </span>
+                <Button
+                  variant="outline"
+                  onClick={() => handleInsert(100_000)}
+                  disabled={inserting || benchRunning}
+                  className="uppercase tracking-wider text-xs gap-2"
+                >
+                  {inserting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Database className="w-3 h-3" />}
+                  +100K
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => handleInsert(500_000)}
+                  disabled={inserting || benchRunning}
+                  className="uppercase tracking-wider text-xs"
+                >
+                  +500K
+                </Button>
               </div>
-            )}
+            </div>
           </div>
-          {ivmResult && reqResult && (
-            <div className="info-box" style={{ marginTop: 12, textAlign: 'center', fontSize: 18 }}>
-              IVM is <strong>{(ivmResult.ups / reqResult.ups).toFixed(1)}x</strong> faster
-              ({ivmResult.ups.toLocaleString()} vs {reqResult.ups.toLocaleString()} updates/sec)
+
+          {/* Live Data Table - Using native table for better performance */}
+          <div className="border border-white/10">
+            <div className="border-b border-white/10 px-4 py-3 flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <span className="text-xs tracking-widest uppercase text-white/40">// LIVE DATA</span>
+                <div className="flex items-center gap-2 px-2 py-1 border border-white/20 text-xs">
+                  <Zap className="w-3 h-3" />
+                  <span>IVM trace()</span>
+                </div>
+              </div>
+              <span className="text-xs text-white/30">
+                {stocks.length} / {matchCount} ROWS
+              </span>
+            </div>
+            <p className="px-4 py-2 text-[10px] text-white/30 border-b border-white/5">
+              Showing {stocks.length} of {matchCount} matching rows. Re-query fetches all {matchCount} rows on every change (no LIMIT).
+            </p>
+            <div className="max-h-[400px] overflow-auto">
+              <table className="w-full">
+                <thead className="sticky top-0 bg-background">
+                  <tr className="border-b border-white/10">
+                    {DISPLAY_COLS.map(c => (
+                      <th
+                        key={c}
+                        className={cn(
+                          "text-[10px] uppercase tracking-wider font-normal text-white/40 whitespace-nowrap py-3 px-4",
+                          c === 'id' || c === 'symbol' || c === 'name' ? 'text-left' : 'text-right'
+                        )}
+                      >
+                        {c}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {stocks.map(stock => (
+                    <StockRow key={stock.id} stock={stock} changedCells={changedCells} />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        {/* Right: Benchmark */}
+        <div className="space-y-6">
+          {/* Benchmark Panel */}
+          <div className="border border-white/10">
+            <div className="border-b border-white/10 px-4 py-3">
+              <span className="text-xs tracking-widest uppercase text-white/40">// BENCHMARK</span>
+            </div>
+            <div className="p-4 space-y-4">
+              <p className="text-xs text-white/40">
+                IVM = O(delta) · Re-query = O(result_set)
+              </p>
+
+              <div className="flex flex-wrap gap-3">
+                <Select value={benchDuration} onValueChange={setBenchDuration} disabled={benchRunning}>
+                  <SelectTrigger className="w-[120px] uppercase text-xs tracking-wider">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="2">2 SEC</SelectItem>
+                    <SelectItem value="3">3 SEC</SelectItem>
+                    <SelectItem value="5">5 SEC</SelectItem>
+                    <SelectItem value="10">10 SEC</SelectItem>
+                  </SelectContent>
+                </Select>
+
+                <Button
+                  onClick={handleRunBench}
+                  disabled={benchRunning}
+                  className={cn(
+                    "uppercase tracking-wider text-xs gap-2",
+                    !benchRunning && "bg-white text-black hover:bg-white/90"
+                  )}
+                >
+                  {benchRunning ? (
+                    <>
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      {currentMode === 'ivm' ? 'IVM...' : 'RE-QUERY...'}
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3 h-3" />
+                      RUN BENCHMARK
+                    </>
+                  )}
+                </Button>
+              </div>
+
+              {currentMode && (
+                <div className="flex items-center gap-3 px-4 py-3 border border-white/20 bg-white/[0.02] text-xs">
+                  <span className="w-2 h-2 bg-white animate-pulse" />
+                  <span className="text-white/60">
+                    {liveUps.toLocaleString()} UPS · {liveNotifications} NOTIFICATIONS
+                  </span>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Results */}
+          {results.length > 0 && (
+            <div className="space-y-4">
+              {/* Result Cards */}
+              <div className="grid grid-cols-2 gap-px bg-white/10">
+                {ivmResult && (
+                  <div className="bg-background p-4">
+                    <div className="flex items-center gap-2 mb-4">
+                      <span className="text-xs tracking-widest uppercase">IVM</span>
+                      <span className="text-[10px] px-2 py-0.5 border border-white/30">O(δ)</span>
+                    </div>
+                    <div className="space-y-2 text-xs">
+                      <div className="flex justify-between">
+                        <span className="text-white/40">UPS</span>
+                        <span className="font-mono font-bold">{ivmResult.ups.toLocaleString()}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-white/40">TOTAL</span>
+                        <span className="font-mono">{ivmResult.totalUpdates.toLocaleString()}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-white/40">NOTIFY</span>
+                        <span className="font-mono">{ivmResult.notifications}</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {reqResult && (
+                  <div className="bg-background p-4">
+                    <div className="flex items-center gap-2 mb-4">
+                      <span className="text-xs tracking-widest uppercase">RE-QUERY</span>
+                      <span className="text-[10px] px-2 py-0.5 border border-white/20 text-white/50">O(n)</span>
+                    </div>
+                    <div className="space-y-2 text-xs">
+                      <div className="flex justify-between">
+                        <span className="text-white/40">UPS</span>
+                        <span className="font-mono">{reqResult.ups.toLocaleString()}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-white/40">TOTAL</span>
+                        <span className="font-mono">{reqResult.totalUpdates.toLocaleString()}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-white/40">NOTIFY</span>
+                        <span className="font-mono">{reqResult.notifications}</span>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Comparison */}
+              {ivmResult && reqResult && (
+                <div className="border border-white/20 bg-white/[0.02] p-6 text-center">
+                  <div className="text-4xl font-bold font-mono mb-2">
+                    {(ivmResult.ups / reqResult.ups).toFixed(1)}x
+                  </div>
+                  <div className="text-xs text-white/40 uppercase tracking-wider">
+                    IVM FASTER
+                  </div>
+                  <div className="text-xs text-white/30 mt-2">
+                    {ivmResult.ups.toLocaleString()} vs {reqResult.ups.toLocaleString()} UPS
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
-      )}
+      </div>
     </div>
   )
-}
-
-function fmtVal(col: keyof Stock, value: Stock[keyof Stock]) {
-  if (col === 'price' || col === 'high' || col === 'low' || col === 'open')
-    return `$${(value as number).toFixed(2)}`
-  if (col === 'change')
-    return (value as number) >= 0 ? `+${(value as number).toFixed(2)}` : (value as number).toFixed(2)
-  if (col === 'volume' || col === 'marketCap')
-    return (value as number).toLocaleString()
-  return String(value)
 }

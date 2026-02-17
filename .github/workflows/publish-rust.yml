@@ -1,64 +1,64 @@
-name: Publish Rust Crates
+# name: Publish Rust Crates
 
-on:
-  push:
-    tags:
-      - 'rust-v*'
+# on:
+#   push:
+#     tags:
+#       - 'rust-v*'
 
-env:
-  CARGO_TERM_COLOR: always
+# env:
+#   CARGO_TERM_COLOR: always
 
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+# jobs:
+#   publish:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
 
-      - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+#       - name: Setup Rust
+#         uses: dtolnay/rust-action@stable
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+#       - name: Cache cargo
+#         uses: actions/cache@v4
+#         with:
+#           path: |
+#             ~/.cargo/bin/
+#             ~/.cargo/registry/index/
+#             ~/.cargo/registry/cache/
+#             ~/.cargo/git/db/
+#             target/
+#           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Verify version matches tag
-        run: |
-          TAG_VERSION=${GITHUB_REF#refs/tags/rust-v}
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
-            echo "Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
-            exit 1
-          fi
+#       - name: Verify version matches tag
+#         run: |
+#           TAG_VERSION=${GITHUB_REF#refs/tags/rust-v}
+#           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+#           if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+#             echo "Tag version ($TAG_VERSION) does not match Cargo.toml version ($CARGO_VERSION)"
+#             exit 1
+#           fi
 
-      - name: Run tests
-        run: cargo test --workspace
+#       - name: Run tests
+#         run: cargo test --workspace
 
-      - name: Publish crates
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          # Publish in dependency order
-          cargo publish -p cynos-core --no-verify
-          sleep 30
-          cargo publish -p cynos-jsonb --no-verify
-          sleep 30
-          cargo publish -p cynos-incremental --no-verify
-          sleep 30
-          cargo publish -p cynos-index --no-verify
-          sleep 30
-          cargo publish -p cynos-storage --no-verify
-          sleep 30
-          cargo publish -p cynos-query --no-verify
-          sleep 30
-          cargo publish -p cynos-reactive --no-verify
-          sleep 30
-          cargo publish -p cynos-binary --no-verify
-          sleep 30
-          cargo publish -p cynos-database --no-verify
+#       - name: Publish crates
+#         env:
+#           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+#         run: |
+#           # Publish in dependency order
+#           cargo publish -p cynos-core --no-verify
+#           sleep 30
+#           cargo publish -p cynos-jsonb --no-verify
+#           sleep 30
+#           cargo publish -p cynos-incremental --no-verify
+#           sleep 30
+#           cargo publish -p cynos-index --no-verify
+#           sleep 30
+#           cargo publish -p cynos-storage --no-verify
+#           sleep 30
+#           cargo publish -p cynos-query --no-verify
+#           sleep 30
+#           cargo publish -p cynos-reactive --no-verify
+#           sleep 30
+#           cargo publish -p cynos-binary --no-verify
+#           sleep 30
+#           cargo publish -p cynos-database --no-verify
