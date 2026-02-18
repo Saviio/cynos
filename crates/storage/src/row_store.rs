@@ -37,6 +37,8 @@ pub trait IndexStore {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    /// Returns whether this is a unique index.
+    fn is_unique(&self) -> bool;
     /// Clears all entries.
     fn clear(&mut self);
     /// Gets range of row IDs.
@@ -82,6 +84,10 @@ impl IndexStore for BTreeIndexStore {
 
     fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    fn is_unique(&self) -> bool {
+        self.inner.is_unique()
     }
 
     fn clear(&mut self) {
@@ -134,6 +140,10 @@ impl IndexStore for HashIndexStore {
 
     fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    fn is_unique(&self) -> bool {
+        self.inner.is_unique()
     }
 
     fn clear(&mut self) {
@@ -356,12 +366,12 @@ impl RowStore {
             }
         }
 
-        // Check secondary index uniqueness
+        // Check secondary index uniqueness (only for unique indexes)
         for (idx_name, cols) in &self.index_columns {
             let old_key = extract_key(&old_row, cols);
             let new_key = extract_key(&new_row, cols);
             if let Some(idx) = self.secondary_indices.get(idx_name) {
-                if old_key != new_key && idx.contains_key(&new_key) {
+                if idx.is_unique() && old_key != new_key && idx.contains_key(&new_key) {
                     return Err(Error::UniqueConstraint {
                         column: idx_name.clone(),
                         value: new_key,
