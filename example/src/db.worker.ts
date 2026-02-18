@@ -353,7 +353,8 @@ async function querySelect(
   const queryTime = performance.now() - start
 
   // Get or create cached layout (not counted in query time)
-  const cacheKey = useAllFields ? '*' : fields.slice().sort().join(',')
+  // Key must preserve field order since binary layout depends on SELECT order
+  const cacheKey = useAllFields ? '*' : fields.join(',')
   let serializedLayout = layoutCache.get(cacheKey)
 
   if (!serializedLayout) {

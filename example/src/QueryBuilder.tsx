@@ -570,6 +570,7 @@ export default function QueryBuilder() {
 }
 
 const formatValue = (field: keyof Stock, value: Stock[keyof Stock]) => {
+  if (value === undefined || value === null) return '-'
   if (field === 'price' || field === 'high' || field === 'low' || field === 'open')
     return `$${(value as number).toFixed(2)}`
   if (field === 'change')

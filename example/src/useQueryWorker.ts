@@ -11,7 +11,7 @@ export type { WhereClause }
 
 export function useQueryWorker() {
   const workerRef = useRef<Worker | null>(null)
-  const decoderRef = useRef<((buffer: ArrayBuffer) => Stock[]) | null>(null)
+  const decoderRef = useRef<{ key: string; decode: (buffer: ArrayBuffer) => Stock[] } | null>(null)
   const requestStartRef = useRef<number>(0)
   const [ready, setReady] = useState(false)
   const [stockCount, setStockCount] = useState(0)
@@ -56,10 +56,13 @@ export function useQueryWorker() {
         case 'queryBinaryResult': {
           // Decode on main thread using pure JS decoder
           const decodeStart = performance.now()
-          if (!decoderRef.current) {
-            decoderRef.current = createDecoder(msg.layout)
+
+          // Create decoder if layout changed (keyed by column names)
+          const layoutKey = msg.layout.columnNames.join(',')
+          if (!decoderRef.current || decoderRef.current.key !== layoutKey) {
+            decoderRef.current = { key: layoutKey, decode: createDecoder(msg.layout) }
           }
-          const stocks = decoderRef.current(msg.buffer)
+          const stocks = decoderRef.current.decode(msg.buffer)
           const decode = performance.now() - decodeStart
 
           // Calculate latency: total round-trip time - query time - decode time
