@@ -170,6 +170,13 @@ impl<'a> OrderByIndexPass<'a> {
                     return optimized;
                 }
 
+                // Try to optimize TopN over existing IndexScan by setting reverse flag
+                if let Some(optimized) =
+                    self.try_optimize_topn_index_scan(optimized_input.clone(), &order_by, limit, offset)
+                {
+                    return optimized;
+                }
+
                 // No optimization possible, keep the TopN
                 PhysicalPlan::TopN {
                     input: Box::new(optimized_input),
@@ -273,66 +280,165 @@ impl<'a> OrderByIndexPass<'a> {
         })
     }
 
+    /// Tries to optimize TopN over existing IndexScan by setting reverse flag and pushing limit.
+    fn try_optimize_topn_index_scan(
+        &self,
+        plan: PhysicalPlan,
+        order_by: &[(Expr, SortOrder)],
+        limit: usize,
+        offset: usize,
+    ) -> Option<PhysicalPlan> {
+        match plan {
+            // Direct IndexScan
+            PhysicalPlan::IndexScan {
+                table,
+                index,
+                range_start,
+                range_end,
+                include_start,
+                include_end,
+                ..
+            } => {
+                // Get index info by name
+                let index_info = self.ctx.find_index_by_name(&table, &index)?;
+
+                // Check if this index matches the order_by
+                let order_columns: Vec<String> = order_by
+                    .iter()
+                    .filter_map(|(expr, _)| self.extract_column_name(expr))
+                    .collect();
+
+                if order_columns.len() != order_by.len() {
+                    return None;
+                }
+
+                // Check if columns match
+                if !index_info
+                    .columns
+                    .iter()
+                    .zip(order_columns.iter())
+                    .all(|(a, b)| a == b)
+                {
+                    return None;
+                }
+
+                // Check if the sort order matches (natural or reversed)
+                let is_reverse = self.check_order_match(order_by, &index_info.columns)?;
+
+                // Return IndexScan with reverse flag and limit pushed down
+                Some(PhysicalPlan::IndexScan {
+                    table,
+                    index,
+                    range_start,
+                    range_end,
+                    include_start,
+                    include_end,
+                    limit: Some(limit),
+                    offset: Some(offset),
+                    reverse: is_reverse,
+                })
+            }
+
+            // Look through Project nodes
+            PhysicalPlan::Project { input, columns } => {
+                let optimized_input = self.try_optimize_topn_index_scan(*input, order_by, limit, offset)?;
+                Some(PhysicalPlan::Project {
+                    input: Box::new(optimized_input),
+                    columns,
+                })
+            }
+
+            // Can't optimize through other nodes
+            _ => None,
+        }
+    }
+
     /// Tries to optimize an existing IndexScan by setting its reverse flag.
+    /// Can look through Project and Limit nodes to find the IndexScan.
     fn try_optimize_index_scan(
         &self,
         plan: PhysicalPlan,
         order_by: &[(Expr, SortOrder)],
     ) -> Option<PhysicalPlan> {
-        // Find an IndexScan in the plan
-        if let PhysicalPlan::IndexScan {
-            table,
-            index,
-            range_start,
-            range_end,
-            include_start,
-            include_end,
-            limit,
-            offset,
-            ..
-        } = &plan
-        {
-            // Get index info
-            let index_info = self.ctx.find_index(table, &[])?;
+        match plan {
+            // Direct IndexScan
+            PhysicalPlan::IndexScan {
+                table,
+                index,
+                range_start,
+                range_end,
+                include_start,
+                include_end,
+                limit,
+                offset,
+                ..
+            } => {
+                // Get index info by name (not by columns)
+                let index_info = self.ctx.find_index_by_name(&table, &index)?;
 
-            // Check if this index matches the order_by
-            let order_columns: Vec<String> = order_by
-                .iter()
-                .filter_map(|(expr, _)| self.extract_column_name(expr))
-                .collect();
+                // Check if this index matches the order_by
+                let order_columns: Vec<String> = order_by
+                    .iter()
+                    .filter_map(|(expr, _)| self.extract_column_name(expr))
+                    .collect();
 
-            if order_columns.len() != order_by.len() {
-                return None;
+                if order_columns.len() != order_by.len() {
+                    return None;
+                }
+
+                // Check if columns match
+                if !index_info
+                    .columns
+                    .iter()
+                    .zip(order_columns.iter())
+                    .all(|(a, b)| a == b)
+                {
+                    return None;
+                }
+
+                // Check if the sort order matches (natural or reversed)
+                let is_reverse = self.check_order_match(order_by, &index_info.columns)?;
+
+                // Return IndexScan with correct reverse flag
+                Some(PhysicalPlan::IndexScan {
+                    table,
+                    index,
+                    range_start,
+                    range_end,
+                    include_start,
+                    include_end,
+                    limit,
+                    offset,
+                    reverse: is_reverse,
+                })
             }
 
-            // Check if columns match
-            if !index_info
-                .columns
-                .iter()
-                .zip(order_columns.iter())
-                .all(|(a, b)| a == b)
-            {
-                return None;
+            // Look through Project nodes
+            PhysicalPlan::Project { input, columns } => {
+                let optimized_input = self.try_optimize_index_scan(*input, order_by)?;
+                Some(PhysicalPlan::Project {
+                    input: Box::new(optimized_input),
+                    columns,
+                })
             }
 
-            // Check if the sort order matches (natural or reversed)
-            let is_reverse = self.check_order_match(order_by, &index_info.columns)?;
+            // Look through Limit nodes
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                let optimized_input = self.try_optimize_index_scan(*input, order_by)?;
+                Some(PhysicalPlan::Limit {
+                    input: Box::new(optimized_input),
+                    limit,
+                    offset,
+                })
+            }
 
-            // Return IndexScan with correct reverse flag
-            return Some(PhysicalPlan::IndexScan {
-                table: table.clone(),
-                index: index.clone(),
-                range_start: range_start.clone(),
-                range_end: range_end.clone(),
-                include_start: *include_start,
-                include_end: *include_end,
-                limit: *limit,
-                offset: *offset,
-                reverse: is_reverse,
-            });
+            // Can't optimize through other nodes
+            _ => None,
         }
-
-        None
     }
 
     /// Finds a TableScan in the plan (only if it's directly accessible).
@@ -582,6 +688,245 @@ mod tests {
         assert!(matches!(result, PhysicalPlan::IndexScan { .. }));
         if let PhysicalPlan::IndexScan { reverse, .. } = result {
             assert!(!reverse, "IndexScan should have reverse=false for ASC ordering");
+        }
+    }
+
+    /// Test: Sort DESC over existing IndexScan should set reverse=true
+    ///
+    /// When we have Sort(price DESC) -> IndexScan(idx_price, range),
+    /// the optimizer should set reverse=true on the IndexScan.
+    #[test]
+    fn test_sort_desc_over_existing_index_scan_should_set_reverse() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "stocks",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_id", alloc::vec!["id".into()], true),
+                    IndexInfo::new("idx_price", alloc::vec!["price".into()], false),
+                ],
+            },
+        );
+        let pass = OrderByIndexPass::new(&ctx);
+
+        // Simulate: Sort(price DESC) -> IndexScan(idx_price, range > 980)
+        // This is what happens after IndexSelection converts Filter+Scan to IndexScan
+        let plan = PhysicalPlan::Sort {
+            input: Box::new(PhysicalPlan::IndexScan {
+                table: "stocks".into(),
+                index: "idx_price".into(),
+                range_start: Some(cynos_core::Value::Float64(980.0)),
+                range_end: None,
+                include_start: false,
+                include_end: true,
+                limit: None,
+                offset: None,
+                reverse: false,
+            }),
+            order_by: alloc::vec![(Expr::column("stocks", "price", 0), SortOrder::Desc)],
+        };
+
+        let result = pass.optimize(plan);
+
+        // Should become IndexScan with reverse=true (no Sort node)
+        match result {
+            PhysicalPlan::IndexScan { reverse, index, .. } => {
+                assert_eq!(index, "idx_price");
+                assert!(reverse, "IndexScan should have reverse=true for DESC ordering over existing IndexScan");
+            }
+            PhysicalPlan::Sort { .. } => {
+                panic!("BUG: Sort node was not eliminated - IndexScan should have reverse=true");
+            }
+            _ => panic!("Unexpected plan: {:?}", result),
+        }
+    }
+
+    /// Test: Sort DESC over Limit -> Project -> IndexScan should set reverse=true
+    #[test]
+    fn test_sort_desc_over_limit_project_index_scan_should_set_reverse() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "stocks",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_id", alloc::vec!["id".into()], true),
+                    IndexInfo::new("idx_price", alloc::vec!["price".into()], false),
+                ],
+            },
+        );
+        let pass = OrderByIndexPass::new(&ctx);
+
+        // Simulate: Sort(price DESC) -> Limit -> Project -> IndexScan(idx_price, range > 980)
+        // This is the structure from: .where(price > 980).orderBy('price', 'Desc').limit(100)
+        let plan = PhysicalPlan::Sort {
+            input: Box::new(PhysicalPlan::Limit {
+                input: Box::new(PhysicalPlan::Project {
+                    input: Box::new(PhysicalPlan::IndexScan {
+                        table: "stocks".into(),
+                        index: "idx_price".into(),
+                        range_start: Some(cynos_core::Value::Float64(980.0)),
+                        range_end: None,
+                        include_start: false,
+                        include_end: true,
+                        limit: None,
+                        offset: None,
+                        reverse: false,
+                    }),
+                    columns: alloc::vec![
+                        Expr::column("stocks", "id", 0),
+                        Expr::column("stocks", "price", 1),
+                    ],
+                }),
+                limit: 100,
+                offset: 0,
+            }),
+            order_by: alloc::vec![(Expr::column("stocks", "price", 0), SortOrder::Desc)],
+        };
+
+        let result = pass.optimize(plan);
+
+        // Should become Limit -> Project -> IndexScan with reverse=true (no Sort node)
+        match result {
+            PhysicalPlan::Limit { input, .. } => {
+                if let PhysicalPlan::Project { input, .. } = *input {
+                    if let PhysicalPlan::IndexScan { reverse, index, .. } = *input {
+                        assert_eq!(index, "idx_price");
+                        assert!(reverse, "IndexScan should have reverse=true");
+                    } else {
+                        panic!("Expected IndexScan inside Project, got {:?}", input);
+                    }
+                } else {
+                    panic!("Expected Project inside Limit, got {:?}", input);
+                }
+            }
+            PhysicalPlan::Sort { .. } => {
+                panic!("BUG: Sort node was not eliminated");
+            }
+            _ => panic!("Unexpected plan: {:?}", result),
+        }
+    }
+
+    /// Test: Sort DESC over Project -> IndexScan should set reverse=true
+    #[test]
+    fn test_sort_desc_over_project_index_scan_should_set_reverse() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "stocks",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_id", alloc::vec!["id".into()], true),
+                    IndexInfo::new("idx_price", alloc::vec!["price".into()], false),
+                ],
+            },
+        );
+        let pass = OrderByIndexPass::new(&ctx);
+
+        // Simulate: Sort(price DESC) -> Project -> IndexScan(idx_price, range > 100)
+        let plan = PhysicalPlan::Sort {
+            input: Box::new(PhysicalPlan::Project {
+                input: Box::new(PhysicalPlan::IndexScan {
+                    table: "stocks".into(),
+                    index: "idx_price".into(),
+                    range_start: Some(cynos_core::Value::Float64(100.0)),
+                    range_end: None,
+                    include_start: false,
+                    include_end: true,
+                    limit: None,
+                    offset: None,
+                    reverse: false,
+                }),
+                columns: alloc::vec![
+                    Expr::column("stocks", "id", 0),
+                    Expr::column("stocks", "price", 1),
+                ],
+            }),
+            order_by: alloc::vec![(Expr::column("stocks", "price", 0), SortOrder::Desc)],
+        };
+
+        let result = pass.optimize(plan);
+
+        // Should become Project -> IndexScan with reverse=true (no Sort node)
+        match result {
+            PhysicalPlan::Project { input, .. } => {
+                if let PhysicalPlan::IndexScan { reverse, index, .. } = *input {
+                    assert_eq!(index, "idx_price");
+                    assert!(reverse, "IndexScan should have reverse=true");
+                } else {
+                    panic!("Expected IndexScan inside Project, got {:?}", input);
+                }
+            }
+            PhysicalPlan::Sort { .. } => {
+                panic!("BUG: Sort node was not eliminated");
+            }
+            _ => panic!("Unexpected plan: {:?}", result),
+        }
+    }
+
+    /// Test: TopN DESC over IndexScan should set reverse=true and push limit
+    /// This is the actual structure when WHERE + ORDER BY + LIMIT are combined:
+    /// Project -> TopN -> IndexScan
+    #[test]
+    fn test_topn_desc_over_index_scan_should_set_reverse() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "stocks",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_id", alloc::vec!["id".into()], true),
+                    IndexInfo::new("idx_price", alloc::vec!["price".into()], false),
+                ],
+            },
+        );
+        let pass = OrderByIndexPass::new(&ctx);
+
+        // Simulate: Project -> TopN(price DESC, limit=100) -> IndexScan(idx_price, range > 100)
+        // This is the actual structure from: .where(price > 100).orderBy('price', 'Desc').limit(100)
+        let plan = PhysicalPlan::Project {
+            input: Box::new(PhysicalPlan::TopN {
+                input: Box::new(PhysicalPlan::IndexScan {
+                    table: "stocks".into(),
+                    index: "idx_price".into(),
+                    range_start: Some(cynos_core::Value::Float64(100.0)),
+                    range_end: None,
+                    include_start: true,
+                    include_end: true,
+                    limit: None,
+                    offset: None,
+                    reverse: false,
+                }),
+                order_by: alloc::vec![(Expr::column("stocks", "price", 3), SortOrder::Desc)],
+                limit: 100,
+                offset: 0,
+            }),
+            columns: alloc::vec![
+                Expr::column("stocks", "id", 0),
+                Expr::column("stocks", "price", 3),
+            ],
+        };
+
+        let result = pass.optimize(plan);
+
+        // Should become Project -> IndexScan with reverse=true and limit=100 (no TopN node)
+        match result {
+            PhysicalPlan::Project { input, .. } => {
+                if let PhysicalPlan::IndexScan { reverse, index, limit, offset, .. } = *input {
+                    assert_eq!(index, "idx_price");
+                    assert!(reverse, "IndexScan should have reverse=true for DESC ordering");
+                    assert_eq!(limit, Some(100), "Limit should be pushed to IndexScan");
+                    assert_eq!(offset, Some(0), "Offset should be pushed to IndexScan");
+                } else {
+                    panic!("Expected IndexScan inside Project, got {:?}", input);
+                }
+            }
+            _ => panic!("Unexpected plan: {:?}", result),
         }
     }
 }

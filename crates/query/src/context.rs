@@ -134,6 +134,13 @@ impl ExecutionContext {
         })
     }
 
+    /// Finds an index by its name.
+    pub fn find_index_by_name(&self, table: &str, index_name: &str) -> Option<&IndexInfo> {
+        self.table_stats
+            .get(table)
+            .and_then(|s| s.indexes.iter().find(|idx| idx.name == index_name))
+    }
+
     /// Finds a GIN index for the given column.
     pub fn find_gin_index(&self, table: &str, column: &str) -> Option<&IndexInfo> {
         self.table_stats.get(table).and_then(|s| {

@@ -94,7 +94,7 @@ function randomValue(field: keyof Stock): number {
 // Message types
 export type WhereClause = {
   field: keyof Stock
-  operator: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
+  operator: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'like' | 'notLike'
   value: string | number
 }
 
@@ -107,6 +107,7 @@ export type WorkerMessage =
   | { type: 'insertStocks'; count: number }
   // Query Builder operations
   | { type: 'querySelect'; fields: (keyof Stock)[]; where: WhereClause[]; orderBy?: { field: keyof Stock; dir: 'Asc' | 'Desc' }; limit?: number }
+  | { type: 'queryExplain'; fields: (keyof Stock)[]; where: WhereClause[]; orderBy?: { field: keyof Stock; dir: 'Asc' | 'Desc' }; limit?: number }
   | { type: 'queryInsert'; count: number }
   | { type: 'queryUpdate'; field: keyof Stock; value: string | number; where: WhereClause[] }
   | { type: 'queryDelete'; where: WhereClause[] }
@@ -123,6 +124,7 @@ export type MainMessage =
   // Query Builder responses
   | { type: 'queryResult'; stocks: Stock[]; execTime: number; affectedRows: number; stockCount: number }
   | { type: 'queryBinaryResult'; buffer: ArrayBuffer; layout: SerializedSchemaLayout; queryTime: number; stockCount: number }
+  | { type: 'queryExplainResult'; plan: { logical: string; optimized: string; physical: string } }
   | { type: 'stockCount'; count: number }
 
 // Serializable schema layout for transfer to main thread
@@ -320,6 +322,8 @@ function applyWhereClauses<T>(query: T, whereClauses: WhereClause[]): T {
       case 'gte': q = q.where(colRef.gte(val)); break
       case 'lt': q = q.where(colRef.lt(val)); break
       case 'lte': q = q.where(colRef.lte(val)); break
+      case 'like': q = q.where(colRef.like(String(val))); break
+      case 'notLike': q = q.where(colRef.like(String(val)).not()); break
     }
   }
   return q as T
@@ -382,6 +386,33 @@ async function querySelect(
 
   // Transfer binary to main thread for decode (zero-copy)
   postToMain({ type: 'queryBinaryResult', buffer, layout: serializedLayout, queryTime, stockCount }, [buffer])
+}
+
+// Query Builder: EXPLAIN
+function queryExplain(
+  fields: (keyof Stock)[],
+  whereClauses: WhereClause[],
+  orderBy?: { field: keyof Stock; dir: 'Asc' | 'Desc' },
+  limit?: number
+) {
+  if (!db) return
+
+  const useAllFields = fields.length === 13
+  let query = db.select(...(useAllFields ? ['*'] : fields)).from('stocks')
+  query = applyWhereClauses(query, whereClauses)
+
+  if (orderBy) {
+    const order = orderBy.dir === 'Asc' ? JsSortOrder.Asc : JsSortOrder.Desc
+    query = query.orderBy(orderBy.field, order)
+  }
+
+  if (limit) {
+    query = query.limit(limit)
+  }
+
+  const plan = query.explain()
+  console.log('[DEBUG] Physical plan:', plan.physical)
+  postToMain({ type: 'queryExplainResult', plan })
 }
 
 // Query Builder: INSERT
@@ -456,6 +487,9 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
       // Query Builder operations
       case 'querySelect':
         await querySelect(msg.fields, msg.where, msg.orderBy, msg.limit)
+        break
+      case 'queryExplain':
+        queryExplain(msg.fields, msg.where, msg.orderBy, msg.limit)
         break
       case 'queryInsert':
         await queryInsert(msg.count)

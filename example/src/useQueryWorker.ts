@@ -21,6 +21,7 @@ export function useQueryWorker() {
   const [latencyTime, setLatencyTime] = useState<number | null>(null)
   const [decodeTime, setDecodeTime] = useState<number | null>(null)
   const [affectedRows, setAffectedRows] = useState<number | null>(null)
+  const [explainPlan, setExplainPlan] = useState<{ logical: string; optimized: string; physical: string } | null>(null)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
@@ -79,6 +80,10 @@ export function useQueryWorker() {
           break
         }
 
+        case 'queryExplainResult':
+          setExplainPlan(msg.plan)
+          break
+
         case 'error':
           setError(msg.message)
           setExecuting(false)
@@ -106,6 +111,21 @@ export function useQueryWorker() {
     requestStartRef.current = performance.now()
     workerRef.current?.postMessage({
       type: 'querySelect',
+      fields,
+      where,
+      orderBy,
+      limit
+    } as WorkerMessage)
+  }, [])
+
+  const queryExplain = useCallback((
+    fields: (keyof Stock)[],
+    where: WhereClause[],
+    orderBy?: { field: keyof Stock; dir: 'Asc' | 'Desc' },
+    limit?: number
+  ) => {
+    workerRef.current?.postMessage({
+      type: 'queryExplain',
       fields,
       where,
       orderBy,
@@ -158,6 +178,7 @@ export function useQueryWorker() {
     setLatencyTime(null)
     setDecodeTime(null)
     setAffectedRows(null)
+    setExplainPlan(null)
     setError(null)
   }, [])
 
@@ -170,8 +191,10 @@ export function useQueryWorker() {
     latencyTime,
     decodeTime,
     affectedRows,
+    explainPlan,
     error,
     querySelect,
+    queryExplain,
     queryInsert,
     queryUpdate,
     queryDelete,

@@ -4,10 +4,10 @@ import { useQueryWorker, type WhereClause } from './useQueryWorker'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { Loader2, Play, Plus, Trash2, Database, Code, Clock, Cpu } from 'lucide-react'
+import { Loader2, Play, Plus, Trash2, Database, Code, Clock, Cpu, FileText } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
-type Operator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
+type Operator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'like' | 'notLike'
 type SortDir = 'Asc' | 'Desc'
 type Operation = 'select' | 'insert' | 'update' | 'delete'
 
@@ -30,6 +30,8 @@ const OPERATORS: { value: Operator; label: string }[] = [
   { value: 'gte', label: '≥' },
   { value: 'lt', label: '<' },
   { value: 'lte', label: '≤' },
+  { value: 'like', label: 'LIKE' },
+  { value: 'notLike', label: 'NOT LIKE' },
 ]
 
 const NUMERIC_FIELDS: (keyof Stock)[] = ['id', 'price', 'change', 'changePercent', 'volume', 'high', 'low', 'open', 'marketCap', 'pe']
@@ -53,8 +55,10 @@ export default function QueryBuilder() {
     latencyTime,
     decodeTime,
     affectedRows,
+    explainPlan,
     error,
     querySelect,
+    queryExplain,
     queryInsert,
     queryUpdate,
     queryDelete,
@@ -114,18 +118,26 @@ export default function QueryBuilder() {
   const generateCode = useCallback((): string => {
     const lines: string[] = []
 
+    const formatWhereClause = (clause: UIWhereClause): string => {
+      const val = getFieldType(clause.field) === 'number' ? clause.value : `'${clause.value}'`
+      if (clause.operator === 'neq') {
+        return `  .where(col('${clause.field}').eq(${val}).not())`
+      } else if (clause.operator === 'like') {
+        return `  .where(col('${clause.field}').like('${clause.value}'))`
+      } else if (clause.operator === 'notLike') {
+        return `  .where(col('${clause.field}').like('${clause.value}').not())`
+      } else {
+        return `  .where(col('${clause.field}').${clause.operator}(${val}))`
+      }
+    }
+
     if (operation === 'select') {
       const fields = selectedFields.length === STOCK_COLUMNS.length ? "'*'" : selectedFields.map(f => `'${f}'`).join(', ')
       lines.push(`db.select(${fields})`)
       lines.push(`  .from('stocks')`)
 
       for (const clause of whereClauses) {
-        const val = getFieldType(clause.field) === 'number' ? clause.value : `'${clause.value}'`
-        if (clause.operator === 'neq') {
-          lines.push(`  .where(col('${clause.field}').eq(${val}).not())`)
-        } else {
-          lines.push(`  .where(col('${clause.field}').${clause.operator}(${val}))`)
-        }
+        lines.push(formatWhereClause(clause))
       }
 
       if (sortClause) {
@@ -148,12 +160,7 @@ export default function QueryBuilder() {
       lines.push(`  .set('${updateField}', ${val})`)
 
       for (const clause of whereClauses) {
-        const clauseVal = getFieldType(clause.field) === 'number' ? clause.value : `'${clause.value}'`
-        if (clause.operator === 'neq') {
-          lines.push(`  .where(col('${clause.field}').eq(${clauseVal}).not())`)
-        } else {
-          lines.push(`  .where(col('${clause.field}').${clause.operator}(${clauseVal}))`)
-        }
+        lines.push(formatWhereClause(clause))
       }
 
       lines.push(`  .exec()`)
@@ -161,12 +168,7 @@ export default function QueryBuilder() {
       lines.push(`db.delete('stocks')`)
 
       for (const clause of whereClauses) {
-        const val = getFieldType(clause.field) === 'number' ? clause.value : `'${clause.value}'`
-        if (clause.operator === 'neq') {
-          lines.push(`  .where(col('${clause.field}').eq(${val}).not())`)
-        } else {
-          lines.push(`  .where(col('${clause.field}').${clause.operator}(${val}))`)
-        }
+        lines.push(formatWhereClause(clause))
       }
 
       lines.push(`  .exec()`)
@@ -177,12 +179,11 @@ export default function QueryBuilder() {
 
   const executeQuery = useCallback(() => {
     if (operation === 'select') {
-      querySelect(
-        selectedFields,
-        toWorkerWhere(whereClauses),
-        sortClause ? { field: sortClause.field, dir: sortClause.dir } : undefined,
-        limit ? Number(limit) : undefined
-      )
+      const where = toWorkerWhere(whereClauses)
+      const orderBy = sortClause ? { field: sortClause.field, dir: sortClause.dir } : undefined
+      const lim = limit ? Number(limit) : undefined
+      querySelect(selectedFields, where, orderBy, lim)
+      queryExplain(selectedFields, where, orderBy, lim)
     } else if (operation === 'insert') {
       queryInsert(Number(insertCount))
     } else if (operation === 'update') {
@@ -194,7 +195,7 @@ export default function QueryBuilder() {
       }
       queryDelete(toWorkerWhere(whereClauses))
     }
-  }, [operation, selectedFields, whereClauses, sortClause, limit, updateField, updateValue, insertCount, querySelect, queryInsert, queryUpdate, queryDelete])
+  }, [operation, selectedFields, whereClauses, sortClause, limit, updateField, updateValue, insertCount, querySelect, queryExplain, queryInsert, queryUpdate, queryDelete])
 
   if (!ready) {
     return (
@@ -376,7 +377,7 @@ export default function QueryBuilder() {
                         value={clause.operator}
                         onValueChange={(v) => updateWhereClause(clause.id, { operator: v as Operator })}
                       >
-                        <SelectTrigger className="w-[50px] sm:w-[70px] text-[10px] sm:text-xs">
+                        <SelectTrigger className="min-w-[70px] max-w-[120px] text-[10px] sm:text-xs">
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
@@ -527,6 +528,19 @@ export default function QueryBuilder() {
             </div>
           )}
 
+          {/* Query Plan */}
+          {explainPlan && operation === 'select' && (
+            <div className="border border-white/10">
+              <div className="border-b border-white/10 px-3 sm:px-4 py-2 sm:py-3 flex items-center gap-2">
+                <FileText className="w-3 h-3 sm:w-4 sm:h-4 text-white/40" />
+                <span className="text-[10px] sm:text-xs tracking-widest uppercase text-white/40">// QUERY PLAN</span>
+              </div>
+              <div className="p-3 sm:p-4">
+                <pre className="text-[10px] sm:text-xs font-mono text-white/70 whitespace-pre">{formatQueryPlan(explainPlan.physical)}</pre>
+              </div>
+            </div>
+          )}
+
           {/* Results Table */}
           {results.length > 0 && (
             <div className="border border-white/10">
@@ -582,4 +596,74 @@ const formatValue = (field: keyof Stock, value: Stock[keyof Stock]) => {
   if (field === 'pe')
     return (value as number).toFixed(1)
   return String(value)
+}
+
+// Simplify Rust debug format query plan to compact tree
+const formatQueryPlan = (plan: string): string => {
+  // Normalize whitespace for easier parsing
+  const normalized = plan.replace(/\s+/g, ' ')
+  const lines: string[] = []
+
+  // Match main operation types
+  const projectMatch = normalized.match(/^(Optimized)?Project\s*\{/)
+  const indexScanMatch = normalized.match(/IndexScan\s*\{[^}]*table:\s*"([^"]+)"[^}]*index:\s*"([^"]+)"/)
+  const scanMatch = normalized.match(/Scan\s*\{[^}]*table:\s*"([^"]+)"/)
+  const limitMatch = normalized.match(/limit:\s*(?:Some\(\s*)?(\d+)/)
+  const offsetMatch = normalized.match(/offset:\s*(?:Some\(\s*)?(\d+)/)
+  const filterMatch = normalized.match(/Filter\s*\{[^}]*predicate:/)
+
+  // Extract range values - match Float64(xxx) or Int64(xxx) or String("xxx")
+  // Match the value inside the type wrapper, handling trailing comma and whitespace
+  const rangeStartMatch = normalized.match(/range_start:\s*Some\(\s*(Float64|Int64|String)\(\s*([^)]+?)\s*,?\s*\)/)
+  const rangeEndMatch = normalized.match(/range_end:\s*Some\(\s*(Float64|Int64|String)\(\s*([^)]+?)\s*,?\s*\)/)
+
+  // Extract include_start/include_end for open/closed interval notation
+  const includeStartMatch = normalized.match(/include_start:\s*(true|false)/)
+  const includeEndMatch = normalized.match(/include_end:\s*(true|false)/)
+
+  // Extract reverse flag for DESC ordering
+  const reverseMatch = normalized.match(/reverse:\s*(true|false)/)
+
+  // Extract columns
+  const columnMatches = normalized.matchAll(/column:\s*"([^"]+)"/g)
+  const columns = [...columnMatches].map(m => m[1])
+
+  // Build compact representation
+  if (projectMatch) {
+    lines.push(projectMatch[1] ? 'OptimizedProject' : 'Project')
+  }
+
+  if (indexScanMatch) {
+    let scanLine = `  └─ IndexScan(${indexScanMatch[1]}.${indexScanMatch[2]})`
+    if (reverseMatch && reverseMatch[1] === 'true') {
+      scanLine += ' DESC'
+    }
+    if (rangeStartMatch || rangeEndMatch) {
+      const start = rangeStartMatch ? rangeStartMatch[2].replace(/"/g, '').trim() : '-∞'
+      const end = rangeEndMatch ? rangeEndMatch[2].replace(/"/g, '').trim() : '+∞'
+      const includeStart = includeStartMatch ? includeStartMatch[1] === 'true' : true
+      const includeEnd = includeEndMatch ? includeEndMatch[1] === 'true' : true
+      const leftBracket = includeStart ? '[' : '('
+      const rightBracket = includeEnd ? ']' : ')'
+      scanLine += ` ${leftBracket}${start}, ${end}${rightBracket}`
+    }
+    lines.push(scanLine)
+  } else if (scanMatch) {
+    lines.push(`  └─ Scan(${scanMatch[1]})`)
+  }
+
+  if (limitMatch) {
+    const offset = offsetMatch ? parseInt(offsetMatch[1]) : 0
+    lines.push(`  └─ Limit(${limitMatch[1]}${offset > 0 ? `, offset=${offset}` : ''})`)
+  }
+
+  if (filterMatch) {
+    lines.push(`  └─ Filter(...)`)
+  }
+
+  if (columns.length > 0) {
+    lines.push(`  → [${columns.join(', ')}]`)
+  }
+
+  return lines.join('\n') || plan.slice(0, 200) + '...'
 }
