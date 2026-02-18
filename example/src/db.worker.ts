@@ -9,8 +9,10 @@ import {
   initCynos,
   createDatabase,
   JsDataType,
+  JsSortOrder,
   ColumnOptions,
   col,
+  ResultSet,
   type Database,
 } from '@cynos/core'
 
@@ -120,6 +122,7 @@ export type MainMessage =
   | { type: 'error'; message: string }
   // Query Builder responses
   | { type: 'queryResult'; stocks: Stock[]; execTime: number; affectedRows: number; stockCount: number }
+  | { type: 'queryBinaryResult'; buffer: ArrayBuffer; layout: SerializedSchemaLayout; queryTime: number; stockCount: number }
   | { type: 'stockCount'; count: number }
 
 // Serializable schema layout for transfer to main thread
@@ -130,6 +133,9 @@ export type SerializedSchemaLayout = {
   columnOffsets: number[]
   nullMaskSize: number
 }
+
+// Cache for serialized schema layouts (keyed by sorted field names)
+const layoutCache = new Map<string, SerializedSchemaLayout>()
 
 function postToMain(msg: MainMessage, transfer?: Transferable[]) {
   if (transfer) {
@@ -329,11 +335,11 @@ async function querySelect(
   if (!db) return
 
   const start = performance.now()
-  let query = db.select(...(fields.length === 13 ? ['*'] : fields)).from('stocks')
+  const useAllFields = fields.length === 13
+  let query = db.select(...(useAllFields ? ['*'] : fields)).from('stocks')
   query = applyWhereClauses(query, whereClauses)
 
   if (orderBy) {
-    const { JsSortOrder } = await import('@cynos/core')
     const order = orderBy.dir === 'Asc' ? JsSortOrder.Asc : JsSortOrder.Desc
     query = query.orderBy(orderBy.field, order)
   }
@@ -342,9 +348,39 @@ async function querySelect(
     query = query.limit(limit)
   }
 
-  const stocks = await query.exec() as Stock[]
-  const execTime = performance.now() - start
-  postToMain({ type: 'queryResult', stocks, execTime, affectedRows: stocks.length, stockCount })
+  // Execute and get binary result
+  const binaryResult = await query.execBinary()
+  const queryTime = performance.now() - start
+
+  // Get or create cached layout (not counted in query time)
+  const cacheKey = useAllFields ? '*' : fields.slice().sort().join(',')
+  let serializedLayout = layoutCache.get(cacheKey)
+
+  if (!serializedLayout) {
+    const schemaLayout = query.getSchemaLayout()
+    const colCount = schemaLayout.columnCount()
+    serializedLayout = {
+      columnCount: colCount,
+      columnNames: [],
+      columnTypes: [],
+      columnOffsets: [],
+      nullMaskSize: schemaLayout.nullMaskSize(),
+    }
+    for (let i = 0; i < colCount; i++) {
+      serializedLayout.columnNames.push(schemaLayout.columnName(i) ?? '')
+      serializedLayout.columnTypes.push(schemaLayout.columnType(i) ?? 0)
+      serializedLayout.columnOffsets.push(schemaLayout.columnOffset(i) ?? 0)
+    }
+    layoutCache.set(cacheKey, serializedLayout)
+  }
+
+  const view = binaryResult.asView()
+  // Copy to transferable ArrayBuffer
+  const buffer = view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength)
+  binaryResult.free()
+
+  // Transfer binary to main thread for decode (zero-copy)
+  postToMain({ type: 'queryBinaryResult', buffer, layout: serializedLayout, queryTime, stockCount }, [buffer])
 }
 
 // Query Builder: INSERT

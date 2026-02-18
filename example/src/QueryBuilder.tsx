@@ -50,6 +50,8 @@ export default function QueryBuilder() {
     executing,
     results,
     execTime,
+    latencyTime,
+    decodeTime,
     affectedRows,
     error,
     querySelect,
@@ -502,8 +504,15 @@ export default function QueryBuilder() {
                   <div className="flex flex-wrap gap-4 sm:gap-6 text-[10px] sm:text-xs">
                     <div className="flex items-center gap-1.5 sm:gap-2">
                       <Clock className="w-3 h-3 sm:w-4 sm:h-4 text-white/40" />
-                      <span className="text-white/40">TIME</span>
-                      <span className="font-mono font-bold">{execTime?.toFixed(2)} ms</span>
+                      <span className="text-white/40">QUERY</span>
+                      <span className="font-mono font-bold">{execTime?.toFixed(2)}ms</span>
+                      {(latencyTime !== null || decodeTime !== null) && (
+                        <span className="text-white/30 font-mono">
+                          ({decodeTime !== null && `+${decodeTime.toFixed(1)}ms decode`}
+                          {latencyTime !== null && decodeTime !== null && ', '}
+                          {latencyTime !== null && `+${latencyTime.toFixed(1)}ms RT latency`})
+                        </span>
+                      )}
                     </div>
                     {affectedRows !== null && (
                       <div className="flex items-center gap-1.5 sm:gap-2">

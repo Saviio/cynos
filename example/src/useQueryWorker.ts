@@ -5,16 +5,21 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import type { Stock } from './db'
 import type { WorkerMessage, MainMessage, WhereClause } from './db.worker'
+import { createDecoder } from './binary-decoder'
 
 export type { WhereClause }
 
 export function useQueryWorker() {
   const workerRef = useRef<Worker | null>(null)
+  const decoderRef = useRef<((buffer: ArrayBuffer) => Stock[]) | null>(null)
+  const requestStartRef = useRef<number>(0)
   const [ready, setReady] = useState(false)
   const [stockCount, setStockCount] = useState(0)
   const [executing, setExecuting] = useState(false)
   const [results, setResults] = useState<Stock[]>([])
   const [execTime, setExecTime] = useState<number | null>(null)
+  const [latencyTime, setLatencyTime] = useState<number | null>(null)
+  const [decodeTime, setDecodeTime] = useState<number | null>(null)
   const [affectedRows, setAffectedRows] = useState<number | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -41,10 +46,35 @@ export function useQueryWorker() {
         case 'queryResult':
           setResults(msg.stocks)
           setExecTime(msg.execTime)
+          setLatencyTime(null)
+          setDecodeTime(null)
           setAffectedRows(msg.affectedRows)
           setStockCount(msg.stockCount)
           setExecuting(false)
           break
+
+        case 'queryBinaryResult': {
+          // Decode on main thread using pure JS decoder
+          const decodeStart = performance.now()
+          if (!decoderRef.current) {
+            decoderRef.current = createDecoder(msg.layout)
+          }
+          const stocks = decoderRef.current(msg.buffer)
+          const decode = performance.now() - decodeStart
+
+          // Calculate latency: total round-trip time - query time - decode time
+          const totalTime = performance.now() - requestStartRef.current
+          const latency = totalTime - msg.queryTime - decode
+
+          setResults(stocks)
+          setExecTime(msg.queryTime)
+          setLatencyTime(latency)
+          setDecodeTime(decode)
+          setAffectedRows(stocks.length)
+          setStockCount(msg.stockCount)
+          setExecuting(false)
+          break
+        }
 
         case 'error':
           setError(msg.message)
@@ -70,6 +100,7 @@ export function useQueryWorker() {
     setError(null)
     setResults([])
     setAffectedRows(null)
+    requestStartRef.current = performance.now()
     workerRef.current?.postMessage({
       type: 'querySelect',
       fields,
@@ -121,6 +152,8 @@ export function useQueryWorker() {
   const clearResults = useCallback(() => {
     setResults([])
     setExecTime(null)
+    setLatencyTime(null)
+    setDecodeTime(null)
     setAffectedRows(null)
     setError(null)
   }, [])
@@ -131,6 +164,8 @@ export function useQueryWorker() {
     executing,
     results,
     execTime,
+    latencyTime,
+    decodeTime,
     affectedRows,
     error,
     querySelect,
