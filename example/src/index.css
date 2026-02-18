@@ -98,3 +98,7 @@
   content: '_';
   animation: blink 1s infinite;
 }
+
+.font-mono {
+  font-family: 'JetBrains Mono', 'SF Mono', 'Monaco', 'Inconsolata', 'Fira Code', monospace;
+}
