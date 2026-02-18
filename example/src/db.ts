@@ -99,6 +99,8 @@ export async function getDatabase(): Promise<Database> {
         .column('marketCap', JsDataType.Int64, null)
         .column('pe', JsDataType.Float64, null)
         .column('sector', JsDataType.String, null)
+        .index('idx_price', 'price')
+        .index('idx_symbol', 'symbol')
         .index('idx_sector', 'sector')
 
       database.registerTable(stocksTable)

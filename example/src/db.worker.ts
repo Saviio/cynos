@@ -90,6 +90,12 @@ function randomValue(field: keyof Stock): number {
 }
 
 // Message types
+export type WhereClause = {
+  field: keyof Stock
+  operator: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte'
+  value: string | number
+}
+
 export type WorkerMessage =
   | { type: 'init' }
   | { type: 'subscribe'; limit: number }
@@ -97,6 +103,12 @@ export type WorkerMessage =
   | { type: 'startUpdates'; displayLimit: number; batchSize: number }
   | { type: 'stopUpdates' }
   | { type: 'insertStocks'; count: number }
+  // Query Builder operations
+  | { type: 'querySelect'; fields: (keyof Stock)[]; where: WhereClause[]; orderBy?: { field: keyof Stock; dir: 'Asc' | 'Desc' }; limit?: number }
+  | { type: 'queryInsert'; count: number }
+  | { type: 'queryUpdate'; field: keyof Stock; value: string | number; where: WhereClause[] }
+  | { type: 'queryDelete'; where: WhereClause[] }
+  | { type: 'getStockCount' }
 
 export type MainMessage =
   | { type: 'ready'; stockCount: number }
@@ -106,6 +118,9 @@ export type MainMessage =
   | { type: 'stats'; updates: number; elapsed: number; ups: number }
   | { type: 'insertComplete'; count: number; time: number; stockCount: number }
   | { type: 'error'; message: string }
+  // Query Builder responses
+  | { type: 'queryResult'; stocks: Stock[]; execTime: number; affectedRows: number; stockCount: number }
+  | { type: 'stockCount'; count: number }
 
 // Serializable schema layout for transfer to main thread
 export type SerializedSchemaLayout = {
@@ -146,6 +161,9 @@ async function initDatabase() {
       .column('marketCap', JsDataType.Int64, null)
       .column('pe', JsDataType.Float64, null)
       .column('sector', JsDataType.String, null)
+      .index('idx_price', 'price')
+      .index('idx_symbol', 'symbol')
+      .index('idx_sector', 'sector')
 
     db.registerTable(stocksTable)
 
@@ -283,6 +301,97 @@ async function insertStocks(count: number) {
   postToMain({ type: 'insertComplete', count: inserted, time, stockCount })
 }
 
+// Query Builder helper: apply where clauses
+function applyWhereClauses<T>(query: T, whereClauses: WhereClause[]): T {
+  let q = query as any
+  for (const clause of whereClauses) {
+    const colRef = col(clause.field)
+    const val = clause.value
+    switch (clause.operator) {
+      case 'eq': q = q.where(colRef.eq(val)); break
+      case 'neq': q = q.where(colRef.eq(val).not()); break
+      case 'gt': q = q.where(colRef.gt(val)); break
+      case 'gte': q = q.where(colRef.gte(val)); break
+      case 'lt': q = q.where(colRef.lt(val)); break
+      case 'lte': q = q.where(colRef.lte(val)); break
+    }
+  }
+  return q as T
+}
+
+// Query Builder: SELECT
+async function querySelect(
+  fields: (keyof Stock)[],
+  whereClauses: WhereClause[],
+  orderBy?: { field: keyof Stock; dir: 'Asc' | 'Desc' },
+  limit?: number
+) {
+  if (!db) return
+
+  const start = performance.now()
+  let query = db.select(...(fields.length === 13 ? ['*'] : fields)).from('stocks')
+  query = applyWhereClauses(query, whereClauses)
+
+  if (orderBy) {
+    const { JsSortOrder } = await import('@cynos/core')
+    const order = orderBy.dir === 'Asc' ? JsSortOrder.Asc : JsSortOrder.Desc
+    query = query.orderBy(orderBy.field, order)
+  }
+
+  if (limit) {
+    query = query.limit(limit)
+  }
+
+  const stocks = await query.exec() as Stock[]
+  const execTime = performance.now() - start
+  postToMain({ type: 'queryResult', stocks, execTime, affectedRows: stocks.length, stockCount })
+}
+
+// Query Builder: INSERT
+async function queryInsert(count: number) {
+  if (!db) return
+
+  const start = performance.now()
+  const batchSize = 10000
+  let inserted = 0
+
+  for (let i = 0; i < count; i += batchSize) {
+    const batch = Math.min(batchSize, count - i)
+    const stocks = Array.from({ length: batch }, (_, j) => generateStock(stockCount + i + j + 1))
+    await db.insert('stocks').values(stocks).exec()
+    inserted += batch
+  }
+
+  stockCount += count
+  const execTime = performance.now() - start
+  postToMain({ type: 'queryResult', stocks: [], execTime, affectedRows: inserted, stockCount })
+}
+
+// Query Builder: UPDATE
+async function queryUpdate(field: keyof Stock, value: string | number, whereClauses: WhereClause[]) {
+  if (!db) return
+
+  const start = performance.now()
+  let query = db.update('stocks').set(field, value)
+  query = applyWhereClauses(query, whereClauses)
+  await query.exec()
+  const execTime = performance.now() - start
+  postToMain({ type: 'queryResult', stocks: [], execTime, affectedRows: 0, stockCount })
+}
+
+// Query Builder: DELETE
+async function queryDelete(whereClauses: WhereClause[]) {
+  if (!db) return
+
+  const start = performance.now()
+  let query = db.delete('stocks')
+  query = applyWhereClauses(query, whereClauses)
+  await query.exec()
+  stockCount = db.totalRowCount()
+  const execTime = performance.now() - start
+  postToMain({ type: 'queryResult', stocks: [], execTime, affectedRows: 0, stockCount })
+}
+
 // Handle messages from main thread
 self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
   const msg = e.data
@@ -306,6 +415,22 @@ self.onmessage = async (e: MessageEvent<WorkerMessage>) => {
         break
       case 'insertStocks':
         await insertStocks(msg.count)
+        break
+      // Query Builder operations
+      case 'querySelect':
+        await querySelect(msg.fields, msg.where, msg.orderBy, msg.limit)
+        break
+      case 'queryInsert':
+        await queryInsert(msg.count)
+        break
+      case 'queryUpdate':
+        await queryUpdate(msg.field, msg.value, msg.where)
+        break
+      case 'queryDelete':
+        await queryDelete(msg.where)
+        break
+      case 'getStockCount':
+        postToMain({ type: 'stockCount', count: stockCount })
         break
     }
   } catch (err) {

@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@cynos/core':
-        specifier: ^0.1.1
-        version: 0.1.1
+        specifier: ^0.1.2
+        version: 0.1.2
       '@radix-ui/react-select':
         specifier: ^2.1.2
         version: 2.2.6(@types/react-dom@18.3.7(@types/react@18.3.28))(@types/react@18.3.28)(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
@@ -165,8 +165,8 @@ packages:
     resolution: {integrity: sha512-LwdZHpScM4Qz8Xw2iKSzS+cfglZzJGvofQICy7W7v4caru4EaAmyUuO6BGrbyQ2mYV11W0U8j5mBhd14dd3B0A==}
     engines: {node: '>=6.9.0'}
 
-  '@cynos/core@0.1.1':
-    resolution: {integrity: sha512-kLYr2joIT5WpcXtUGMO8v1Lhz66o35OH4CwAaysU52bXBHY3WVZA0a8yYUX1w+Ur4QR+gIC7fx7cJlttF+13Tw==}
+  '@cynos/core@0.1.2':
+    resolution: {integrity: sha512-sclhL7Kb3I+6fhQhlR65DK4CHG/KE8eUV5Ke4iLLFEc7E5ReycdDuF/O6b4F1w4sEzCVWEHZ2SYlz6YRQE4nVA==}
 
   '@dimforge/rapier3d-compat@0.12.0':
     resolution: {integrity: sha512-uekIGetywIgopfD97oDL5PfeezkFpNhwlzlaEYNOA0N6ghdsOvh/HYjSMek5Q2O1PYvRSDFcqFVJl4r4ZBwOow==}
@@ -1503,7 +1503,7 @@ snapshots:
       '@babel/helper-string-parser': 7.27.1
       '@babel/helper-validator-identifier': 7.28.5
 
-  '@cynos/core@0.1.1': {}
+  '@cynos/core@0.1.2': {}
 
   '@dimforge/rapier3d-compat@0.12.0': {}
 

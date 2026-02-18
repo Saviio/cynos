@@ -1,11 +1,15 @@
 import { createRoot } from 'react-dom/client'
-import { useState, useEffect } from 'react'
+import { useState, useEffect, lazy, Suspense } from 'react'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Layers, Activity, GitCompare, Home } from 'lucide-react'
+import { Layers, Activity, GitCompare, Home, Code, Loader2 } from 'lucide-react'
 import Landing from './Landing'
 import App from './App'
 import IvmDemo from './IvmDemo'
+import QueryBuilder from './QueryBuilder'
 import './index.css'
+
+// Lazy load hidden comparison page
+const LovefieldComparison = lazy(() => import('./LovefieldComparison'))
 
 function Router() {
   const [route, setRoute] = useState(location.hash || '#/')
@@ -21,7 +25,7 @@ function Router() {
     setRoute(hash)
   }
 
-  const currentTab = route === '#/live' ? 'live' : route === '#/ivm' ? 'ivm' : 'home'
+  const currentTab = route === '#/live' ? 'live' : route === '#/ivm' ? 'ivm' : route === '#/query' ? 'query' : 'home'
 
   return (
     <div className="min-h-screen bg-background">
@@ -64,7 +68,15 @@ function Router() {
                   className="gap-1.5"
                 >
                   <GitCompare className="w-4 h-4" />
-                  IVM Demo
+                  Incremental Query
+                </TabsTrigger>
+                <TabsTrigger
+                  value="query"
+                  onClick={() => navigate('#/query')}
+                  className="gap-1.5"
+                >
+                  <Code className="w-4 h-4" />
+                  Query Builder
                 </TabsTrigger>
               </TabsList>
             </Tabs>
@@ -89,6 +101,12 @@ function Router() {
               >
                 <GitCompare className="w-5 h-5" />
               </button>
+              <button
+                onClick={() => navigate('#/query')}
+                className={`p-2 rounded-md transition-colors ${currentTab === 'query' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              >
+                <Code className="w-5 h-5" />
+              </button>
             </div>
           </div>
         </div>
@@ -100,6 +118,17 @@ function Router() {
           <App />
         ) : route === '#/ivm' ? (
           <IvmDemo />
+        ) : route === '#/query' ? (
+          <QueryBuilder />
+        ) : route === '#/lf' ? (
+          <Suspense fallback={
+            <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4">
+              <Loader2 className="w-8 h-8 animate-spin" />
+              <p className="text-white/40 text-sm tracking-wider uppercase">Loading...</p>
+            </div>
+          }>
+            <LovefieldComparison />
+          </Suspense>
         ) : (
           <Landing onNavigate={navigate} />
         )}

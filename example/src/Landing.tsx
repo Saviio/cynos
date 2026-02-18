@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Database, Zap, GitCompare, ArrowRight, Activity, Gauge, Terminal, Box, Cpu } from 'lucide-react'
+import { Database, Zap, GitCompare, ArrowRight, Activity, Gauge, Terminal, Box, Cpu, Code } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { TextMorph } from 'torph/react'
 import { WaveBackground } from './components/WaveBackground'
@@ -29,11 +29,11 @@ export default function Landing({ onNavigate }: LandingProps) {
         <div className="container mx-auto px-4 relative">
           <div className="max-w-4xl mx-auto text-center">
             {/* Terminal-style header */}
-            <div className="inline-flex items-center gap-2 mb-8 px-4 py-2 border border-white/20 bg-black/50 text-xs tracking-widest uppercase">
+            <div className="inline-flex items-center gap-2 mb-8 px-4 py-2 border border-white/20 bg-black/50 text-[10px] sm:text-xs tracking-widest uppercase">
               <span className="w-2 h-2 bg-white animate-pulse" />
               <span className="text-white/60">SYS.INIT</span>
               <span className="text-white/40">//</span>
-              <span>INCREMENTAL VIEW MAINTENANCE</span>
+              <span>INCREMENTAL.VIEW.MAINTENANCE</span>
             </div>
 
             <h1 className="text-5xl md:text-7xl lg:text-8xl font-bold tracking-tighter mb-6">
@@ -114,7 +114,7 @@ export default function Landing({ onNavigate }: LandingProps) {
               </div>
               <h3 className="text-sm font-bold tracking-wider uppercase mb-3">Binary Protocol</h3>
               <p className="text-sm text-white/40 leading-relaxed">
-                Efficient binary serialization for query results. Up to 10x faster than JSON parsing.
+                Efficient binary serialization for query results. Delivers up to 10x faster parsing than JSON under optimized conditions.
               </p>
             </div>
           </div>
@@ -129,7 +129,7 @@ export default function Landing({ onNavigate }: LandingProps) {
             <h2 className="text-2xl md:text-3xl font-bold tracking-tight">INTERACTIVE DEMOS</h2>
           </div>
 
-          <div className="grid md:grid-cols-2 gap-6 max-w-4xl mx-auto">
+          <div className="grid md:grid-cols-3 gap-6 max-w-5xl mx-auto">
             <div
               className="border border-white/10 bg-white/[0.02] p-8 hover:border-white/30 transition-all cursor-pointer group"
               onClick={() => onNavigate('#/live')}
@@ -141,15 +141,13 @@ export default function Landing({ onNavigate }: LandingProps) {
                 </div>
                 <ArrowRight className="w-4 h-4 text-white/30 group-hover:text-white transition-colors" />
               </div>
-              <h3 className="text-lg font-bold tracking-wide uppercase mb-3">Live Query Demo</h3>
+              <h3 className="text-lg font-bold tracking-wide uppercase mb-3">Live Query</h3>
               <p className="text-sm text-white/40 mb-6">
-                Watch real-time stock data updates with live query subscriptions.
-                Test continuous updates and see cell-level change highlighting.
+                Real-time stock data with live query subscriptions and cell-level highlighting.
               </p>
               <div className="flex gap-2 flex-wrap">
                 <span className="text-xs px-2 py-1 border border-white/20 text-white/60">observe()</span>
                 <span className="text-xs px-2 py-1 border border-white/20 text-white/60">Real-time</span>
-                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">100K+ Rows</span>
               </div>
             </div>
 
@@ -166,13 +164,33 @@ export default function Landing({ onNavigate }: LandingProps) {
               </div>
               <h3 className="text-lg font-bold tracking-wide uppercase mb-3">IVM vs Re-query</h3>
               <p className="text-sm text-white/40 mb-6">
-                Compare incremental view maintenance (trace) against traditional re-query (observe).
-                See the performance difference in real-time.
+                Compare incremental view maintenance against traditional re-query performance.
               </p>
               <div className="flex gap-2 flex-wrap">
                 <span className="text-xs px-2 py-1 border border-white/20 text-white/60">trace()</span>
                 <span className="text-xs px-2 py-1 border border-white/20 text-white/60">O(delta)</span>
-                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">Benchmark</span>
+              </div>
+            </div>
+
+            <div
+              className="border border-white/10 bg-white/[0.02] p-8 hover:border-white/30 transition-all cursor-pointer group"
+              onClick={() => onNavigate('#/query')}
+            >
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex items-center gap-3">
+                  <Code className="w-4 h-4" />
+                  <span className="text-xs tracking-widest uppercase">CRUD</span>
+                </div>
+                <ArrowRight className="w-4 h-4 text-white/30 group-hover:text-white transition-colors" />
+              </div>
+              <h3 className="text-lg font-bold tracking-wide uppercase mb-3">Query Builder</h3>
+              <p className="text-sm text-white/40 mb-6">
+                Build SQL-like queries visually. Full CRUD operations with execution stats.
+              </p>
+              <div className="flex gap-2 flex-wrap">
+                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">SELECT</span>
+                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">INSERT</span>
+                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">UPDATE</span>
               </div>
             </div>
           </div>
