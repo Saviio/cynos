@@ -332,6 +332,7 @@ dependencies = [
 name = "cynos-storage"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "cynos-core",
  "cynos-incremental",
  "cynos-index",

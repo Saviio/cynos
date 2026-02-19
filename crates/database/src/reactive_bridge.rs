@@ -512,6 +512,7 @@ impl JsObservableQuery {
     }
 
     /// Get the aggregate columns.
+    #[allow(dead_code)]
     pub(crate) fn aggregate_columns(&self) -> Option<&Vec<String>> {
         self.aggregate_columns.as_ref()
     }

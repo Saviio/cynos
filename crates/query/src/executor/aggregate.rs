@@ -6,7 +6,7 @@ use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
-use cynos_core::{Row, Value, DUMMY_ROW_ID};
+use cynos_core::{Row, Value};
 use libm::{exp, log, sqrt};
 
 /// Aggregate executor - computes aggregate functions.

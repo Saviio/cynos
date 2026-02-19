@@ -195,21 +195,19 @@ impl BinaryEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloc::string::String;
+    use alloc::string::ToString;
+    use alloc::vec;
     use cynos_core::schema::{Column, Table};
     use cynos_core::DataType;
 
     fn create_test_schema() -> Table {
         Table::new(
-            "test".to_string(),
+            "test",
             vec![
-                Column::new("id".to_string(), DataType::Int64),
-                Column::new("name".to_string(), DataType::String).nullable(true),
-                Column::new("value".to_string(), DataType::Float64),
+                Column::new("id", DataType::Int64),
+                Column::new("name", DataType::String).nullable(true),
+                Column::new("value", DataType::Float64),
             ],
-            vec![],
-            Default::default(),
-            false,
         )
     }
 

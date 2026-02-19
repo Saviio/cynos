@@ -29,6 +29,8 @@ pub trait IndexStore {
     fn get(&self, key: &Value) -> Vec<RowId>;
     /// Removes a key-value pair.
     fn remove(&mut self, key: &Value, row_id: Option<RowId>);
+    /// Removes multiple key-value pairs in batch (more efficient than multiple remove calls).
+    fn remove_batch(&mut self, entries: &[(Value, RowId)]);
     /// Checks if the index contains a key.
     fn contains_key(&self, key: &Value) -> bool;
     /// Returns the number of entries.
@@ -76,6 +78,10 @@ impl IndexStore for BTreeIndexStore {
 
     fn remove(&mut self, key: &Value, row_id: Option<RowId>) {
         self.inner.remove(key, row_id);
+    }
+
+    fn remove_batch(&mut self, entries: &[(Value, RowId)]) {
+        self.inner.remove_batch(entries);
     }
 
     fn contains_key(&self, key: &Value) -> bool {
@@ -132,6 +138,13 @@ impl IndexStore for HashIndexStore {
 
     fn remove(&mut self, key: &Value, row_id: Option<RowId>) {
         self.inner.remove(key, row_id);
+    }
+
+    fn remove_batch(&mut self, entries: &[(Value, RowId)]) {
+        // HashIndex doesn't have optimized batch remove, fall back to individual removes
+        for (key, row_id) in entries {
+            self.inner.remove(key, Some(*row_id));
+        }
     }
 
     fn contains_key(&self, key: &Value) -> bool {
@@ -435,6 +448,60 @@ impl RowStore {
         }
 
         Ok(row)
+    }
+
+    /// Deletes multiple rows from the store in batch.
+    /// This is more efficient than calling delete() multiple times because it:
+    /// 1. Batches index removals for better cache locality
+    /// 2. Reduces repeated HashMap lookups for index names
+    /// Returns the deleted rows.
+    pub fn delete_batch(&mut self, row_ids: &[RowId]) -> Vec<Rc<Row>> {
+        if row_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // First pass: remove rows from the main storage and collect them
+        let mut deleted_rows: Vec<Rc<Row>> = Vec::with_capacity(row_ids.len());
+        for &row_id in row_ids {
+            if let Some(row) = self.rows.remove(&row_id) {
+                deleted_rows.push(row);
+            }
+        }
+
+        if deleted_rows.is_empty() {
+            return Vec::new();
+        }
+
+        // Prepare batch entries for row_id_index
+        let row_id_entries: Vec<(Value, RowId)> = deleted_rows
+            .iter()
+            .map(|row| (Value::Int64(row.id() as i64), row.id()))
+            .collect();
+        self.row_id_index.remove_batch(&row_id_entries);
+
+        // Prepare batch entries for primary key index
+        if !self.pk_columns.is_empty() {
+            if let Some(ref mut pk_index) = self.primary_index {
+                let pk_entries: Vec<(Value, RowId)> = deleted_rows
+                    .iter()
+                    .map(|row| (extract_key(row, &self.pk_columns), row.id()))
+                    .collect();
+                pk_index.remove_batch(&pk_entries);
+            }
+        }
+
+        // Prepare batch entries for each secondary index
+        for (idx_name, cols) in &self.index_columns {
+            if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
+                let entries: Vec<(Value, RowId)> = deleted_rows
+                    .iter()
+                    .map(|row| (extract_key(row, cols), row.id()))
+                    .collect();
+                idx.remove_batch(&entries);
+            }
+        }
+
+        deleted_rows
     }
 
     /// Gets a row by ID.
@@ -1114,5 +1181,119 @@ mod tests {
         assert_eq!(insert_delta.diff(), 1);
         assert_eq!(insert_delta.data(), &new_row);
         assert_eq!(store.len(), 1);
+    }
+
+    // ==================== Batch Delete Tests ====================
+
+    #[test]
+    fn test_delete_batch_basic() {
+        let mut store = RowStore::new(test_schema());
+
+        // Insert 10 rows
+        for i in 1..=10 {
+            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            store.insert(row).unwrap();
+        }
+        assert_eq!(store.len(), 10);
+
+        // Delete rows 2, 4, 6, 8
+        let deleted = store.delete_batch(&[2, 4, 6, 8]);
+        assert_eq!(deleted.len(), 4);
+        assert_eq!(store.len(), 6);
+
+        // Verify remaining rows
+        assert!(store.get(1).is_some());
+        assert!(store.get(2).is_none());
+        assert!(store.get(3).is_some());
+        assert!(store.get(4).is_none());
+        assert!(store.get(5).is_some());
+        assert!(store.get(6).is_none());
+        assert!(store.get(7).is_some());
+        assert!(store.get(8).is_none());
+        assert!(store.get(9).is_some());
+        assert!(store.get(10).is_some());
+    }
+
+    #[test]
+    fn test_delete_batch_with_index() {
+        let mut store = RowStore::new(test_schema_with_index());
+
+        // Insert rows with indexed values
+        for i in 1..=5 {
+            let row = Row::new(i, vec![Value::Int64(i as i64), Value::Int64((i * 100) as i64)]);
+            store.insert(row).unwrap();
+        }
+
+        // Delete rows 2 and 4
+        store.delete_batch(&[2, 4]);
+
+        // Verify index is updated correctly
+        let results = store.index_scan("idx_value", Some(&KeyRange::only(Value::Int64(200))));
+        assert_eq!(results.len(), 0); // Row 2 was deleted
+
+        let results = store.index_scan("idx_value", Some(&KeyRange::only(Value::Int64(300))));
+        assert_eq!(results.len(), 1); // Row 3 still exists
+    }
+
+    #[test]
+    fn test_delete_batch_empty() {
+        let mut store = RowStore::new(test_schema());
+
+        for i in 1..=5 {
+            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            store.insert(row).unwrap();
+        }
+
+        // Delete empty batch should be no-op
+        let deleted = store.delete_batch(&[]);
+        assert_eq!(deleted.len(), 0);
+        assert_eq!(store.len(), 5);
+    }
+
+    #[test]
+    fn test_delete_batch_nonexistent() {
+        let mut store = RowStore::new(test_schema());
+
+        for i in 1..=5 {
+            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            store.insert(row).unwrap();
+        }
+
+        // Try to delete nonexistent rows
+        let deleted = store.delete_batch(&[100, 200, 300]);
+        assert_eq!(deleted.len(), 0);
+        assert_eq!(store.len(), 5);
+    }
+
+    #[test]
+    fn test_delete_batch_all() {
+        let mut store = RowStore::new(test_schema());
+
+        for i in 1..=10 {
+            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            store.insert(row).unwrap();
+        }
+
+        // Delete all rows
+        let row_ids: Vec<_> = (1..=10).collect();
+        let deleted = store.delete_batch(&row_ids);
+        assert_eq!(deleted.len(), 10);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_delete_batch_pk_freed() {
+        let mut store = RowStore::new(test_schema());
+
+        // Insert row with PK=100
+        let row = Row::new(1, vec![Value::Int64(100), Value::String("Alice".into())]);
+        store.insert(row).unwrap();
+
+        // Delete it
+        store.delete_batch(&[1]);
+
+        // Should be able to insert another row with same PK
+        let row2 = Row::new(2, vec![Value::Int64(100), Value::String("Bob".into())]);
+        assert!(store.insert(row2).is_ok());
     }
 }

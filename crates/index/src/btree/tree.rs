@@ -482,6 +482,82 @@ impl<K: Clone + Ord> Index<K> for BTreeIndex<K> {
         self.delete(key, value);
     }
 
+    fn remove_batch(&mut self, entries: &[(K, RowId)]) {
+        if entries.is_empty() {
+            return;
+        }
+
+        // Sort entries by key for better cache locality and to process same-key entries together
+        let mut sorted_entries: Vec<_> = entries.iter().collect();
+        sorted_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Track nodes that need underflow handling (defer to end for efficiency)
+        let mut underflow_nodes: Vec<NodeId> = Vec::new();
+
+        // Process entries in sorted order
+        let mut i = 0;
+        while i < sorted_entries.len() {
+            let key = &sorted_entries[i].0;
+            let leaf_id = self.find_leaf(key);
+
+            // Collect all row_ids to remove for this key
+            let mut row_ids_to_remove: Vec<RowId> = Vec::new();
+            while i < sorted_entries.len() && &sorted_entries[i].0 == key {
+                row_ids_to_remove.push(sorted_entries[i].1);
+                i += 1;
+            }
+
+            // Remove all row_ids for this key at once
+            let leaf = &self.arena[leaf_id];
+            if let Some(pos) = leaf.find_key(key) {
+                let values = &mut self.arena[leaf_id].values[pos];
+                let original_len = values.len();
+
+                // Use HashSet for O(1) lookup when removing multiple values
+                if row_ids_to_remove.len() > 4 {
+                    let to_remove: hashbrown::HashSet<RowId> =
+                        row_ids_to_remove.iter().copied().collect();
+                    values.retain(|v| !to_remove.contains(v));
+                } else {
+                    // For small number of removals, linear scan is faster
+                    for row_id in &row_ids_to_remove {
+                        if let Some(idx) = values.iter().position(|&v| v == *row_id) {
+                            values.swap_remove(idx);
+                        }
+                    }
+                }
+
+                let removed = original_len - values.len();
+                self.stats.remove_rows(removed);
+
+                // If all values removed, remove the key
+                if values.is_empty() {
+                    self.arena[leaf_id].keys.remove(pos);
+                    self.arena[leaf_id].values.remove(pos);
+
+                    // Track for deferred underflow handling
+                    if self.arena[leaf_id].is_empty() && leaf_id != self.root {
+                        if !underflow_nodes.contains(&leaf_id) {
+                            underflow_nodes.push(leaf_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle underflows at the end (deferred for efficiency)
+        // Process in reverse order to handle children before parents
+        for node_id in underflow_nodes.into_iter().rev() {
+            if !self.arena[node_id].is_empty() {
+                continue; // Node was filled by subsequent operations
+            }
+            if node_id == self.root {
+                continue; // Root doesn't need underflow handling
+            }
+            self.handle_underflow(node_id);
+        }
+    }
+
     fn contains_key(&self, key: &K) -> bool {
         let leaf_id = self.find_leaf(key);
         self.arena[leaf_id].find_key(key).is_some()
@@ -1515,5 +1591,148 @@ mod tests {
 
         tree.remove(&17, Some(17)); // Remove specific value
         assert_eq!(tree.stats().total_rows(), 7);
+    }
+
+    // ==================== Batch Remove Tests ====================
+
+    #[test]
+    fn test_remove_batch_basic() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, true);
+
+        for i in 0..10 {
+            tree.add(i, i as u64).unwrap();
+        }
+        assert_eq!(tree.len(), 10);
+
+        // Remove entries 2, 4, 6, 8
+        let entries: Vec<(i32, RowId)> = vec![(2, 2), (4, 4), (6, 6), (8, 8)];
+        tree.remove_batch(&entries);
+
+        assert_eq!(tree.len(), 6);
+        assert!(tree.contains_key(&0));
+        assert!(tree.contains_key(&1));
+        assert!(!tree.contains_key(&2));
+        assert!(tree.contains_key(&3));
+        assert!(!tree.contains_key(&4));
+        assert!(tree.contains_key(&5));
+        assert!(!tree.contains_key(&6));
+        assert!(tree.contains_key(&7));
+        assert!(!tree.contains_key(&8));
+        assert!(tree.contains_key(&9));
+    }
+
+    #[test]
+    fn test_remove_batch_same_key_multiple_values() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, false);
+
+        // Add multiple values for same key
+        tree.add(10, 100).unwrap();
+        tree.add(10, 101).unwrap();
+        tree.add(10, 102).unwrap();
+        tree.add(20, 200).unwrap();
+
+        assert_eq!(tree.len(), 4);
+
+        // Remove two values from key 10
+        let entries: Vec<(i32, RowId)> = vec![(10, 100), (10, 102)];
+        tree.remove_batch(&entries);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.get(&10), vec![101]);
+        assert_eq!(tree.get(&20), vec![200]);
+    }
+
+    #[test]
+    fn test_remove_batch_all_entries() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, true);
+
+        for i in 0..20 {
+            tree.add(i, i as u64).unwrap();
+        }
+
+        // Remove all entries
+        let entries: Vec<(i32, RowId)> = (0..20).map(|i| (i, i as u64)).collect();
+        tree.remove_batch(&entries);
+
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn test_remove_batch_empty() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, true);
+
+        for i in 0..5 {
+            tree.add(i, i as u64).unwrap();
+        }
+
+        // Remove empty batch should be no-op
+        let entries: Vec<(i32, RowId)> = vec![];
+        tree.remove_batch(&entries);
+
+        assert_eq!(tree.len(), 5);
+    }
+
+    #[test]
+    fn test_remove_batch_nonexistent_keys() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, true);
+
+        for i in 0..5 {
+            tree.add(i, i as u64).unwrap();
+        }
+
+        // Try to remove keys that don't exist
+        let entries: Vec<(i32, RowId)> = vec![(100, 100), (200, 200)];
+        tree.remove_batch(&entries);
+
+        // Should not affect existing entries
+        assert_eq!(tree.len(), 5);
+    }
+
+    #[test]
+    fn test_remove_batch_large_scale() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(64, true);
+
+        // Insert 10000 entries
+        for i in 0..10000 {
+            tree.add(i, i as u64).unwrap();
+        }
+        assert_eq!(tree.len(), 10000);
+
+        // Remove every other entry (5000 entries)
+        let entries: Vec<(i32, RowId)> = (0..10000)
+            .filter(|i| i % 2 == 0)
+            .map(|i| (i, i as u64))
+            .collect();
+        tree.remove_batch(&entries);
+
+        assert_eq!(tree.len(), 5000);
+
+        // Verify remaining entries
+        for i in 0..10000 {
+            if i % 2 == 0 {
+                assert!(!tree.contains_key(&i));
+            } else {
+                assert!(tree.contains_key(&i));
+                assert_eq!(tree.get(&i), vec![i as u64]);
+            }
+        }
+    }
+
+    #[test]
+    fn test_remove_batch_preserves_order() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, true);
+
+        for i in 0..10 {
+            tree.add(i, i as u64).unwrap();
+        }
+
+        // Remove some entries
+        let entries: Vec<(i32, RowId)> = vec![(3, 3), (7, 7)];
+        tree.remove_batch(&entries);
+
+        // Verify range query still works correctly
+        let result = tree.get_range(None, false, None, 0);
+        assert_eq!(result, vec![0, 1, 2, 4, 5, 6, 8, 9]);
     }
 }

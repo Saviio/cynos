@@ -17,3 +17,8 @@ cynos-incremental = { workspace = true }
 hashbrown = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "row_store_bench"
+harness = false

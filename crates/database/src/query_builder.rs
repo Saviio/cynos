@@ -1474,8 +1474,44 @@ impl DeleteBuilder {
             store.schema().clone()
         };
 
-        // Find rows to delete using query engine (with index optimization)
-        let rows_to_delete: Vec<Row> = if let Some(ref predicate) = self.where_clause {
+        // Fast path: DELETE without WHERE clause - use clear() for O(1) deletion
+        if self.where_clause.is_none() {
+            // Collect all rows for IVM notification before clearing
+            let (delete_count, deltas, deleted_ids) = {
+                let cache = self.cache.borrow();
+                let store = cache
+                    .get_table(&self.table_name)
+                    .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+
+                let rows: Vec<_> = store.scan().collect();
+                let count = rows.len();
+                let deltas: Vec<Delta<Row>> = rows.iter().map(|r| Delta::delete((**r).clone())).collect();
+                let ids: hashbrown::HashSet<_> = rows.iter().map(|r| r.id()).collect();
+                (count, deltas, ids)
+            };
+
+            // Clear the table (O(1) operation)
+            {
+                let mut cache = self.cache.borrow_mut();
+                let store = cache
+                    .get_table_mut(&self.table_name)
+                    .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+                store.clear();
+            }
+
+            // Notify query registry
+            if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
+                self.query_registry
+                    .borrow_mut()
+                    .on_table_change_ivm(table_id, deltas, &deleted_ids);
+            }
+
+            return Ok(JsValue::from_f64(delete_count as f64));
+        }
+
+        // Slow path: DELETE with WHERE clause - need to find matching rows
+        let rows_to_delete: Vec<Row> = {
+            let predicate = self.where_clause.as_ref().unwrap();
             // Build logical plan: SELECT * FROM table WHERE predicate
             let get_col_info = |name: &str| -> Option<(String, usize, DataType)> {
                 schema.get_column(name).map(|col| {
@@ -1498,39 +1534,30 @@ impl DeleteBuilder {
                 .into_iter()
                 .map(|rc| (*rc).clone())
                 .collect()
-        } else {
-            // No WHERE clause - delete all rows (full scan is necessary)
-            let cache = self.cache.borrow();
-            let store = cache
-                .get_table(&self.table_name)
-                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
-            store.scan().map(|rc| (*rc).clone()).collect()
         };
 
-        let mut cache = self.cache.borrow_mut();
-        let store = cache
-            .get_table_mut(&self.table_name)
-            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+        // Collect row IDs for batch deletion
+        let row_ids: Vec<_> = rows_to_delete.iter().map(|r| r.id()).collect();
+        let deleted_ids: hashbrown::HashSet<_> = row_ids.iter().copied().collect();
+        let delete_count = row_ids.len();
 
+        // Build deltas for IVM notification
         let deltas: Vec<Delta<Row>> = rows_to_delete
             .iter()
             .map(|r| Delta::delete(r.clone()))
             .collect();
 
-        let delete_count = rows_to_delete.len();
-
-        // Delete rows and collect their IDs
-        let mut deleted_ids = hashbrown::HashSet::new();
-        for row in rows_to_delete {
-            deleted_ids.insert(row.id());
-            store
-                .delete(row.id())
-                .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
+        // Use batch delete for better performance
+        {
+            let mut cache = self.cache.borrow_mut();
+            let store = cache
+                .get_table_mut(&self.table_name)
+                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+            store.delete_batch(&row_ids);
         }
 
         // Notify query registry with changed IDs and deltas
         if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
-            drop(cache);
             self.query_registry
                 .borrow_mut()
                 .on_table_change_ivm(table_id, deltas, &deleted_ids);

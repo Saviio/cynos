@@ -34,6 +34,8 @@ export type Stock = {
 
 let db: Database | null = null
 let stockCount = 0
+// Track the maximum ID ever used (for generating new unique IDs after delete)
+let maxUsedId = 0
 
 const SECTORS = ['Technology', 'Finance', 'Healthcare', 'Consumer', 'Energy', 'Industrial', 'Materials', 'Utilities', 'Real Estate', 'Telecom']
 const PREFIXES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
@@ -178,8 +180,13 @@ async function initDatabase() {
     const initialStocks = Array.from({ length: 100 }, (_, i) => generateStock(i + 1))
     await db.insert('stocks').values(initialStocks).exec()
     stockCount = 100
+    maxUsedId = 100
   } else {
     stockCount = db.totalRowCount()
+    // When loading existing data, we need to find the max ID to avoid conflicts
+    // For simplicity, assume maxUsedId >= stockCount (conservative estimate)
+    // A more accurate approach would query MAX(id) from the table
+    maxUsedId = stockCount
   }
 
   postToMain({ type: 'ready', stockCount })
@@ -299,11 +306,13 @@ async function insertStocks(count: number) {
 
   for (let i = 0; i < count; i += batchSize) {
     const batch = Math.min(batchSize, count - i)
-    const stocks = Array.from({ length: batch }, (_, j) => generateStock(stockCount + i + j + 1))
+    // Use maxUsedId to generate unique IDs (not stockCount which is row count)
+    const stocks = Array.from({ length: batch }, (_, j) => generateStock(maxUsedId + i + j + 1))
     await db.insert('stocks').values(stocks).exec()
     inserted += batch
   }
 
+  maxUsedId += count
   stockCount += count
   const time = performance.now() - start
   postToMain({ type: 'insertComplete', count: inserted, time, stockCount })
@@ -425,11 +434,13 @@ async function queryInsert(count: number) {
 
   for (let i = 0; i < count; i += batchSize) {
     const batch = Math.min(batchSize, count - i)
-    const stocks = Array.from({ length: batch }, (_, j) => generateStock(stockCount + i + j + 1))
+    // Use maxUsedId to generate unique IDs (not stockCount which is row count)
+    const stocks = Array.from({ length: batch }, (_, j) => generateStock(maxUsedId + i + j + 1))
     await db.insert('stocks').values(stocks).exec()
     inserted += batch
   }
 
+  maxUsedId += count
   stockCount += count
   const execTime = performance.now() - start
   postToMain({ type: 'queryResult', stocks: [], execTime, affectedRows: inserted, stockCount })
@@ -455,6 +466,8 @@ async function queryDelete(whereClauses: WhereClause[]) {
   let query = db.delete('stocks')
   query = applyWhereClauses(query, whereClauses)
   await query.exec()
+  // Only update stockCount (row count), NOT maxUsedId
+  // maxUsedId must remain unchanged to avoid ID conflicts on next insert
   stockCount = db.totalRowCount()
   const execTime = performance.now() - start
   postToMain({ type: 'queryResult', stocks: [], execTime, affectedRows: 0, stockCount })

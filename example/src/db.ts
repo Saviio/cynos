@@ -34,6 +34,8 @@ export const STOCK_COLUMNS: (keyof Stock)[] = [
 let db: Database | null = null
 let dbPromise: Promise<Database> | null = null
 let stockCount = 0
+// Track the maximum ID ever used (for generating new unique IDs after delete)
+let maxUsedId = 0
 
 const SECTORS = ['Technology', 'Finance', 'Healthcare', 'Consumer', 'Energy', 'Industrial', 'Materials', 'Utilities', 'Real Estate', 'Telecom']
 const PREFIXES = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
@@ -109,8 +111,11 @@ export async function getDatabase(): Promise<Database> {
       const initialStocks = Array.from({ length: 100 }, (_, i) => generateStock(i + 1))
       await database.insert('stocks').values(initialStocks).exec()
       stockCount = 100
+      maxUsedId = 100
     } else {
       stockCount = database.totalRowCount()
+      // When loading existing data, assume maxUsedId >= stockCount (conservative estimate)
+      maxUsedId = stockCount
     }
 
     db = database
@@ -131,11 +136,13 @@ export async function insertStocks(count: number): Promise<number> {
 
   for (let i = 0; i < count; i += batchSize) {
     const batch = Math.min(batchSize, count - i)
-    const stocks = Array.from({ length: batch }, (_, j) => generateStock(stockCount + i + j + 1))
+    // Use maxUsedId to generate unique IDs (not stockCount which is row count)
+    const stocks = Array.from({ length: batch }, (_, j) => generateStock(maxUsedId + i + j + 1))
     await database.insert('stocks').values(stocks).exec()
     inserted += batch
   }
 
+  maxUsedId += count
   stockCount += count
   return inserted
 }

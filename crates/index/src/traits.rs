@@ -200,6 +200,18 @@ pub trait Index<K> {
     /// If value is None, removes all values for the key.
     fn remove(&mut self, key: &K, value: Option<RowId>);
 
+    /// Removes multiple key-value pairs from the index in batch.
+    /// This can be more efficient than calling remove() multiple times.
+    /// Default implementation calls remove() for each entry.
+    fn remove_batch(&mut self, entries: &[(K, RowId)])
+    where
+        K: Clone,
+    {
+        for (key, row_id) in entries {
+            self.remove(key, Some(*row_id));
+        }
+    }
+
     /// Checks if the index contains the given key.
     fn contains_key(&self, key: &K) -> bool;
 
