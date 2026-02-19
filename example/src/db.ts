@@ -326,6 +326,7 @@ export async function clearAllStocks(): Promise<void> {
   const database = await getDatabase()
   await database.delete('stocks').exec()
   stockCount = 0
+  maxUsedId = 0  // Reset maxUsedId so new inserts start from id=1
 }
 
 // Delete stocks keeping only first N rows
