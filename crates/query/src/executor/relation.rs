@@ -333,6 +333,11 @@ impl Relation {
         Self { entries, tables, table_column_counts }
     }
 
+    /// Creates a relation from existing entries with metadata.
+    pub fn from_entries(entries: Vec<RelationEntry>, tables: Vec<String>, table_column_counts: Vec<usize>) -> Self {
+        Self { entries, tables, table_column_counts }
+    }
+
     /// Returns the tables in this relation.
     pub fn tables(&self) -> &[String] {
         &self.tables

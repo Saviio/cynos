@@ -198,47 +198,76 @@ impl<'a> OrderByIndexPass<'a> {
     }
 
     /// Tries to replace TableScan + Sort with IndexScan.
+    /// Preserves intermediate nodes (Filter, Project) in the tree.
     fn try_optimize_table_scan(
         &self,
         plan: &PhysicalPlan,
         order_by: &[(Expr, SortOrder)],
     ) -> Option<PhysicalPlan> {
-        // Find a TableScan that can be optimized
-        let table_scan = self.find_table_scan(plan)?;
+        match plan {
+            // Direct TableScan - can optimize
+            PhysicalPlan::TableScan { table } => {
+                // Extract column names from order_by
+                let order_columns: Vec<String> = order_by
+                    .iter()
+                    .filter_map(|(expr, _)| self.extract_column_name(expr))
+                    .collect();
 
-        // Extract column names from order_by
-        let order_columns: Vec<String> = order_by
-            .iter()
-            .filter_map(|(expr, _)| self.extract_column_name(expr))
-            .collect();
+                if order_columns.len() != order_by.len() {
+                    return None; // Not all order_by expressions are simple columns
+                }
 
-        if order_columns.len() != order_by.len() {
-            return None; // Not all order_by expressions are simple columns
+                // Find an index that matches the order_by columns
+                let column_refs: Vec<&str> = order_columns.iter().map(|s| s.as_str()).collect();
+                let index = self.ctx.find_index(table, &column_refs)?;
+
+                // Check if the sort order matches (natural or reversed)
+                let is_reverse = self.check_order_match(order_by, &index.columns)?;
+
+                // Create IndexScan with appropriate range (full scan)
+                Some(PhysicalPlan::IndexScan {
+                    table: table.clone(),
+                    index: index.name.clone(),
+                    range_start: None,
+                    range_end: None,
+                    include_start: true,
+                    include_end: true,
+                    limit: None,
+                    offset: None,
+                    reverse: is_reverse,
+                })
+            }
+
+            // Look through Filter - preserve it in the result
+            PhysicalPlan::Filter { input, predicate } => {
+                let optimized_input = self.try_optimize_table_scan(input, order_by)?;
+                Some(PhysicalPlan::Filter {
+                    input: Box::new(optimized_input),
+                    predicate: predicate.clone(),
+                })
+            }
+
+            // Look through Project - preserve it in the result
+            PhysicalPlan::Project { input, columns } => {
+                let optimized_input = self.try_optimize_table_scan(input, order_by)?;
+                Some(PhysicalPlan::Project {
+                    input: Box::new(optimized_input),
+                    columns: columns.clone(),
+                })
+            }
+
+            // Can't optimize through other nodes
+            _ => None,
         }
-
-        // Find an index that matches the order_by columns
-        let column_refs: Vec<&str> = order_columns.iter().map(|s| s.as_str()).collect();
-        let index = self.ctx.find_index(&table_scan, &column_refs)?;
-
-        // Check if the sort order matches (natural or reversed)
-        let is_reverse = self.check_order_match(order_by, &index.columns)?;
-
-        // Create IndexScan with appropriate range (full scan)
-        Some(PhysicalPlan::IndexScan {
-            table: table_scan,
-            index: index.name.clone(),
-            range_start: None,
-            range_end: None,
-            include_start: true,
-            include_end: true,
-            limit: None,
-            offset: None,
-            reverse: is_reverse,
-        })
     }
 
     /// Tries to replace TopN(TableScan) with IndexScan(limit, offset).
     /// This enables true LIMIT pushdown to the storage layer.
+    /// Preserves intermediate nodes (Filter, Project) in the tree.
+    ///
+    /// IMPORTANT: When there's a Filter, we can only push limit to IndexScan if
+    /// the filter is on the same column as the index. Otherwise, we need to keep
+    /// the TopN to apply limit AFTER filtering.
     fn try_optimize_topn_table_scan(
         &self,
         plan: &PhysicalPlan,
@@ -246,38 +275,73 @@ impl<'a> OrderByIndexPass<'a> {
         limit: usize,
         offset: usize,
     ) -> Option<PhysicalPlan> {
-        // Find a TableScan that can be optimized
-        let table_scan = self.find_table_scan(plan)?;
+        match plan {
+            // Direct TableScan - can fully optimize with limit pushdown
+            PhysicalPlan::TableScan { table } => {
+                // Extract column names from order_by
+                let order_columns: Vec<String> = order_by
+                    .iter()
+                    .filter_map(|(expr, _)| self.extract_column_name(expr))
+                    .collect();
 
-        // Extract column names from order_by
-        let order_columns: Vec<String> = order_by
-            .iter()
-            .filter_map(|(expr, _)| self.extract_column_name(expr))
-            .collect();
+                if order_columns.len() != order_by.len() {
+                    return None;
+                }
 
-        if order_columns.len() != order_by.len() {
-            return None; // Not all order_by expressions are simple columns
+                // Find an index that matches the order_by columns
+                let column_refs: Vec<&str> = order_columns.iter().map(|s| s.as_str()).collect();
+                let index = self.ctx.find_index(table, &column_refs)?;
+
+                // Check if the sort order matches (natural or reversed)
+                let is_reverse = self.check_order_match(order_by, &index.columns)?;
+
+                // Create IndexScan with limit and offset pushed down
+                Some(PhysicalPlan::IndexScan {
+                    table: table.clone(),
+                    index: index.name.clone(),
+                    range_start: None,
+                    range_end: None,
+                    include_start: true,
+                    include_end: true,
+                    limit: Some(limit),
+                    offset: Some(offset),
+                    reverse: is_reverse,
+                })
+            }
+
+            // Filter node - we CANNOT push limit through Filter!
+            // The filter may reduce the result set, so we need TopN after filter.
+            // We can still optimize the Sort part by using IndexScan for ordering.
+            PhysicalPlan::Filter { input, predicate } => {
+                // Try to optimize the inner part for ordering only (no limit pushdown)
+                let optimized_input = self.try_optimize_table_scan(input, order_by)?;
+                // Return Filter -> optimized_input, but keep TopN above (caller will handle)
+                // Actually, we should NOT optimize here because we can't push limit.
+                // Return None to let the caller keep the TopN.
+                // But we CAN still benefit from index ordering - just wrap in TopN.
+                Some(PhysicalPlan::TopN {
+                    input: Box::new(PhysicalPlan::Filter {
+                        input: Box::new(optimized_input),
+                        predicate: predicate.clone(),
+                    }),
+                    order_by: order_by.to_vec(),
+                    limit,
+                    offset,
+                })
+            }
+
+            // Look through Project - preserve it in the result
+            PhysicalPlan::Project { input, columns } => {
+                let optimized_input = self.try_optimize_topn_table_scan(input, order_by, limit, offset)?;
+                Some(PhysicalPlan::Project {
+                    input: Box::new(optimized_input),
+                    columns: columns.clone(),
+                })
+            }
+
+            // Can't optimize through other nodes
+            _ => None,
         }
-
-        // Find an index that matches the order_by columns
-        let column_refs: Vec<&str> = order_columns.iter().map(|s| s.as_str()).collect();
-        let index = self.ctx.find_index(&table_scan, &column_refs)?;
-
-        // Check if the sort order matches (natural or reversed)
-        let is_reverse = self.check_order_match(order_by, &index.columns)?;
-
-        // Create IndexScan with limit and offset pushed down
-        Some(PhysicalPlan::IndexScan {
-            table: table_scan,
-            index: index.name.clone(),
-            range_start: None,
-            range_end: None,
-            include_start: true,
-            include_end: true,
-            limit: Some(limit),
-            offset: Some(offset),
-            reverse: is_reverse,
-        })
     }
 
     /// Tries to optimize TopN over existing IndexScan by setting reverse flag and pushing limit.
@@ -441,19 +505,6 @@ impl<'a> OrderByIndexPass<'a> {
         }
     }
 
-    /// Finds a TableScan in the plan (only if it's directly accessible).
-    fn find_table_scan(&self, plan: &PhysicalPlan) -> Option<String> {
-        match plan {
-            PhysicalPlan::TableScan { table } => Some(table.clone()),
-            // Can look through Filter and Project nodes
-            PhysicalPlan::Filter { input, .. } | PhysicalPlan::Project { input, .. } => {
-                self.find_table_scan(input)
-            }
-            // Stop at nodes that would disrupt ordering
-            _ => None,
-        }
-    }
-
     /// Extracts the column name from a column expression.
     fn extract_column_name(&self, expr: &Expr) -> Option<String> {
         match expr {
@@ -573,8 +624,18 @@ mod tests {
 
         let result = pass.optimize(plan);
 
-        // Should become IndexScan (Filter is transparent for this optimization)
-        assert!(matches!(result, PhysicalPlan::IndexScan { .. }));
+        // Should become Filter -> IndexScan (Sort eliminated, Filter preserved)
+        // The optimization now correctly preserves the Filter while using IndexScan for ordering
+        match result {
+            PhysicalPlan::Filter { input, predicate } => {
+                assert!(matches!(*input, PhysicalPlan::IndexScan { .. }),
+                    "Expected IndexScan inside Filter, got {:?}", input);
+                // Verify predicate is preserved
+                assert!(matches!(predicate, Expr::BinaryOp { .. }),
+                    "Filter predicate should be preserved");
+            }
+            _ => panic!("Expected Filter -> IndexScan, got {:?}", result),
+        }
     }
 
     #[test]

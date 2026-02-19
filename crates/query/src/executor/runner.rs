@@ -16,8 +16,62 @@ use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cmp::Ordering;
 use cynos_core::{Row, Value};
 use cynos_jsonb::{JsonbObject, JsonbValue, JsonPath};
+
+// ========== TopN Heap Entry ==========
+
+/// Entry wrapper for binary heap-based TopN execution.
+/// Stores a reference to the order_by indices to avoid cloning per entry.
+struct TopNHeapEntry<'a> {
+    entry: RelationEntry,
+    order_by: &'a [(usize, SortOrder)],
+}
+
+impl<'a> PartialEq for TopNHeapEntry<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl<'a> Eq for TopNHeapEntry<'a> {}
+
+impl<'a> PartialOrd for TopNHeapEntry<'a> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a> Ord for TopNHeapEntry<'a> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // For TopN with ASC order, we want to keep the k smallest elements.
+        // BinaryHeap is a max-heap, so the largest element is at the top.
+        // We need the heap to keep the k smallest, with the largest of those at top.
+        // So for ASC: normal comparison (larger values have higher priority, stay at top)
+        // For DESC: reversed comparison (smaller values have higher priority, stay at top)
+        for (idx, order) in self.order_by {
+            let a = self.entry.get_field(*idx);
+            let b = other.entry.get_field(*idx);
+            let cmp = match (a, b) {
+                (Some(va), Some(vb)) => va.partial_cmp(vb).unwrap_or(Ordering::Equal),
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
+            };
+            if cmp != Ordering::Equal {
+                // For ASC: keep smallest k, so larger values should be at heap top (normal order)
+                // For DESC: keep largest k, so smaller values should be at heap top (reversed)
+                let final_cmp = match order {
+                    SortOrder::Asc => cmp,
+                    SortOrder::Desc => cmp.reverse(),
+                };
+                return final_cmp;
+            }
+        }
+        Ordering::Equal
+    }
+}
 
 /// Context for expression evaluation in JOIN queries.
 /// Contains table metadata needed to compute correct column indices at runtime.
@@ -390,11 +444,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 limit,
                 offset,
             } => {
-                // TopN is executed as Sort + Limit for now
-                // A more efficient implementation would use a heap
                 let input_rel = self.execute(input)?;
-                let sorted = self.execute_sort(input_rel, order_by)?;
-                self.execute_limit(sorted, *limit, *offset)
+                self.execute_topn(input_rel, order_by, *limit, *offset)
             }
 
             PhysicalPlan::Empty => Ok(Relation::empty()),
@@ -850,6 +901,100 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
     ) -> ExecutionResult<Relation> {
         let executor = LimitExecutor::new(limit, offset);
         Ok(executor.execute(input))
+    }
+
+    // ========== TopN Operation ==========
+
+    /// Executes TopN using a binary heap for O(n log k) performance.
+    /// This is more efficient than Sort + Limit when k << n.
+    fn execute_topn(
+        &self,
+        input: Relation,
+        order_by: &[(Expr, SortOrder)],
+        limit: usize,
+        offset: usize,
+    ) -> ExecutionResult<Relation> {
+        use alloc::collections::BinaryHeap;
+
+        let tables = input.tables().to_vec();
+        let table_column_counts = input.table_column_counts().to_vec();
+        let ctx = EvalContext::new(&tables, &table_column_counts);
+
+        // Convert order_by to column indices
+        let order_by_indices: Vec<(usize, SortOrder)> = order_by
+            .iter()
+            .filter_map(|(expr, order)| {
+                if let Expr::Column(col) = expr {
+                    let actual_index = ctx.resolve_column_index(&col.table, col.index);
+                    Some((actual_index, *order))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let k = limit + offset;
+
+        // For small k or small input, just use sort
+        if k == 0 || input.len() <= k * 2 {
+            let executor = SortExecutor::new(order_by_indices);
+            let sorted = executor.execute(input);
+            let limit_executor = LimitExecutor::new(limit, offset);
+            return Ok(limit_executor.execute(sorted));
+        }
+
+        // Build heap with capacity k (using reference to avoid cloning order_by per entry)
+        let mut heap: BinaryHeap<TopNHeapEntry> = BinaryHeap::with_capacity(k + 1);
+
+        for entry in input.into_iter() {
+            let heap_entry = TopNHeapEntry {
+                entry,
+                order_by: &order_by_indices,
+            };
+
+            if heap.len() < k {
+                heap.push(heap_entry);
+            } else if let Some(top) = heap.peek() {
+                // Replace if new entry should come before the worst (top) in final result.
+                // For ASC: heap keeps k smallest, top is largest of those. Replace if new < top.
+                // For DESC: heap keeps k largest, top is smallest of those. Replace if new > top.
+                // In our Ord impl: for ASC, larger values are Greater; for DESC, smaller are Greater.
+                // So we replace when heap_entry < top (Less), meaning heap_entry is better.
+                if heap_entry.cmp(top) == Ordering::Less {
+                    heap.pop();
+                    heap.push(heap_entry);
+                }
+            }
+        }
+
+        // Extract and sort the k elements
+        let mut result: Vec<RelationEntry> = heap.into_iter().map(|e| e.entry).collect();
+
+        // Sort the result (heap doesn't maintain full order)
+        result.sort_by(|a, b| {
+            for (idx, order) in &order_by_indices {
+                let va = a.get_field(*idx);
+                let vb = b.get_field(*idx);
+                let cmp = match (va, vb) {
+                    (Some(va), Some(vb)) => va.partial_cmp(vb).unwrap_or(Ordering::Equal),
+                    (Some(_), None) => Ordering::Greater,
+                    (None, Some(_)) => Ordering::Less,
+                    (None, None) => Ordering::Equal,
+                };
+                if cmp != Ordering::Equal {
+                    return match order {
+                        SortOrder::Asc => cmp,
+                        SortOrder::Desc => cmp.reverse(),
+                    };
+                }
+            }
+            Ordering::Equal
+        });
+
+        // Apply offset and limit
+        let final_result: Vec<RelationEntry> = result.into_iter().skip(offset).take(limit).collect();
+
+        Ok(Relation::from_entries(final_result, tables, table_column_counts))
     }
 
     // ========== Expression Evaluation ==========
@@ -2902,5 +3047,265 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(40)));
         assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(30)));
+    }
+
+    // ========== TopN Tests ==========
+
+    #[test]
+    fn test_topn_basic_asc() {
+        let mut ds = InMemoryDataSource::new();
+
+        let data = vec![
+            Row::new(1, vec![Value::Int64(50)]),
+            Row::new(2, vec![Value::Int64(20)]),
+            Row::new(3, vec![Value::Int64(40)]),
+            Row::new(4, vec![Value::Int64(10)]),
+            Row::new(5, vec![Value::Int64(30)]),
+        ];
+        ds.add_table("numbers", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        // TopN: ORDER BY value ASC LIMIT 3
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("numbers")),
+            order_by: vec![(Expr::column("numbers", "value", 0), SortOrder::Asc)],
+            limit: 3,
+            offset: 0,
+        };
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(10)));
+        assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(20)));
+        assert_eq!(result.entries[2].get_field(0), Some(&Value::Int64(30)));
+    }
+
+    #[test]
+    fn test_topn_basic_desc() {
+        let mut ds = InMemoryDataSource::new();
+
+        let data = vec![
+            Row::new(1, vec![Value::Int64(50)]),
+            Row::new(2, vec![Value::Int64(20)]),
+            Row::new(3, vec![Value::Int64(40)]),
+            Row::new(4, vec![Value::Int64(10)]),
+            Row::new(5, vec![Value::Int64(30)]),
+        ];
+        ds.add_table("numbers", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        // TopN: ORDER BY value DESC LIMIT 3
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("numbers")),
+            order_by: vec![(Expr::column("numbers", "value", 0), SortOrder::Desc)],
+            limit: 3,
+            offset: 0,
+        };
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(50)));
+        assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(40)));
+        assert_eq!(result.entries[2].get_field(0), Some(&Value::Int64(30)));
+    }
+
+    #[test]
+    fn test_topn_with_offset() {
+        let mut ds = InMemoryDataSource::new();
+
+        let data = vec![
+            Row::new(1, vec![Value::Int64(50)]),
+            Row::new(2, vec![Value::Int64(20)]),
+            Row::new(3, vec![Value::Int64(40)]),
+            Row::new(4, vec![Value::Int64(10)]),
+            Row::new(5, vec![Value::Int64(30)]),
+        ];
+        ds.add_table("numbers", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        // TopN: ORDER BY value ASC LIMIT 2 OFFSET 1 (skip 10, get 20, 30)
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("numbers")),
+            order_by: vec![(Expr::column("numbers", "value", 0), SortOrder::Asc)],
+            limit: 2,
+            offset: 1,
+        };
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(20)));
+        assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(30)));
+    }
+
+    #[test]
+    fn test_topn_large_dataset_uses_heap() {
+        let mut ds = InMemoryDataSource::new();
+
+        // Create 100 rows to ensure heap path is taken (k * 2 < n)
+        let data: Vec<Row> = (0..100)
+            .map(|i| Row::new(i as u64, vec![Value::Int64(i as i64)]))
+            .collect();
+        ds.add_table("numbers", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        // TopN: ORDER BY value DESC LIMIT 5 (should use heap since 5*2 < 100)
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("numbers")),
+            order_by: vec![(Expr::column("numbers", "value", 0), SortOrder::Desc)],
+            limit: 5,
+            offset: 0,
+        };
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(99)));
+        assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(98)));
+        assert_eq!(result.entries[2].get_field(0), Some(&Value::Int64(97)));
+        assert_eq!(result.entries[3].get_field(0), Some(&Value::Int64(96)));
+        assert_eq!(result.entries[4].get_field(0), Some(&Value::Int64(95)));
+    }
+
+    #[test]
+    fn test_topn_small_dataset_uses_sort() {
+        let mut ds = InMemoryDataSource::new();
+
+        // Create 5 rows - too small for heap (k * 2 >= n)
+        let data: Vec<Row> = (0..5)
+            .map(|i| Row::new(i as u64, vec![Value::Int64(i as i64)]))
+            .collect();
+        ds.add_table("numbers", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        // TopN: ORDER BY value DESC LIMIT 3 (should use sort since 3*2 >= 5)
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("numbers")),
+            order_by: vec![(Expr::column("numbers", "value", 0), SortOrder::Desc)],
+            limit: 3,
+            offset: 0,
+        };
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(4)));
+        assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(3)));
+        assert_eq!(result.entries[2].get_field(0), Some(&Value::Int64(2)));
+    }
+
+    #[test]
+    fn test_topn_matches_sort_limit() {
+        let mut ds = InMemoryDataSource::new();
+
+        // Create 50 rows with random-ish values
+        let data: Vec<Row> = vec![
+            Row::new(0, vec![Value::Int64(42)]),
+            Row::new(1, vec![Value::Int64(17)]),
+            Row::new(2, vec![Value::Int64(89)]),
+            Row::new(3, vec![Value::Int64(3)]),
+            Row::new(4, vec![Value::Int64(56)]),
+            Row::new(5, vec![Value::Int64(71)]),
+            Row::new(6, vec![Value::Int64(28)]),
+            Row::new(7, vec![Value::Int64(94)]),
+            Row::new(8, vec![Value::Int64(12)]),
+            Row::new(9, vec![Value::Int64(65)]),
+            Row::new(10, vec![Value::Int64(33)]),
+            Row::new(11, vec![Value::Int64(81)]),
+            Row::new(12, vec![Value::Int64(7)]),
+            Row::new(13, vec![Value::Int64(49)]),
+            Row::new(14, vec![Value::Int64(22)]),
+        ];
+        ds.add_table("numbers", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        // TopN result
+        let topn_plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("numbers")),
+            order_by: vec![(Expr::column("numbers", "value", 0), SortOrder::Asc)],
+            limit: 5,
+            offset: 0,
+        };
+        let topn_result = runner.execute(&topn_plan).unwrap();
+
+        // Sort + Limit result
+        let sort_limit_plan = PhysicalPlan::limit(
+            PhysicalPlan::sort(
+                PhysicalPlan::table_scan("numbers"),
+                vec![(Expr::column("numbers", "value", 0), SortOrder::Asc)],
+            ),
+            5,
+            0,
+        );
+        let sort_limit_result = runner.execute(&sort_limit_plan).unwrap();
+
+        // Results should match
+        assert_eq!(topn_result.len(), sort_limit_result.len());
+        for i in 0..topn_result.len() {
+            assert_eq!(
+                topn_result.entries[i].get_field(0),
+                sort_limit_result.entries[i].get_field(0)
+            );
+        }
+    }
+
+    #[test]
+    fn test_topn_with_strings() {
+        let mut ds = InMemoryDataSource::new();
+
+        let data = vec![
+            Row::new(1, vec![Value::String("Charlie".into())]),
+            Row::new(2, vec![Value::String("Alice".into())]),
+            Row::new(3, vec![Value::String("Bob".into())]),
+            Row::new(4, vec![Value::String("David".into())]),
+            Row::new(5, vec![Value::String("Eve".into())]),
+        ];
+        ds.add_table("names", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("names")),
+            order_by: vec![(Expr::column("names", "name", 0), SortOrder::Asc)],
+            limit: 3,
+            offset: 0,
+        };
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::String("Alice".into())));
+        assert_eq!(result.entries[1].get_field(0), Some(&Value::String("Bob".into())));
+        assert_eq!(result.entries[2].get_field(0), Some(&Value::String("Charlie".into())));
+    }
+
+    #[test]
+    fn test_topn_limit_exceeds_input() {
+        let mut ds = InMemoryDataSource::new();
+
+        let data = vec![
+            Row::new(1, vec![Value::Int64(30)]),
+            Row::new(2, vec![Value::Int64(10)]),
+            Row::new(3, vec![Value::Int64(20)]),
+        ];
+        ds.add_table("numbers", data, 1);
+
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        // TopN: LIMIT 10 but only 3 rows
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("numbers")),
+            order_by: vec![(Expr::column("numbers", "value", 0), SortOrder::Asc)],
+            limit: 10,
+            offset: 0,
+        };
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(10)));
+        assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(20)));
+        assert_eq!(result.entries[2].get_field(0), Some(&Value::Int64(30)));
     }
 }

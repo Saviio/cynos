@@ -828,4 +828,90 @@ mod tests {
             speedup
         );
     }
+
+    /// Test: WHERE on non-indexed column + ORDER BY on indexed column should still filter correctly
+    /// Bug: When WHERE name = 'xxx' ORDER BY price DESC is used, the optimizer may choose
+    /// idx_price for ORDER BY but ignore the WHERE filter, returning wrong results.
+    #[test]
+    fn test_where_filter_with_order_by_on_different_index() {
+        use cynos_core::schema::TableBuilder;
+        use cynos_core::{DataType, Row, Value};
+
+        // Create a table with price index but no name index
+        let table = TableBuilder::new("stocks")
+            .unwrap()
+            .add_column("id", DataType::Int64).unwrap()
+            .add_column("name", DataType::String).unwrap()
+            .add_column("price", DataType::Float64).unwrap()
+            .add_primary_key(&["id"], false).unwrap()
+            .add_index("idx_price", &["price"], false).unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(table).unwrap();
+
+        // Insert test data
+        let store = cache.get_table_mut("stocks").unwrap();
+        let test_data = [
+            (1, "Apple Inc", 150.0),
+            (2, "E82 Group", 200.0),  // Target row
+            (3, "Microsoft", 300.0),
+            (4, "Google", 250.0),
+            (5, "Amazon", 180.0),
+        ];
+        for (id, name, price) in test_data {
+            store.insert(Row::new(
+                id as u64,
+                alloc::vec![
+                    Value::Int64(id),
+                    Value::String(name.into()),
+                    Value::Float64(price),
+                ],
+            )).unwrap();
+        }
+
+        // Query: WHERE name = 'E82 Group' ORDER BY price DESC LIMIT 100
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::Scan {
+                        table: "stocks".into(),
+                    }),
+                    predicate: AstExpr::eq(
+                        AstExpr::column("stocks", "name", 1),
+                        AstExpr::literal(Value::String("E82 Group".into())),
+                    ),
+                }),
+                order_by: alloc::vec![(
+                    AstExpr::column("stocks", "price", 2),
+                    cynos_query::ast::SortOrder::Desc,
+                )],
+            }),
+            limit: 100,
+            offset: 0,
+        };
+
+        println!("Input plan: {:?}", plan);
+
+        // Build context and execute
+        let ctx = build_execution_context(&cache, "stocks");
+        let planner = QueryPlanner::new(ctx);
+        let physical = planner.plan(plan.clone());
+        println!("Physical plan: {:?}", physical);
+
+        let result = execute_plan(&cache, "stocks", plan).unwrap();
+        println!("Result count: {}", result.len());
+        for row in &result {
+            println!("Row: {:?}", row);
+        }
+
+        // Should return exactly 1 row with name = 'E82 Group'
+        assert_eq!(result.len(), 1, "Expected exactly 1 row with name='E82 Group'");
+        assert_eq!(
+            result[0].get(1),
+            Some(&Value::String("E82 Group".into())),
+            "The row should have name='E82 Group'"
+        );
+    }
 }

@@ -677,6 +677,65 @@ fn bench_optimized_topn(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark: TopN heap vs Sort+Limit comparison
+/// Compares the performance of heap-based TopN (O(n log k)) vs Sort+Limit (O(n log n))
+fn bench_topn_heap_vs_sort(c: &mut Criterion) {
+    let mut group = c.benchmark_group("topn_heap_vs_sort");
+
+    // Test with varying data sizes and k values
+    for (size, k) in [(1000, 10), (10000, 10), (10000, 100), (100000, 10), (100000, 100)].iter() {
+        let ds = {
+            let mut ds = InMemoryDataSource::new();
+            let rows: Vec<Row> = shuffle_indices(*size, 12345)
+                .into_iter()
+                .map(|i| {
+                    Row::new(
+                        i as u64,
+                        vec![
+                            Value::Int64(i as i64),
+                            Value::String(format!("name_{}", i)),
+                        ],
+                    )
+                })
+                .collect();
+            ds.add_table("data", rows, 2);
+            ds
+        };
+
+        // TopN (uses heap for large datasets)
+        let topn_plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("data")),
+            order_by: vec![(Expr::column("data", "id", 0), SortOrder::Asc)],
+            limit: *k,
+            offset: 0,
+        };
+
+        // Sort + Limit (traditional approach)
+        let sort_limit_plan = PhysicalPlan::limit(
+            PhysicalPlan::sort(
+                PhysicalPlan::table_scan("data"),
+                vec![(Expr::column("data", "id", 0), SortOrder::Asc)],
+            ),
+            *k,
+            0,
+        );
+
+        let label = format!("n={}_k={}", size, k);
+
+        group.bench_with_input(BenchmarkId::new("topn_heap", &label), &label, |b, _| {
+            let runner = PhysicalPlanRunner::new(&ds);
+            b.iter(|| black_box(runner.execute(&topn_plan).unwrap()))
+        });
+
+        group.bench_with_input(BenchmarkId::new("sort_limit", &label), &label, |b, _| {
+            let runner = PhysicalPlanRunner::new(&ds);
+            b.iter(|| black_box(runner.execute(&sort_limit_plan).unwrap()))
+        });
+    }
+
+    group.finish();
+}
+
 /// Optimized e2e: Three-way join with different table sizes
 /// Tests: JoinReorder (should reorder to join smaller tables first)
 fn bench_optimized_join_reorder(c: &mut Criterion) {
@@ -891,6 +950,7 @@ criterion_group!(
     // Optimized end-to-end benchmarks (with optimizer)
     bench_optimized_filter,
     bench_optimized_topn,
+    bench_topn_heap_vs_sort,
     bench_optimized_join_reorder,
     bench_optimized_join_filter_pushdown,
     bench_optimized_outer_join_simplification,

@@ -644,10 +644,14 @@ impl SelectBuilder {
         self
     }
 
-    /// Sets the WHERE clause.
+    /// Sets or extends the WHERE clause.
+    /// Multiple calls to where_() are combined with AND.
     #[wasm_bindgen(js_name = "where")]
     pub fn where_(mut self, predicate: &Expr) -> Self {
-        self.where_clause = Some(predicate.clone());
+        self.where_clause = Some(match self.where_clause {
+            Some(existing) => Expr::and(&existing, predicate),
+            None => predicate.clone(),
+        });
         self
     }
 
@@ -997,47 +1001,6 @@ impl SelectBuilder {
         }
     }
 
-    /// Creates an observable query with join support.
-    /// Note: Join queries still use the old incremental approach for now.
-    #[allow(dead_code)]
-    fn observe_with_joins(
-        &self,
-        _left_table_id: TableId,
-        _left_schema: &Table,
-        _cache: &TableCache,
-    ) -> Result<JsObservableQuery, JsValue> {
-        // TODO: Implement re-query for joins
-        Err(JsValue::from_str("Join queries with observe() not yet supported in re-query mode"))
-    }
-
-    /// Extracts join key column names from a join condition.
-    /// Expects condition like: left_table.col = right_table.col
-    #[allow(dead_code)]
-    fn extract_join_keys(&self, condition: &Expr) -> Result<(String, String), JsValue> {
-        match condition.inner() {
-            ExprInner::Comparison { column, op, value } => {
-                use crate::expr::ComparisonOp;
-                if *op != ComparisonOp::Eq {
-                    return Err(JsValue::from_str("Join condition must be an equality"));
-                }
-
-                // The column is the left key
-                let left_key = column.name();
-
-                // The value should be a column reference (as string for now)
-                // In a real implementation, we'd have a proper ColumnRef expression
-                let right_key = if let Some(s) = value.as_string() {
-                    s
-                } else {
-                    return Err(JsValue::from_str("Join condition right side must be a column name"));
-                };
-
-                Ok((left_key, right_key))
-            }
-            _ => Err(JsValue::from_str("Join condition must be a column equality")),
-        }
-    }
-
     /// Creates a changes stream (initial + incremental).
     pub fn changes(&self) -> Result<JsChangesStream, JsValue> {
         let observable = self.observe()?;
@@ -1353,10 +1316,14 @@ impl UpdateBuilder {
         self
     }
 
-    /// Sets the WHERE clause.
+    /// Sets or extends the WHERE clause.
+    /// Multiple calls to where_() are combined with AND.
     #[wasm_bindgen(js_name = "where")]
     pub fn where_(mut self, predicate: &Expr) -> Self {
-        self.where_clause = Some(predicate.clone());
+        self.where_clause = Some(match self.where_clause {
+            Some(existing) => Expr::and(&existing, predicate),
+            None => predicate.clone(),
+        });
         self
     }
 
@@ -1486,10 +1453,14 @@ impl DeleteBuilder {
 
 #[wasm_bindgen]
 impl DeleteBuilder {
-    /// Sets the WHERE clause.
+    /// Sets or extends the WHERE clause.
+    /// Multiple calls to where_() are combined with AND.
     #[wasm_bindgen(js_name = "where")]
     pub fn where_(mut self, predicate: &Expr) -> Self {
-        self.where_clause = Some(predicate.clone());
+        self.where_clause = Some(match self.where_clause {
+            Some(existing) => Expr::and(&existing, predicate),
+            None => predicate.clone(),
+        });
         self
     }
 
