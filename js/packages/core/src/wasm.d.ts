@@ -253,7 +253,8 @@ export class DeleteBuilder {
      */
     exec(): Promise<any>;
     /**
-     * Sets the WHERE clause.
+     * Sets or extends the WHERE clause.
+     * Multiple calls to where_() are combined with AND.
      */
     where(predicate: Expr): DeleteBuilder;
 }
@@ -729,7 +730,8 @@ export class SelectBuilder {
      */
     trace(): JsIvmObservableQuery;
     /**
-     * Sets the WHERE clause.
+     * Sets or extends the WHERE clause.
+     * Multiple calls to where_() are combined with AND.
      */
     where(predicate: Expr): SelectBuilder;
 }
@@ -753,7 +755,8 @@ export class UpdateBuilder {
      */
     set(column_or_obj: any, value?: any | null): UpdateBuilder;
     /**
-     * Sets the WHERE clause.
+     * Sets or extends the WHERE clause.
+     * Multiple calls to where_() are combined with AND.
      */
     where(predicate: Expr): UpdateBuilder;
 }
@@ -936,10 +939,10 @@ export interface InitOutput {
     readonly binaryresult_asView: (a: number) => number;
     readonly binaryresult_free: (a: number) => void;
     readonly __wasm_bindgen_func_elem_61: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1541: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1730: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1548: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_595: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_1576: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_1765: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1583: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_607: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

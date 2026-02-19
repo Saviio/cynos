@@ -345,6 +345,37 @@ impl<'a> OrderByIndexPass<'a> {
     }
 
     /// Tries to optimize TopN over existing IndexScan by setting reverse flag and pushing limit.
+    ///
+    /// # Potential Optimization: TopN through Filter
+    ///
+    /// Currently this function can only look through `Project` nodes to find an IndexScan.
+    /// It cannot optimize through `Filter` nodes, which means queries like:
+    ///
+    /// ```text
+    /// TopN(price DESC, limit=100)
+    ///   └─ Filter(price > 10)
+    ///        └─ IndexScan(idx_price, range=[-∞, 150))
+    /// ```
+    ///
+    /// Cannot be optimized to:
+    ///
+    /// ```text
+    /// IndexScan(idx_price, range=(10, 150), reverse=true, limit=100)
+    /// ```
+    ///
+    /// To implement this optimization safely, we would need to:
+    /// 1. Check if the Filter predicate is fully covered by the IndexScan range
+    /// 2. Or merge the Filter predicate into the IndexScan range bounds
+    /// 3. Ensure the Filter column matches the IndexScan/OrderBy column
+    ///
+    /// This is complex because:
+    /// - Filter may contain non-range predicates (e.g., `status = 'active'`)
+    /// - Filter may reference different columns than the index
+    /// - Incorrect optimization could produce wrong results
+    ///
+    /// A safer approach is to ensure IndexSelection merges all range predicates
+    /// on the same column into the IndexScan range, eliminating the Filter entirely.
+    /// This is now implemented in `IndexSelection::merge_range_predicates_by_column`.
     fn try_optimize_topn_index_scan(
         &self,
         plan: PhysicalPlan,
@@ -412,7 +443,9 @@ impl<'a> OrderByIndexPass<'a> {
                 })
             }
 
-            // Can't optimize through other nodes
+            // TODO(optimization): Consider supporting Filter nodes here.
+            // See the function-level documentation for details on the complexity involved.
+            // For now, rely on IndexSelection to merge range predicates and eliminate Filters.
             _ => None,
         }
     }

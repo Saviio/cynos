@@ -73,6 +73,102 @@ pub struct PredicateInfo {
     pub is_point_lookup: bool,
 }
 
+/// Merged range bounds for a single column.
+/// Used when multiple range predicates on the same column can be combined.
+#[derive(Debug, Clone)]
+struct MergedRange {
+    /// Lower bound value (None means -∞)
+    lower_bound: Option<Value>,
+    /// Whether the lower bound is inclusive (>=) or exclusive (>)
+    lower_inclusive: bool,
+    /// Upper bound value (None means +∞)
+    upper_bound: Option<Value>,
+    /// Whether the upper bound is inclusive (<=) or exclusive (<)
+    upper_inclusive: bool,
+}
+
+impl MergedRange {
+    /// Creates a new unbounded range (-∞, +∞)
+    fn new() -> Self {
+        Self {
+            lower_bound: None,
+            lower_inclusive: true,
+            upper_bound: None,
+            upper_inclusive: true,
+        }
+    }
+
+    /// Updates the lower bound with a new constraint.
+    /// Takes the more restrictive (larger) lower bound.
+    fn update_lower(&mut self, value: Value, inclusive: bool) {
+        match &self.lower_bound {
+            None => {
+                self.lower_bound = Some(value);
+                self.lower_inclusive = inclusive;
+            }
+            Some(existing) => {
+                use core::cmp::Ordering;
+                match value.cmp(existing) {
+                    Ordering::Greater => {
+                        // New value is larger, use it
+                        self.lower_bound = Some(value);
+                        self.lower_inclusive = inclusive;
+                    }
+                    Ordering::Equal => {
+                        // Same value: exclusive (>) is more restrictive than inclusive (>=)
+                        if !inclusive {
+                            self.lower_inclusive = false;
+                        }
+                    }
+                    Ordering::Less => {
+                        // Existing is larger, keep it
+                    }
+                }
+            }
+        }
+    }
+
+    /// Updates the upper bound with a new constraint.
+    /// Takes the more restrictive (smaller) upper bound.
+    fn update_upper(&mut self, value: Value, inclusive: bool) {
+        match &self.upper_bound {
+            None => {
+                self.upper_bound = Some(value);
+                self.upper_inclusive = inclusive;
+            }
+            Some(existing) => {
+                use core::cmp::Ordering;
+                match value.cmp(existing) {
+                    Ordering::Less => {
+                        // New value is smaller, use it
+                        self.upper_bound = Some(value);
+                        self.upper_inclusive = inclusive;
+                    }
+                    Ordering::Equal => {
+                        // Same value: exclusive (<) is more restrictive than inclusive (<=)
+                        if !inclusive {
+                            self.upper_inclusive = false;
+                        }
+                    }
+                    Ordering::Greater => {
+                        // Existing is smaller, keep it
+                    }
+                }
+            }
+        }
+    }
+
+    /// Converts to IndexScan range parameters.
+    fn to_range_params(self) -> (Option<Value>, Option<Value>, bool, bool) {
+        (
+            self.lower_bound,
+            self.upper_bound,
+            self.lower_inclusive,
+            self.upper_inclusive,
+        )
+    }
+}
+
 /// Information extracted from an IN predicate for index selection.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -293,7 +389,7 @@ impl IndexSelection {
     }
 
     /// Attempts to use a B-Tree index for AND compound predicates.
-    /// Extracts sub-predicates from AND, finds the best indexable predicate,
+    /// Extracts sub-predicates from AND, merges range predicates on the same column,
     /// converts to IndexScan/IndexGet, and keeps remaining predicates as Filter.
     fn try_use_btree_with_and(
         &self,
@@ -313,51 +409,180 @@ impl IndexSelection {
             return None;
         }
 
-        // Find the best indexable predicate (prioritize point lookups over range scans)
-        let (best_pred, best_info, best_index) = self.select_best_btree_predicate(&indexable)?;
+        // Try to find a point lookup first (highest priority)
+        for (pred, info, index) in &indexable {
+            if info.is_point_lookup && info.value.is_some() {
+                // Build IndexGet plan
+                let index_plan = LogicalPlan::IndexGet {
+                    table: table.into(),
+                    index: index.name.clone(),
+                    key: info.value.clone()?,
+                };
 
-        // Build the index plan
-        let index_plan = if best_info.is_point_lookup {
-            LogicalPlan::IndexGet {
-                table: table.into(),
-                index: best_index.name.clone(),
-                key: best_info.value.clone()?,
-            }
-        } else {
-            let (range_start, range_end, include_start, include_end) =
-                self.compute_range(&best_info);
-            LogicalPlan::IndexScan {
-                table: table.into(),
-                index: best_index.name.clone(),
-                range_start,
-                range_end,
-                include_start,
-                include_end,
-            }
-        };
+                // Collect remaining predicates (non-indexable + other indexable)
+                let mut all_remaining: Vec<Expr> = remaining;
+                for (other_pred, _, _) in &indexable {
+                    if !Self::expr_eq(other_pred, pred) {
+                        all_remaining.push(other_pred.clone());
+                    }
+                }
 
-        // Collect remaining predicates (non-indexable + indexable but not selected)
-        let mut all_remaining: Vec<Expr> = remaining;
-        for (pred, _, _) in &indexable {
-            if !Self::expr_eq(pred, &best_pred) {
-                all_remaining.push(pred.clone());
+                return Some(self.wrap_with_filter_if_needed(index_plan, all_remaining));
             }
         }
 
-        // If there are remaining predicates, wrap with Filter
-        if all_remaining.is_empty() {
-            Some(index_plan)
+        // No point lookup found, try to merge range predicates on the same column
+        // Group range predicates by (column, index)
+        let merged = self.merge_range_predicates_by_column(&indexable);
+
+        if merged.is_empty() {
+            return None;
+        }
+
+        // Select the best merged range (prefer ranges with both bounds)
+        let (best_column, best_index, best_range, used_predicates) =
+            self.select_best_merged_range(&merged)?;
+
+        // Build IndexScan with merged range
+        let (range_start, range_end, include_start, include_end) = best_range.to_range_params();
+        let index_plan = LogicalPlan::IndexScan {
+            table: table.into(),
+            index: best_index.name.clone(),
+            range_start,
+            range_end,
+            include_start,
+            include_end,
+        };
+
+        // Collect remaining predicates:
+        // - All non-indexable predicates
+        // - Indexable predicates on other columns
+        // - Indexable predicates on the same column but not used in the merge
+        let mut all_remaining: Vec<Expr> = remaining;
+        for (pred, info, _) in &indexable {
+            // Skip predicates that were used in the merged range
+            if info.column == best_column && used_predicates.iter().any(|p| Self::expr_eq(p, pred)) {
+                continue;
+            }
+            all_remaining.push(pred.clone());
+        }
+
+        Some(self.wrap_with_filter_if_needed(index_plan, all_remaining))
+    }
+
+    /// Wraps an index plan with a Filter if there are remaining predicates.
+    fn wrap_with_filter_if_needed(
+        &self,
+        index_plan: LogicalPlan,
+        remaining: Vec<Expr>,
+    ) -> LogicalPlan {
+        if remaining.is_empty() {
+            index_plan
         } else {
-            let combined_predicate = all_remaining
+            let combined_predicate = remaining
                 .into_iter()
                 .reduce(|acc, pred| Expr::and(acc, pred))
                 .unwrap();
 
-            Some(LogicalPlan::Filter {
+            LogicalPlan::Filter {
                 input: Box::new(index_plan),
                 predicate: combined_predicate,
-            })
+            }
         }
+    }
+
+    /// Groups range predicates by column and merges them into combined ranges.
+    /// Returns a map of (column_name, index, merged_range, used_predicates).
+    fn merge_range_predicates_by_column(
+        &self,
+        indexable: &[(Expr, PredicateInfo, IndexInfo)],
+    ) -> Vec<(String, IndexInfo, MergedRange, Vec<Expr>)> {
+        use hashbrown::HashMap;
+
+        // Group by column name
+        let mut by_column: HashMap<String, Vec<(Expr, PredicateInfo, IndexInfo)>> = HashMap::new();
+        for (pred, info, index) in indexable {
+            if info.is_range && info.value.is_some() {
+                by_column
+                    .entry(info.column.clone())
+                    .or_default()
+                    .push((pred.clone(), info.clone(), index.clone()));
+            }
+        }
+
+        // Merge ranges for each column
+        let mut result = Vec::new();
+        for (column, predicates) in by_column {
+            if predicates.is_empty() {
+                continue;
+            }
+
+            // All predicates on the same column should use the same index
+            let index = predicates[0].2.clone();
+
+            let mut merged = MergedRange::new();
+            let mut used_preds = Vec::new();
+
+            for (pred, info, _) in &predicates {
+                if let Some(value) = &info.value {
+                    match info.op {
+                        BinaryOp::Gt => {
+                            merged.update_lower(value.clone(), false);
+                            used_preds.push(pred.clone());
+                        }
+                        BinaryOp::Ge => {
+                            merged.update_lower(value.clone(), true);
+                            used_preds.push(pred.clone());
+                        }
+                        BinaryOp::Lt => {
+                            merged.update_upper(value.clone(), false);
+                            used_preds.push(pred.clone());
+                        }
+                        BinaryOp::Le => {
+                            merged.update_upper(value.clone(), true);
+                            used_preds.push(pred.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            if !used_preds.is_empty() {
+                result.push((column, index, merged, used_preds));
+            }
+        }
+
+        result
+    }
+
+    /// Selects the best merged range for index usage.
+    /// Priority: ranges with both bounds > ranges with only lower bound > ranges with only upper bound
+    fn select_best_merged_range(
+        &self,
+        merged: &[(String, IndexInfo, MergedRange, Vec<Expr>)],
+    ) -> Option<(String, IndexInfo, MergedRange, Vec<Expr>)> {
+        // Priority 1: Ranges with both bounds (most selective)
+        for (col, idx, range, preds) in merged {
+            if range.lower_bound.is_some() && range.upper_bound.is_some() {
+                return Some((col.clone(), idx.clone(), range.clone(), preds.clone()));
+            }
+        }
+
+        // Priority 2: Ranges with lower bound only (> or >=)
+        for (col, idx, range, preds) in merged {
+            if range.lower_bound.is_some() {
+                return Some((col.clone(), idx.clone(), range.clone(), preds.clone()));
+            }
+        }
+
+        // Priority 3: Ranges with upper bound only (< or <=)
+        for (col, idx, range, preds) in merged {
+            if range.upper_bound.is_some() {
+                return Some((col.clone(), idx.clone(), range.clone(), preds.clone()));
+            }
+        }
+
+        None
     }
 
     /// Extracts B-Tree indexable predicates and remaining predicates from an AND expression.
@@ -409,6 +634,11 @@ impl IndexSelection {
 
     /// Selects the best B-Tree predicate for index usage.
     /// Priority: point lookup (IndexGet) > range scan (IndexScan)
+    ///
+    /// Note: This function is kept for potential future use but is currently
+    /// superseded by `merge_range_predicates_by_column` + `select_best_merged_range`
+    /// which can merge multiple range predicates on the same column.
+    #[allow(dead_code)]
     fn select_best_btree_predicate(
         &self,
         indexable: &[(Expr, PredicateInfo, IndexInfo)],
@@ -1276,6 +1506,340 @@ mod tests {
             }
             other => {
                 panic!("Unexpected plan type: {:?}", other);
+            }
+        }
+    }
+
+    /// Test: Multiple range predicates on the same column should be merged.
+    ///
+    /// Query: price > 10 AND price < 150
+    ///
+    /// Expected: IndexScan with range (10, 150) - no Filter needed
+    #[test]
+    fn test_range_merge_same_column() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "stocks",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_price",
+                    alloc::vec!["price".into()],
+                    false
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        // Build predicate: price > 10 AND price < 150
+        let predicate = Expr::and(
+            Expr::gt(
+                Expr::column("stocks", "price", 1),
+                Expr::literal(Value::Float64(10.0)),
+            ),
+            Expr::lt(
+                Expr::column("stocks", "price", 1),
+                Expr::literal(Value::Float64(150.0)),
+            ),
+        );
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("stocks"), predicate);
+        let optimized = pass.optimize(plan);
+
+        // Should be IndexScan with merged range (10, 150) - no Filter
+        match optimized {
+            LogicalPlan::IndexScan {
+                index,
+                range_start,
+                range_end,
+                include_start,
+                include_end,
+                ..
+            } => {
+                assert_eq!(index, "idx_price");
+                assert_eq!(range_start, Some(Value::Float64(10.0)));
+                assert_eq!(range_end, Some(Value::Float64(150.0)));
+                assert!(!include_start, "Lower bound should be exclusive (>)");
+                assert!(!include_end, "Upper bound should be exclusive (<)");
+            }
+            other => {
+                panic!(
+                    "Expected IndexScan with merged range, got: {:?}",
+                    other
+                );
+            }
+        }
+    }
+
+    /// Test: Range merge with inclusive bounds (>= and <=)
+    #[test]
+    fn test_range_merge_inclusive_bounds() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "products",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_price",
+                    alloc::vec!["price".into()],
+                    false
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        // Build predicate: price >= 100 AND price <= 500
+        let predicate = Expr::and(
+            Expr::ge(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(100)),
+            ),
+            Expr::le(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(500)),
+            ),
+        );
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("products"), predicate);
+        let optimized = pass.optimize(plan);
+
+        match optimized {
+            LogicalPlan::IndexScan {
+                range_start,
+                range_end,
+                include_start,
+                include_end,
+                ..
+            } => {
+                assert_eq!(range_start, Some(Value::Int64(100)));
+                assert_eq!(range_end, Some(Value::Int64(500)));
+                assert!(include_start, "Lower bound should be inclusive (>=)");
+                assert!(include_end, "Upper bound should be inclusive (<=)");
+            }
+            other => {
+                panic!("Expected IndexScan, got: {:?}", other);
+            }
+        }
+    }
+
+    /// Test: Range merge takes the more restrictive bound when same value
+    /// price > 10 AND price >= 10 should result in price > 10 (exclusive)
+    #[test]
+    fn test_range_merge_same_value_takes_exclusive() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "products",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_price",
+                    alloc::vec!["price".into()],
+                    false
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        // Build predicate: price > 10 AND price >= 10
+        let predicate = Expr::and(
+            Expr::gt(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(10)),
+            ),
+            Expr::ge(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(10)),
+            ),
+        );
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("products"), predicate);
+        let optimized = pass.optimize(plan);
+
+        match optimized {
+            LogicalPlan::IndexScan {
+                range_start,
+                include_start,
+                ..
+            } => {
+                assert_eq!(range_start, Some(Value::Int64(10)));
+                assert!(!include_start, "Should take exclusive bound (>)");
+            }
+            other => {
+                panic!("Expected IndexScan, got: {:?}", other);
+            }
+        }
+    }
+
+    /// Test: Range merge takes the larger lower bound
+    /// price > 10 AND price > 5 should result in price > 10
+    #[test]
+    fn test_range_merge_takes_larger_lower_bound() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "products",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_price",
+                    alloc::vec!["price".into()],
+                    false
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        // Build predicate: price > 10 AND price > 5
+        let predicate = Expr::and(
+            Expr::gt(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(10)),
+            ),
+            Expr::gt(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(5)),
+            ),
+        );
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("products"), predicate);
+        let optimized = pass.optimize(plan);
+
+        match optimized {
+            LogicalPlan::IndexScan { range_start, .. } => {
+                assert_eq!(range_start, Some(Value::Int64(10)));
+            }
+            other => {
+                panic!("Expected IndexScan, got: {:?}", other);
+            }
+        }
+    }
+
+    /// Test: Range merge takes the smaller upper bound
+    /// price < 150 AND price < 200 should result in price < 150
+    #[test]
+    fn test_range_merge_takes_smaller_upper_bound() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "products",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_price",
+                    alloc::vec!["price".into()],
+                    false
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        // Build predicate: price < 150 AND price < 200
+        let predicate = Expr::and(
+            Expr::lt(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(150)),
+            ),
+            Expr::lt(
+                Expr::column("products", "price", 1),
+                Expr::literal(Value::Int64(200)),
+            ),
+        );
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("products"), predicate);
+        let optimized = pass.optimize(plan);
+
+        match optimized {
+            LogicalPlan::IndexScan { range_end, .. } => {
+                assert_eq!(range_end, Some(Value::Int64(150)));
+            }
+            other => {
+                panic!("Expected IndexScan, got: {:?}", other);
+            }
+        }
+    }
+
+    /// Test: Range merge with additional non-indexed predicate
+    /// price > 10 AND price < 150 AND status = 'active'
+    /// Should produce: Filter(status = 'active', IndexScan(10, 150))
+    #[test]
+    fn test_range_merge_with_non_indexed_predicate() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "stocks",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_price",
+                    alloc::vec!["price".into()],
+                    false
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        // Build predicate: price > 10 AND price < 150 AND status = 'active'
+        let predicate = Expr::and(
+            Expr::and(
+                Expr::gt(
+                    Expr::column("stocks", "price", 1),
+                    Expr::literal(Value::Float64(10.0)),
+                ),
+                Expr::lt(
+                    Expr::column("stocks", "price", 1),
+                    Expr::literal(Value::Float64(150.0)),
+                ),
+            ),
+            Expr::eq(
+                Expr::column("stocks", "status", 2),
+                Expr::literal(Value::String("active".into())),
+            ),
+        );
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("stocks"), predicate);
+        let optimized = pass.optimize(plan);
+
+        // Should be Filter(status = 'active', IndexScan(10, 150))
+        match optimized {
+            LogicalPlan::Filter { input, predicate } => {
+                // Check the Filter predicate is status = 'active'
+                if let Expr::BinaryOp { left, op, .. } = &predicate {
+                    assert_eq!(*op, BinaryOp::Eq);
+                    if let Expr::Column(col) = left.as_ref() {
+                        assert_eq!(col.column, "status");
+                    }
+                }
+
+                // Check the input is IndexScan with merged range
+                match input.as_ref() {
+                    LogicalPlan::IndexScan {
+                        range_start,
+                        range_end,
+                        include_start,
+                        include_end,
+                        ..
+                    } => {
+                        assert_eq!(*range_start, Some(Value::Float64(10.0)));
+                        assert_eq!(*range_end, Some(Value::Float64(150.0)));
+                        assert!(!include_start);
+                        assert!(!include_end);
+                    }
+                    other => {
+                        panic!("Expected IndexScan inside Filter, got: {:?}", other);
+                    }
+                }
+            }
+            other => {
+                panic!("Expected Filter wrapping IndexScan, got: {:?}", other);
             }
         }
     }
