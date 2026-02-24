@@ -464,6 +464,51 @@ impl PhysicalPlan {
             PhysicalPlan::IndexNestedLoopJoin { outer, .. } => alloc::vec![outer.as_ref()],
         }
     }
+
+    /// Collects all table names referenced by this plan.
+    pub fn collect_tables(&self) -> Vec<String> {
+        let mut tables = Vec::new();
+        self.collect_tables_into(&mut tables);
+        tables
+    }
+
+    fn collect_tables_into(&self, tables: &mut Vec<String>) {
+        match self {
+            PhysicalPlan::TableScan { table }
+            | PhysicalPlan::IndexScan { table, .. }
+            | PhysicalPlan::IndexGet { table, .. }
+            | PhysicalPlan::IndexInGet { table, .. }
+            | PhysicalPlan::GinIndexScan { table, .. }
+            | PhysicalPlan::GinIndexScanMulti { table, .. } => {
+                if !tables.contains(table) {
+                    tables.push(table.clone());
+                }
+            }
+            PhysicalPlan::IndexNestedLoopJoin { outer, inner_table, .. } => {
+                outer.collect_tables_into(tables);
+                if !tables.contains(inner_table) {
+                    tables.push(inner_table.clone());
+                }
+            }
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::HashAggregate { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::TopN { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::NoOp { input } => {
+                input.collect_tables_into(tables);
+            }
+            PhysicalPlan::HashJoin { left, right, .. }
+            | PhysicalPlan::SortMergeJoin { left, right, .. }
+            | PhysicalPlan::NestedLoopJoin { left, right, .. }
+            | PhysicalPlan::CrossProduct { left, right } => {
+                left.collect_tables_into(tables);
+                right.collect_tables_into(tables);
+            }
+            PhysicalPlan::Empty => {}
+        }
+    }
 }
 
 #[cfg(test)]

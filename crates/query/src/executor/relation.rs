@@ -239,6 +239,35 @@ impl RelationEntry {
             tables: TablesStorage::Shared(combined_tables),
         }
     }
+
+    /// Creates a combined entry with null values for the left side (for right outer joins).
+    /// The combined row's version is the right row's version (left side is NULL).
+    pub fn combine_null_with(
+        left_column_count: usize,
+        left_tables: &[String],
+        right: &RelationEntry,
+        right_tables: &[String],
+    ) -> Self {
+        let right_values = right.row.values();
+        let total_len = left_column_count + right_values.len();
+
+        let mut values = Vec::with_capacity(total_len);
+        values.resize(left_column_count, Value::Null);
+        values.extend(right_values.iter().cloned());
+
+        let mut tables = Vec::with_capacity(left_tables.len() + right_tables.len());
+        tables.extend(left_tables.iter().cloned());
+        tables.extend(right_tables.iter().cloned());
+
+        // For right outer join unmatched rows, use right's version
+        let combined_version = right.row.version();
+
+        Self {
+            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            is_combined: true,
+            tables: TablesStorage::Owned(tables),
+        }
+    }
 }
 
 /// A relation is a collection of entries with table context.

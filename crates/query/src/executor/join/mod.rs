@@ -6,4 +6,4 @@ mod nested;
 
 pub use hash::HashJoin;
 pub use merge::{sort_merge_join, SortMergeJoin};
-pub use nested::{nested_loop_join, NestedLoopJoin};
+pub use nested::{nested_loop_join, JoinType, NestedLoopJoin};

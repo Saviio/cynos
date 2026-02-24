@@ -7,6 +7,8 @@
 use crate::ast::Expr;
 use crate::planner::{LogicalPlan, PhysicalPlan};
 use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::hash::Hasher;
 
 /// A simple hasher for computing plan fingerprints.
@@ -332,6 +334,8 @@ fn hash_value<H: Hasher>(value: &cynos_core::Value, hasher: &mut H) {
 struct CacheEntry {
     plan: PhysicalPlan,
     last_access: u64,
+    /// Tables referenced by this plan (for targeted invalidation).
+    tables: Vec<String>,
 }
 
 /// LRU cache for compiled physical plans.
@@ -389,11 +393,13 @@ impl PlanCache {
         }
 
         self.access_counter += 1;
+        let tables = plan.collect_tables();
         self.cache.insert(
             fingerprint,
             CacheEntry {
                 plan,
                 last_access: self.access_counter,
+                tables,
             },
         );
     }
@@ -419,11 +425,13 @@ impl PlanCache {
             }
 
             let plan = compile();
+            let tables = plan.collect_tables();
             self.cache.insert(
                 fingerprint,
                 CacheEntry {
                     plan,
                     last_access: self.access_counter,
+                    tables,
                 },
             );
             &self.cache.get(&fingerprint).unwrap().plan
@@ -485,21 +493,31 @@ impl PlanCache {
         }
     }
 
-    /// Invalidates all cached plans for a specific table.
+    /// Invalidates all cached plans that reference a specific table.
     /// Call this when table schema or data changes significantly.
-    pub fn invalidate_table(&mut self, _table: &str) {
-        // For simplicity, clear the entire cache.
-        // A more sophisticated implementation could track which plans
-        // reference which tables and only invalidate those.
-        self.cache.clear();
+    pub fn invalidate_table(&mut self, table: &str) {
+        // Collect fingerprints of plans that reference this table
+        let to_remove: Vec<u64> = self
+            .cache
+            .iter()
+            .filter(|(_, entry)| entry.tables.iter().any(|t| t == table))
+            .map(|(&fp, _)| fp)
+            .collect();
+
+        // Remove the matching entries
+        for fp in to_remove {
+            self.cache.remove(&fp);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{Expr, JoinType};
     use alloc::boxed::Box;
     use alloc::string::String;
+    use cynos_core::Value;
 
     #[test]
     fn test_plan_fingerprint_same_plan() {
@@ -660,5 +678,64 @@ mod tests {
         assert_eq!(compile_count, 1);
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 1);
+    }
+
+    // ==================== Defect 2 Test: invalidate_table should be targeted ====================
+
+    #[test]
+    fn test_invalidate_table_targeted() {
+        let mut cache = PlanCache::new(10);
+
+        // Insert plans for different tables
+        let users_plan = PhysicalPlan::table_scan("users");
+        let orders_plan = PhysicalPlan::table_scan("orders");
+        let products_plan = PhysicalPlan::table_scan("products");
+
+        cache.insert(1, users_plan);
+        cache.insert(2, orders_plan);
+        cache.insert(3, products_plan);
+
+        assert_eq!(cache.len(), 3);
+
+        // Invalidate only "users" table
+        cache.invalidate_table("users");
+
+        // Should only remove the users plan, keeping orders and products
+        assert_eq!(
+            cache.len(), 2,
+            "Defect 2: invalidate_table should only remove plans for the specified table"
+        );
+
+        // Verify users plan is gone but others remain
+        assert!(cache.get(1).is_none(), "users plan should be invalidated");
+        assert!(cache.get(2).is_some(), "orders plan should remain");
+        assert!(cache.get(3).is_some(), "products plan should remain");
+    }
+
+    #[test]
+    fn test_invalidate_table_with_join() {
+        let mut cache = PlanCache::new(10);
+
+        // Create a join plan that references both users and orders
+        let join_plan = PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::table_scan("users")),
+            right: Box::new(PhysicalPlan::table_scan("orders")),
+            condition: Expr::Literal(Value::Boolean(true)),
+            join_type: JoinType::Inner,
+        };
+
+        let products_plan = PhysicalPlan::table_scan("products");
+
+        cache.insert(1, join_plan);
+        cache.insert(2, products_plan);
+
+        assert_eq!(cache.len(), 2);
+
+        // Invalidating "users" should remove the join plan (which references users)
+        cache.invalidate_table("users");
+
+        assert_eq!(cache.len(), 1, "Join plan referencing users should be invalidated");
+        assert!(cache.get(1).is_none(), "join plan should be invalidated");
+        assert!(cache.get(2).is_some(), "products plan should remain");
     }
 }

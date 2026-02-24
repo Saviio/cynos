@@ -1,8 +1,22 @@
 //! Nested Loop Join implementation.
 
 use crate::executor::{Relation, RelationEntry};
+use alloc::vec;
 use alloc::vec::Vec;
 use cynos_core::Value;
+
+/// Join type for nested loop join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    /// Inner join - only matching rows.
+    Inner,
+    /// Left outer join - all left rows, matching right rows or NULL.
+    LeftOuter,
+    /// Right outer join - all right rows, matching left rows or NULL.
+    RightOuter,
+    /// Full outer join - all rows from both sides.
+    FullOuter,
+}
 
 /// Nested Loop Join executor.
 ///
@@ -13,28 +27,38 @@ pub struct NestedLoopJoin {
     left_key_index: usize,
     /// Column index for the right relation.
     right_key_index: usize,
-    /// Whether this is an outer join.
-    is_outer_join: bool,
+    /// Join type.
+    join_type: JoinType,
 }
 
 impl NestedLoopJoin {
     /// Creates a new nested loop join executor.
-    pub fn new(left_key_index: usize, right_key_index: usize, is_outer_join: bool) -> Self {
+    pub fn new(left_key_index: usize, right_key_index: usize, join_type: JoinType) -> Self {
         Self {
             left_key_index,
             right_key_index,
-            is_outer_join,
+            join_type,
         }
     }
 
     /// Creates an inner nested loop join.
     pub fn inner(left_key_index: usize, right_key_index: usize) -> Self {
-        Self::new(left_key_index, right_key_index, false)
+        Self::new(left_key_index, right_key_index, JoinType::Inner)
     }
 
     /// Creates a left outer nested loop join.
     pub fn left_outer(left_key_index: usize, right_key_index: usize) -> Self {
-        Self::new(left_key_index, right_key_index, true)
+        Self::new(left_key_index, right_key_index, JoinType::LeftOuter)
+    }
+
+    /// Creates a right outer nested loop join.
+    pub fn right_outer(left_key_index: usize, right_key_index: usize) -> Self {
+        Self::new(left_key_index, right_key_index, JoinType::RightOuter)
+    }
+
+    /// Creates a full outer nested loop join.
+    pub fn full_outer(left_key_index: usize, right_key_index: usize) -> Self {
+        Self::new(left_key_index, right_key_index, JoinType::FullOuter)
     }
 
     /// Executes the nested loop join with equality comparison.
@@ -50,16 +74,31 @@ impl NestedLoopJoin {
         let mut result_entries = Vec::new();
         let left_tables = left.tables().to_vec();
         let right_tables = right.tables().to_vec();
+        let left_col_count = left
+            .entries
+            .first()
+            .map(|e| e.row.len())
+            .unwrap_or(0);
         let right_col_count = right
             .entries
             .first()
             .map(|e| e.row.len())
             .unwrap_or(0);
 
+        // Track which right rows have been matched (for RIGHT/FULL OUTER)
+        let track_right_matches = matches!(self.join_type, JoinType::RightOuter | JoinType::FullOuter);
+        let mut right_matched = if track_right_matches {
+            vec![false; right.entries.len()]
+        } else {
+            Vec::new()
+        };
+
         // Block-based nested loop for better cache performance
         const BLOCK_SIZE: usize = 256;
-        let right_entries: Vec<_> = right.entries.iter().collect();
+        let right_entries: Vec<_> = right.entries.iter().enumerate().collect();
         let block_count = (right_entries.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+        let emit_unmatched_left = matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter);
 
         for left_entry in left.iter() {
             let mut match_found = false;
@@ -67,7 +106,7 @@ impl NestedLoopJoin {
 
             // Skip if left value is null (nulls don't match)
             if left_value.map(|v| v.is_null()).unwrap_or(true) {
-                if self.is_outer_join {
+                if emit_unmatched_left {
                     let combined = RelationEntry::combine_with_null(
                         left_entry,
                         &left_tables,
@@ -86,10 +125,13 @@ impl NestedLoopJoin {
                 let start = block * BLOCK_SIZE;
                 let end = core::cmp::min(start + BLOCK_SIZE, right_entries.len());
 
-                for right_entry in &right_entries[start..end] {
+                for &(right_idx, right_entry) in &right_entries[start..end] {
                     if let Some(right_val) = right_entry.get_field(self.right_key_index) {
                         if !right_val.is_null() && predicate(left_val, right_val) {
                             match_found = true;
+                            if track_right_matches {
+                                right_matched[right_idx] = true;
+                            }
                             let combined = RelationEntry::combine(
                                 left_entry,
                                 &left_tables,
@@ -102,8 +144,8 @@ impl NestedLoopJoin {
                 }
             }
 
-            // For outer join, add unmatched left entries with nulls
-            if self.is_outer_join && !match_found {
+            // For LEFT/FULL outer join, add unmatched left entries with nulls
+            if emit_unmatched_left && !match_found {
                 let combined = RelationEntry::combine_with_null(
                     left_entry,
                     &left_tables,
@@ -111,6 +153,21 @@ impl NestedLoopJoin {
                     &right_tables,
                 );
                 result_entries.push(combined);
+            }
+        }
+
+        // For RIGHT/FULL outer join, add unmatched right entries with nulls
+        if track_right_matches {
+            for (right_idx, right_entry) in right.entries.iter().enumerate() {
+                if !right_matched[right_idx] {
+                    let combined = RelationEntry::combine_null_with(
+                        left_col_count,
+                        &left_tables,
+                        right_entry,
+                        &right_tables,
+                    );
+                    result_entries.push(combined);
+                }
             }
         }
 
@@ -262,5 +319,80 @@ mod tests {
 
         // NULL values should not match
         assert_eq!(result.len(), 1);
+    }
+
+    // ==================== Bug 5 Test: RIGHT OUTER JOIN not supported ====================
+    // This test demonstrates Bug 5: NestedLoopJoin doesn't support RIGHT OUTER JOIN
+
+    #[test]
+    fn test_nested_loop_join_right_outer_bug() {
+        // LEFT table: [1, 2]
+        // RIGHT table: [1, 3]
+        // RIGHT OUTER JOIN should return:
+        //   (1, 1) - matched
+        //   (NULL, 3) - unmatched right row
+        let left_rows = vec![
+            Row::new(0, vec![Value::Int64(1)]),
+            Row::new(1, vec![Value::Int64(2)]),
+        ];
+        let right_rows = vec![
+            Row::new(10, vec![Value::Int64(1)]),
+            Row::new(11, vec![Value::Int64(3)]),
+        ];
+
+        let left = Relation::from_rows_owned(left_rows, vec!["left".into()]);
+        let right = Relation::from_rows_owned(right_rows, vec!["right".into()]);
+
+        let join = NestedLoopJoin::right_outer(0, 0);
+        let result = join.execute(left, right);
+
+        // Should have 2 rows: (1,1) matched + (NULL,3) unmatched right
+        assert_eq!(
+            result.len(), 2,
+            "Bug 5: RIGHT OUTER JOIN should return unmatched right rows. Expected 2 rows, got {}",
+            result.len()
+        );
+
+        // Verify the unmatched right row has NULL for left columns
+        let has_null_left = result.entries.iter().any(|e| {
+            e.get_field(0).map(|v| v.is_null()).unwrap_or(false)
+        });
+        assert!(
+            has_null_left,
+            "Bug 5: RIGHT OUTER JOIN should have NULL for unmatched left columns"
+        );
+    }
+
+    // ==================== Bug 5 Test: FULL OUTER JOIN not supported ====================
+
+    #[test]
+    fn test_nested_loop_join_full_outer_bug() {
+        // LEFT table: [1, 2]
+        // RIGHT table: [1, 3]
+        // FULL OUTER JOIN should return:
+        //   (1, 1) - matched
+        //   (2, NULL) - unmatched left row
+        //   (NULL, 3) - unmatched right row
+        let left_rows = vec![
+            Row::new(0, vec![Value::Int64(1)]),
+            Row::new(1, vec![Value::Int64(2)]),
+        ];
+        let right_rows = vec![
+            Row::new(10, vec![Value::Int64(1)]),
+            Row::new(11, vec![Value::Int64(3)]),
+        ];
+
+        let left = Relation::from_rows_owned(left_rows, vec!["left".into()]);
+        let right = Relation::from_rows_owned(right_rows, vec!["right".into()]);
+
+        let join = NestedLoopJoin::full_outer(0, 0);
+        let result = join.execute(left, right);
+
+        // Should have 3 rows: (1,1) matched + (2,NULL) unmatched left + (NULL,3) unmatched right
+        assert_eq!(
+            result.len(), 3,
+            "Bug 5: FULL OUTER JOIN should return both unmatched left and right rows. Expected 3 rows, got {}",
+            result.len()
+        );
     }
 }

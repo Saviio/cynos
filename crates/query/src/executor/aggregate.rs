@@ -275,17 +275,28 @@ impl AggregateExecutor {
     }
 }
 
+/// Converts a value to a unique string representation for grouping.
+///
+/// This function includes type prefixes to distinguish between different types
+/// with the same numeric representation (e.g., Int32(42) vs Int64(42) vs DateTime(42)).
+///
+/// For strings, the separator character `|` is escaped to prevent key collisions
+/// when string values contain the separator (e.g., ("a|b", "c") vs ("a", "b|c")).
 fn value_to_string(value: &Value) -> String {
     match value {
-        Value::Null => String::from("null"),
-        Value::Boolean(b) => alloc::format!("{}", b),
-        Value::Int32(i) => alloc::format!("{}", i),
-        Value::Int64(i) => alloc::format!("{}", i),
-        Value::Float64(f) => alloc::format!("{}", f),
-        Value::String(s) => s.clone(),
-        Value::DateTime(d) => alloc::format!("{}", d),
-        Value::Bytes(b) => alloc::format!("{:?}", b),
-        Value::Jsonb(j) => alloc::format!("{:?}", j.0),
+        Value::Null => String::from("N:"),
+        Value::Boolean(b) => alloc::format!("B:{}", b),
+        Value::Int32(i) => alloc::format!("I32:{}", i),
+        Value::Int64(i) => alloc::format!("I64:{}", i),
+        Value::Float64(f) => alloc::format!("F64:{}", f),
+        // Escape backslash first, then escape the separator character
+        Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('|', "\\|");
+            alloc::format!("S:{}", escaped)
+        }
+        Value::DateTime(d) => alloc::format!("DT:{}", d),
+        Value::Bytes(b) => alloc::format!("BY:{:?}", b),
+        Value::Jsonb(j) => alloc::format!("J:{:?}", j.0),
     }
 }
 
@@ -765,5 +776,65 @@ mod tests {
                 _ => panic!("Unexpected group key"),
             }
         }
+    }
+
+    // ==================== Bug 3 Test: GROUP BY key collision with | separator ====================
+    // This test demonstrates Bug 3: GROUP BY key collision when string values contain the separator
+
+    #[test]
+    fn test_group_by_separator_collision_bug() {
+        // Two different groups that should NOT be merged:
+        // Group 1: ("a|b", "c") - first column is "a|b", second is "c"
+        // Group 2: ("a", "b|c") - first column is "a", second is "b|c"
+        // BUG: Both generate the same key "a|b|c" and get incorrectly merged
+        let rows = vec![
+            Row::new(0, vec![Value::String("a|b".into()), Value::String("c".into()), Value::Int64(10)]),
+            Row::new(1, vec![Value::String("a".into()), Value::String("b|c".into()), Value::Int64(20)]),
+        ];
+        let input = Relation::from_rows_owned(rows, vec!["t".into()]);
+
+        let executor = AggregateExecutor::new(
+            vec![0, 1], // group by first two columns
+            vec![(AggregateFunc::Sum, Some(2))],
+        );
+        let result = executor.execute(input);
+
+        // Should have 2 distinct groups, not 1
+        assert_eq!(
+            result.len(), 2,
+            "Bug 3: Groups with separator in values should NOT be merged. Expected 2 groups, got {}",
+            result.len()
+        );
+    }
+
+    // ==================== Bug 4 Test: GROUP BY type confusion ====================
+    // This test demonstrates Bug 4: Different types with same numeric value get merged
+
+    #[test]
+    fn test_group_by_type_confusion_bug() {
+        // Three different groups that should NOT be merged:
+        // Group 1: Int32(42)
+        // Group 2: Int64(42)
+        // Group 3: DateTime(42)
+        // BUG: All three generate the same key "42" and get incorrectly merged
+        let rows = vec![
+            Row::new(0, vec![Value::Int32(42), Value::Int64(10)]),
+            Row::new(1, vec![Value::Int64(42), Value::Int64(20)]),
+            Row::new(2, vec![Value::DateTime(42), Value::Int64(30)]),
+        ];
+        let input = Relation::from_rows_owned(rows, vec!["t".into()]);
+
+        let executor = AggregateExecutor::new(
+            vec![0], // group by first column
+            vec![(AggregateFunc::Sum, Some(1))],
+        );
+        let result = executor.execute(input);
+
+        // Should have 3 distinct groups (different types), not 1
+        assert_eq!(
+            result.len(), 3,
+            "Bug 4: Different types with same numeric value should NOT be merged. Expected 3 groups, got {}",
+            result.len()
+        );
     }
 }

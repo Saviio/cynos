@@ -297,7 +297,7 @@ fn merge_rows_null_left(right: &Row, left_col_count: usize) -> Row {
 ///   This eliminates the `needs_recompute` fallback entirely.
 pub enum AggregateState {
     Count { count: i64 },
-    Sum { sum: f64 },
+    Sum { sum: f64, count: i64 },
     Avg { sum: f64, count: i64 },
     /// BTreeMap<Value, multiplicity> — ordered multiset for O(log n) min on delete
     Min { values: BTreeMap<Value, i32> },
@@ -309,7 +309,7 @@ impl AggregateState {
     pub fn new(agg_type: AggregateType) -> Self {
         match agg_type {
             AggregateType::Count => AggregateState::Count { count: 0 },
-            AggregateType::Sum => AggregateState::Sum { sum: 0.0 },
+            AggregateType::Sum => AggregateState::Sum { sum: 0.0, count: 0 },
             AggregateType::Avg => AggregateState::Avg { sum: 0.0, count: 0 },
             AggregateType::Min => AggregateState::Min { values: BTreeMap::new() },
             AggregateType::Max => AggregateState::Max { values: BTreeMap::new() },
@@ -322,8 +322,9 @@ impl AggregateState {
             AggregateState::Count { count } => {
                 *count += diff as i64;
             }
-            AggregateState::Sum { sum } => {
+            AggregateState::Sum { sum, count } => {
                 *sum += extract_numeric(value) * diff as f64;
+                *count += diff as i64;
             }
             AggregateState::Avg { sum, count } => {
                 *sum += extract_numeric(value) * diff as f64;
@@ -343,7 +344,7 @@ impl AggregateState {
     pub fn get_value(&self) -> Value {
         match self {
             AggregateState::Count { count } => Value::Int64(*count),
-            AggregateState::Sum { sum } => Value::Float64(*sum),
+            AggregateState::Sum { sum, .. } => Value::Float64(*sum),
             AggregateState::Avg { sum, count } => {
                 if *count == 0 {
                     Value::Null
@@ -365,7 +366,7 @@ impl AggregateState {
         match self {
             AggregateState::Count { count } => *count == 0,
             AggregateState::Avg { count, .. } => *count == 0,
-            AggregateState::Sum { sum } => *sum == 0.0,
+            AggregateState::Sum { count, .. } => *count == 0,
             AggregateState::Min { values } | AggregateState::Max { values } => values.is_empty(),
         }
     }
@@ -573,10 +574,16 @@ impl MaterializedView {
             return Vec::new();
         }
 
-        let dataflow_ptr = &self.dataflow as *const DataflowNode;
-        let output_deltas = unsafe {
-            self.propagate_mut(&*dataflow_ptr, table_id, deltas, 0, 0).0
-        };
+        // Split borrows: immutable borrow of dataflow, mutable borrows of states
+        let output_deltas = propagate_deltas(
+            &self.dataflow,
+            &mut self.join_states,
+            &mut self.aggregate_states,
+            table_id,
+            deltas,
+            0,
+            0,
+        ).0;
 
         // Apply output deltas to result
         for delta in &output_deltas {
@@ -590,138 +597,6 @@ impl MaterializedView {
         output_deltas
     }
 
-    /// Propagates deltas through a dataflow node.
-    /// Returns (output_deltas, next_join_id, next_agg_id).
-    fn propagate_mut(
-        &mut self,
-        node: &DataflowNode,
-        source_table: TableId,
-        deltas: Vec<Delta<Row>>,
-        join_id: usize,
-        agg_id: usize,
-    ) -> (Vec<Delta<Row>>, usize, usize) {
-        match node {
-            DataflowNode::Source { table_id } => {
-                if *table_id == source_table {
-                    (deltas, join_id, agg_id)
-                } else {
-                    (Vec::new(), join_id, agg_id)
-                }
-            }
-
-            DataflowNode::Filter { input, predicate } => {
-                let (input_deltas, jid, aid) =
-                    self.propagate_mut(input, source_table, deltas, join_id, agg_id);
-                (filter_incremental(&input_deltas, |row| predicate(row)), jid, aid)
-            }
-
-            DataflowNode::Project { input, columns } => {
-                let (input_deltas, jid, aid) =
-                    self.propagate_mut(input, source_table, deltas, join_id, agg_id);
-                (project_incremental(&input_deltas, columns), jid, aid)
-            }
-
-            DataflowNode::Map { input, mapper } => {
-                let (input_deltas, jid, aid) =
-                    self.propagate_mut(input, source_table, deltas, join_id, agg_id);
-                (map_incremental(&input_deltas, |row| mapper(row)), jid, aid)
-            }
-
-            DataflowNode::Join {
-                left, right, left_key, right_key, join_type,
-            } => {
-                let current_join_id = join_id;
-                if !self.join_states.contains_key(&current_join_id) {
-                    self.join_states.insert(current_join_id, JoinState::new());
-                }
-
-                let left_sources = left.collect_sources();
-                let right_sources = right.collect_sources();
-                let is_left_side = left_sources.contains(&source_table);
-                let is_right_side = right_sources.contains(&source_table);
-                let jt = *join_type;
-
-                let mut output_deltas = Vec::new();
-
-                if is_left_side {
-                    let (left_deltas, _, _) =
-                        self.propagate_mut(left, source_table, deltas.clone(), current_join_id + 1, agg_id);
-
-                    let join_state = self.join_states.get_mut(&current_join_id).unwrap();
-                    for delta in left_deltas {
-                        let key = left_key(&delta.data);
-                        if jt == JoinType::Inner {
-                            // Fast path for inner join
-                            if delta.is_insert() {
-                                for row in join_state.on_left_insert(delta.data, key) {
-                                    output_deltas.push(Delta::insert(row));
-                                }
-                            } else if delta.is_delete() {
-                                for row in join_state.on_left_delete(&delta.data, key) {
-                                    output_deltas.push(Delta::delete(row));
-                                }
-                            }
-                        } else if delta.is_insert() {
-                            output_deltas.extend(join_state.on_left_insert_outer(delta.data, key, jt));
-                        } else if delta.is_delete() {
-                            output_deltas.extend(join_state.on_left_delete_outer(&delta.data, key, jt));
-                        }
-                    }
-                }
-
-                if is_right_side {
-                    let (right_deltas, _, _) =
-                        self.propagate_mut(right, source_table, deltas, current_join_id + 1, agg_id);
-
-                    let join_state = self.join_states.get_mut(&current_join_id).unwrap();
-                    for delta in right_deltas {
-                        let key = right_key(&delta.data);
-                        if jt == JoinType::Inner {
-                            if delta.is_insert() {
-                                for row in join_state.on_right_insert(delta.data, key) {
-                                    output_deltas.push(Delta::insert(row));
-                                }
-                            } else if delta.is_delete() {
-                                for row in join_state.on_right_delete(&delta.data, key) {
-                                    output_deltas.push(Delta::delete(row));
-                                }
-                            }
-                        } else if delta.is_insert() {
-                            output_deltas.extend(join_state.on_right_insert_outer(delta.data, key, jt));
-                        } else if delta.is_delete() {
-                            output_deltas.extend(join_state.on_right_delete_outer(&delta.data, key, jt));
-                        }
-                    }
-                }
-
-                (output_deltas, current_join_id + 1, agg_id)
-            }
-
-            DataflowNode::Aggregate { input, group_by, functions } => {
-                let current_agg_id = agg_id;
-                let (input_deltas, jid, _) =
-                    self.propagate_mut(input, source_table, deltas, join_id, current_agg_id + 1);
-
-                if input_deltas.is_empty() {
-                    return (Vec::new(), jid, current_agg_id + 1);
-                }
-
-                // Get or create aggregate state
-                if !self.aggregate_states.contains_key(&current_agg_id) {
-                    self.aggregate_states.insert(
-                        current_agg_id,
-                        GroupAggregateState::new(group_by.clone(), functions.clone()),
-                    );
-                }
-
-                let agg_state = self.aggregate_states.get_mut(&current_agg_id).unwrap();
-                let output = agg_state.process_deltas(&input_deltas);
-
-                (output, jid, current_agg_id + 1)
-            }
-        }
-    }
-
     pub fn clear(&mut self) {
         self.result_map.clear();
     }
@@ -730,6 +605,140 @@ impl MaterializedView {
         self.result_map.clear();
         for row in rows {
             self.result_map.insert(row.id(), row);
+        }
+    }
+}
+
+/// Propagates deltas through a dataflow node.
+/// This is a free function to allow split borrows: immutable dataflow + mutable states.
+/// Returns (output_deltas, next_join_id, next_agg_id).
+fn propagate_deltas(
+    node: &DataflowNode,
+    join_states: &mut HashMap<usize, JoinState>,
+    aggregate_states: &mut HashMap<usize, GroupAggregateState>,
+    source_table: TableId,
+    deltas: Vec<Delta<Row>>,
+    join_id: usize,
+    agg_id: usize,
+) -> (Vec<Delta<Row>>, usize, usize) {
+    match node {
+        DataflowNode::Source { table_id } => {
+            if *table_id == source_table {
+                (deltas, join_id, agg_id)
+            } else {
+                (Vec::new(), join_id, agg_id)
+            }
+        }
+
+        DataflowNode::Filter { input, predicate } => {
+            let (input_deltas, jid, aid) =
+                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, agg_id);
+            (filter_incremental(&input_deltas, |row| predicate(row)), jid, aid)
+        }
+
+        DataflowNode::Project { input, columns } => {
+            let (input_deltas, jid, aid) =
+                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, agg_id);
+            (project_incremental(&input_deltas, columns), jid, aid)
+        }
+
+        DataflowNode::Map { input, mapper } => {
+            let (input_deltas, jid, aid) =
+                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, agg_id);
+            (map_incremental(&input_deltas, |row| mapper(row)), jid, aid)
+        }
+
+        DataflowNode::Join {
+            left, right, left_key, right_key, join_type,
+        } => {
+            let current_join_id = join_id;
+            if !join_states.contains_key(&current_join_id) {
+                join_states.insert(current_join_id, JoinState::new());
+            }
+
+            let left_sources = left.collect_sources();
+            let right_sources = right.collect_sources();
+            let is_left_side = left_sources.contains(&source_table);
+            let is_right_side = right_sources.contains(&source_table);
+            let jt = *join_type;
+
+            let mut output_deltas = Vec::new();
+
+            if is_left_side {
+                let (left_deltas, _, _) =
+                    propagate_deltas(left, join_states, aggregate_states, source_table, deltas.clone(), current_join_id + 1, agg_id);
+
+                let join_state = join_states.get_mut(&current_join_id).unwrap();
+                for delta in left_deltas {
+                    let key = left_key(&delta.data);
+                    if jt == JoinType::Inner {
+                        // Fast path for inner join
+                        if delta.is_insert() {
+                            for row in join_state.on_left_insert(delta.data, key) {
+                                output_deltas.push(Delta::insert(row));
+                            }
+                        } else if delta.is_delete() {
+                            for row in join_state.on_left_delete(&delta.data, key) {
+                                output_deltas.push(Delta::delete(row));
+                            }
+                        }
+                    } else if delta.is_insert() {
+                        output_deltas.extend(join_state.on_left_insert_outer(delta.data, key, jt));
+                    } else if delta.is_delete() {
+                        output_deltas.extend(join_state.on_left_delete_outer(&delta.data, key, jt));
+                    }
+                }
+            }
+
+            if is_right_side {
+                let (right_deltas, _, _) =
+                    propagate_deltas(right, join_states, aggregate_states, source_table, deltas, current_join_id + 1, agg_id);
+
+                let join_state = join_states.get_mut(&current_join_id).unwrap();
+                for delta in right_deltas {
+                    let key = right_key(&delta.data);
+                    if jt == JoinType::Inner {
+                        if delta.is_insert() {
+                            for row in join_state.on_right_insert(delta.data, key) {
+                                output_deltas.push(Delta::insert(row));
+                            }
+                        } else if delta.is_delete() {
+                            for row in join_state.on_right_delete(&delta.data, key) {
+                                output_deltas.push(Delta::delete(row));
+                            }
+                        }
+                    } else if delta.is_insert() {
+                        output_deltas.extend(join_state.on_right_insert_outer(delta.data, key, jt));
+                    } else if delta.is_delete() {
+                        output_deltas.extend(join_state.on_right_delete_outer(&delta.data, key, jt));
+                    }
+                }
+            }
+
+            (output_deltas, current_join_id + 1, agg_id)
+        }
+
+        DataflowNode::Aggregate { input, group_by, functions } => {
+            let current_agg_id = agg_id;
+            let (input_deltas, jid, _) =
+                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, current_agg_id + 1);
+
+            if input_deltas.is_empty() {
+                return (Vec::new(), jid, current_agg_id + 1);
+            }
+
+            // Get or create aggregate state
+            if !aggregate_states.contains_key(&current_agg_id) {
+                aggregate_states.insert(
+                    current_agg_id,
+                    GroupAggregateState::new(group_by.clone(), functions.clone()),
+                );
+            }
+
+            let agg_state = aggregate_states.get_mut(&current_agg_id).unwrap();
+            let output = agg_state.process_deltas(&input_deltas);
+
+            (output, jid, current_agg_id + 1)
         }
     }
 }
@@ -979,5 +988,63 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(view.len(), 1);
+    }
+
+    // ==================== Bug 2 Test: Sum is_empty() incorrect logic ====================
+    // This test demonstrates Bug 2: Sum uses sum == 0.0 to check if group is empty,
+    // which is incorrect when values sum to zero (e.g., +5 and -5).
+
+    #[test]
+    fn test_aggregate_sum_zero_bug() {
+        // GROUP BY column 0, SUM(column 1)
+        let dataflow = DataflowNode::Aggregate {
+            input: Box::new(DataflowNode::source(1)),
+            group_by: vec![0],
+            functions: vec![(1, AggregateType::Sum)],
+        };
+        let mut view = MaterializedView::new(dataflow);
+
+        // Insert two rows with values that sum to zero: +5 and -5
+        let output = view.on_table_change(1, vec![
+            Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(5)])),
+            Delta::insert(Row::new(2, vec![Value::Int64(1), Value::Int64(-5)])),
+        ]);
+
+        // The group should still exist with sum=0, not be deleted
+        // BUG: The group is incorrectly deleted because sum == 0.0 is used to check emptiness
+        let final_inserts: Vec<_> = output.iter().filter(|d| d.is_insert()).collect();
+        let final_deletes: Vec<_> = output.iter().filter(|d| d.is_delete()).collect();
+
+        // After processing both inserts, we should have:
+        // - One group with key=1 and sum=0.0
+        // The group should NOT be deleted just because sum is zero
+        assert!(
+            final_inserts.len() > final_deletes.len() || view.len() == 1,
+            "Group with sum=0 should still exist, but it was incorrectly deleted"
+        );
+
+        // Verify the group exists with sum=0
+        let result = view.result();
+        assert_eq!(result.len(), 1, "Group should exist even when sum is zero");
+        assert_eq!(result[0].get(1), Some(&Value::Float64(0.0)), "Sum should be 0.0");
+    }
+
+    #[test]
+    fn test_aggregate_sum_is_empty_direct() {
+        // Direct test of AggregateState::is_empty() for Sum
+        use crate::dataflow::AggregateType;
+
+        let mut state = AggregateState::new(AggregateType::Sum);
+
+        // Apply two values that sum to zero
+        state.apply(&Value::Int64(5), 1);  // +5
+        state.apply(&Value::Int64(-5), 1); // -5
+
+        // BUG: is_empty() returns true because sum == 0.0
+        // But the group has 2 rows, so it should NOT be empty
+        assert!(
+            !state.is_empty(),
+            "Sum group with 2 rows should NOT be empty, even if sum is 0.0"
+        );
     }
 }

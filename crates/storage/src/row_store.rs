@@ -357,6 +357,17 @@ impl RowStore {
                 idx.remove(&key, Some(row_id));
             }
         }
+
+        // Remove from GIN indices
+        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        for idx_name in &gin_index_names {
+            let col_idx = self.gin_index_columns[idx_name];
+            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
+                if let Some(value) = row.get(col_idx) {
+                    Self::remove_jsonb_from_gin(gin_idx, value, row_id);
+                }
+            }
+        }
     }
 
     /// Updates a row in the store.
@@ -419,6 +430,25 @@ impl RowStore {
             }
         }
 
+        // Update GIN indices
+        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        for idx_name in &gin_index_names {
+            let col_idx = self.gin_index_columns[idx_name];
+            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
+                let old_value = old_row.get(col_idx);
+                let new_value = new_row.get(col_idx);
+                // Only update if the JSONB value changed
+                if old_value != new_value {
+                    if let Some(old_val) = old_value {
+                        Self::remove_jsonb_from_gin(gin_idx, old_val, row_id);
+                    }
+                    if let Some(new_val) = new_value {
+                        Self::index_jsonb_value(gin_idx, new_val, row_id);
+                    }
+                }
+            }
+        }
+
         self.rows.insert(row_id, Rc::new(new_row));
         Ok(())
     }
@@ -444,6 +474,17 @@ impl RowStore {
             let key = extract_key(&row, cols);
             if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
                 idx.remove(&key, Some(row_id));
+            }
+        }
+
+        // Remove from GIN indices
+        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        for idx_name in &gin_index_names {
+            let col_idx = self.gin_index_columns[idx_name];
+            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
+                if let Some(value) = row.get(col_idx) {
+                    Self::remove_jsonb_from_gin(gin_idx, value, row_id);
+                }
             }
         }
 
@@ -498,6 +539,19 @@ impl RowStore {
                     .map(|row| (extract_key(row, cols), row.id()))
                     .collect();
                 idx.remove_batch(&entries);
+            }
+        }
+
+        // Remove from GIN indices
+        let gin_index_names: Vec<String> = self.gin_index_columns.keys().cloned().collect();
+        for idx_name in &gin_index_names {
+            let col_idx = self.gin_index_columns[idx_name];
+            if let Some(gin_idx) = self.gin_indices.get_mut(idx_name) {
+                for row in &deleted_rows {
+                    if let Some(value) = row.get(col_idx) {
+                        Self::remove_jsonb_from_gin(gin_idx, value, row.id());
+                    }
+                }
             }
         }
 
@@ -760,7 +814,6 @@ impl RowStore {
     }
 
     /// Removes JSONB value from the GIN index.
-    #[allow(dead_code)]
     fn remove_jsonb_from_gin(gin_idx: &mut GinIndex, value: &Value, row_id: RowId) {
         if let Value::Jsonb(jsonb) = value {
             if let Ok(json_str) = core::str::from_utf8(&jsonb.0) {
@@ -848,6 +901,28 @@ impl RowStore {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
             let row_ids = gin_idx.get_by_key_values_all(pairs);
             row_ids.iter().filter_map(|&id| self.rows.get(&id).cloned()).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns the raw row IDs from the GIN index for a given key.
+    /// This is useful for testing to detect ghost entries (entries that point to deleted rows).
+    #[cfg(test)]
+    pub fn gin_index_get_raw_row_ids(&self, index_name: &str, key: &str) -> Vec<RowId> {
+        if let Some(gin_idx) = self.gin_indices.get(index_name) {
+            gin_idx.get_by_key(key)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Returns the raw row IDs from the GIN index for a given key-value pair.
+    /// This is useful for testing to detect ghost entries.
+    #[cfg(test)]
+    pub fn gin_index_get_raw_row_ids_by_kv(&self, index_name: &str, key: &str, value: &str) -> Vec<RowId> {
+        if let Some(gin_idx) = self.gin_indices.get(index_name) {
+            gin_idx.get_by_key_value(key, value)
         } else {
             Vec::new()
         }
@@ -1295,5 +1370,274 @@ mod tests {
         // Should be able to insert another row with same PK
         let row2 = Row::new(2, vec![Value::Int64(100), Value::String("Bob".into())]);
         assert!(store.insert(row2).is_ok());
+    }
+
+    // ==================== GIN Index Bug Tests ====================
+    // These tests verify Bug 1: GIN index not updated in update/delete operations
+
+    fn test_schema_with_gin_index() -> Table {
+        TableBuilder::new("test_jsonb")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_data_gin", &["data"], false)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn make_jsonb(json_str: &str) -> Value {
+        Value::Jsonb(cynos_core::JsonbValue(json_str.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn test_gin_index_insert_and_query() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        // Insert a row with JSONB data
+        let row = Row::new(1, vec![
+            Value::Int64(1),
+            make_jsonb(r#"{"name": "Alice", "status": "active"}"#)
+        ]);
+        store.insert(row).unwrap();
+
+        // Query by key should find the row
+        let results = store.gin_index_get_by_key("idx_data_gin", "name");
+        assert_eq!(results.len(), 1, "GIN index should find row by key 'name'");
+
+        // Query by key-value should find the row
+        let results = store.gin_index_get_by_key_value("idx_data_gin", "status", "active");
+        assert_eq!(results.len(), 1, "GIN index should find row by key-value 'status=active'");
+    }
+
+    #[test]
+    fn test_gin_index_delete_bug() {
+        // This test demonstrates Bug 1: GIN index not updated on delete
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        // Insert a row with JSONB data
+        let row = Row::new(1, vec![
+            Value::Int64(1),
+            make_jsonb(r#"{"name": "Alice", "status": "active"}"#)
+        ]);
+        store.insert(row).unwrap();
+
+        // Verify GIN index has the entry (using raw row IDs to detect ghost entries)
+        let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "name");
+        assert_eq!(raw_ids.len(), 1, "Before delete: GIN index should have entry");
+
+        // Delete the row
+        store.delete(1).unwrap();
+
+        // BUG: GIN index still has the ghost entry
+        // The public API filters out deleted rows, but the index itself still has the entry
+        let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "name");
+        // This assertion will FAIL before the fix, demonstrating the bug
+        assert_eq!(raw_ids.len(), 0, "After delete: GIN index should NOT have ghost entries");
+    }
+
+    #[test]
+    fn test_gin_index_update_bug() {
+        // This test demonstrates Bug 1: GIN index not updated on update
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        // Insert a row with JSONB data
+        let row = Row::new(1, vec![
+            Value::Int64(1),
+            make_jsonb(r#"{"name": "Alice", "status": "active"}"#)
+        ]);
+        store.insert(row).unwrap();
+
+        // Verify initial state (using raw row IDs)
+        let raw_ids = store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", "status", "active");
+        assert_eq!(raw_ids.len(), 1, "Before update: should find 'status=active'");
+
+        // Update the row with different JSONB data
+        let new_row = Row::new(1, vec![
+            Value::Int64(1),
+            make_jsonb(r#"{"name": "Alice", "status": "inactive"}"#)
+        ]);
+        store.update(1, new_row).unwrap();
+
+        // BUG: Old value still in GIN index (ghost entry)
+        let raw_ids = store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", "status", "active");
+        assert_eq!(raw_ids.len(), 0, "After update: old value 'status=active' should NOT be in GIN index");
+
+        // BUG: New value not in GIN index
+        let raw_ids = store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", "status", "inactive");
+        assert_eq!(raw_ids.len(), 1, "After update: new value 'status=inactive' should be in GIN index");
+    }
+
+    #[test]
+    fn test_gin_index_delete_batch_bug() {
+        // This test demonstrates Bug 1: GIN index not updated on delete_batch
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        // Insert multiple rows
+        for i in 1..=3 {
+            let row = Row::new(i, vec![
+                Value::Int64(i as i64),
+                make_jsonb(&format!(r#"{{"user": "user{}"}}"#, i))
+            ]);
+            store.insert(row).unwrap();
+        }
+
+        // Verify all entries exist (using raw row IDs)
+        let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "user");
+        assert_eq!(raw_ids.len(), 3, "Before delete_batch: should have 3 entries");
+
+        // Delete rows 1 and 2
+        store.delete_batch(&[1, 2]);
+
+        // BUG: GIN index still has ghost entries
+        let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "user");
+        assert_eq!(raw_ids.len(), 1, "After delete_batch: should only have 1 entry (row 3)");
+    }
+
+    #[test]
+    fn test_gin_index_rollback_insert_bug() {
+        // This test demonstrates Bug 1: GIN index not cleaned up on rollback_insert
+        // We need a schema with both a unique secondary index and a GIN index
+        let schema = TableBuilder::new("test_rollback")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("email", DataType::String)
+            .unwrap()
+            .add_column("data", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_email", &["email"], true) // unique index
+            .unwrap()
+            .add_index("idx_data_gin", &["data"], false) // GIN index
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut store = RowStore::new(schema);
+
+        // Insert first row
+        let row1 = Row::new(1, vec![
+            Value::Int64(1),
+            Value::String("alice@test.com".into()),
+            make_jsonb(r#"{"role": "admin"}"#)
+        ]);
+        store.insert(row1).unwrap();
+
+        // Verify initial state
+        let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "role");
+        assert_eq!(raw_ids.len(), 1, "After first insert: should have 1 entry");
+
+        // Try to insert second row with same email (will fail due to unique constraint)
+        let row2 = Row::new(2, vec![
+            Value::Int64(2),
+            Value::String("alice@test.com".into()), // duplicate email
+            make_jsonb(r#"{"role": "user"}"#)
+        ]);
+        let result = store.insert(row2);
+        assert!(result.is_err(), "Insert should fail due to unique constraint");
+
+        // BUG: The GIN index may have been partially updated before rollback
+        // After rollback, only row 1's data should be in the GIN index
+        let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "role");
+        assert_eq!(raw_ids.len(), 1, "After failed insert: GIN index should only have row 1's entry");
+    }
+
+    // ==================== Defect 1 Test: Composite PK serialization collision ====================
+    // This test demonstrates Defect 1: Composite PK key collision when values contain separator
+
+    fn test_schema_composite_pk_string_string() -> Table {
+        TableBuilder::new("test")
+            .unwrap()
+            .add_column("id1", DataType::String)
+            .unwrap()
+            .add_column("id2", DataType::String)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id1", "id2"], false)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn test_schema_composite_pk_int_int() -> Table {
+        TableBuilder::new("test")
+            .unwrap()
+            .add_column("id1", DataType::Int32)
+            .unwrap()
+            .add_column("id2", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id1", "id2"], false)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_composite_pk_separator_collision_defect() {
+        // Test that different composite keys don't collide
+        let mut store = RowStore::new(test_schema_composite_pk_string_string());
+
+        let row1 = Row::new(1, vec![
+            Value::String("a\")|String(\"b".into()),
+            Value::String("c".into()),
+            Value::String("Name1".into())
+        ]);
+        assert!(store.insert(row1).is_ok(), "First insert should succeed");
+
+        let row2 = Row::new(2, vec![
+            Value::String("a".into()),
+            Value::String("b\")|String(\"c".into()),
+            Value::String("Name2".into())
+        ]);
+        assert!(
+            store.insert(row2).is_ok(),
+            "Defect 1: Different composite keys should NOT collide"
+        );
+    }
+
+    #[test]
+    fn test_composite_pk_type_confusion_defect() {
+        // Test that Int32 and Int64 with same numeric value don't collide
+        // Int32(42) and Int64(42) should produce different keys
+        let mut store = RowStore::new(test_schema_composite_pk_int_int());
+
+        // Row with (Int32(42), Int64(100))
+        let row1 = Row::new(1, vec![
+            Value::Int32(42),
+            Value::Int64(100),
+            Value::String("Name1".into())
+        ]);
+        assert!(store.insert(row1).is_ok(), "First insert should succeed");
+
+        // Row with (Int32(42), Int64(100)) - same composite key, should fail
+        let row2 = Row::new(2, vec![
+            Value::Int32(42),
+            Value::Int64(100),
+            Value::String("Name2".into())
+        ]);
+        assert!(
+            store.insert(row2).is_err(),
+            "Same composite key should fail"
+        );
+
+        // Row with (Int32(100), Int64(42)) - different composite key, should succeed
+        let row3 = Row::new(3, vec![
+            Value::Int32(100),
+            Value::Int64(42),
+            Value::String("Name3".into())
+        ]);
+        assert!(
+            store.insert(row3).is_ok(),
+            "Different composite key should succeed"
+        );
     }
 }
