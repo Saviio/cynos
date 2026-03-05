@@ -1,4 +1,5 @@
 # Cynos
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Saviio/cynos)
 
 > ⚠️ **Development Status**: This project is currently in active development and not yet ready for production use. APIs may change without notice.
 
