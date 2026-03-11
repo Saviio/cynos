@@ -14,7 +14,7 @@ A reactive in-memory database written in Rust with first-class WASM support.
 - **Rich Data Types**: Boolean, Int32, Int64, Float64, String, DateTime, Bytes, JSONB
 - **Multiple Index Types**: Hash (O(1) lookups), B+Tree (range queries), GIN (JSONB containment)
 - **ACID Transactions**: Full transaction support with rollback capability （this feature has not yet been fully implemented）
-- **Query Optimization**: Cost-based optimizer with predicate pushdown, join reordering, and index selection
+- **Query Optimization**: Optimizer with predicate pushdown, join reordering, and index selection
 
 ## Quick Start
 
@@ -123,7 +123,7 @@ Cynos is organized as a Rust workspace with the following crates:
 
 ## JSONB Support
 
-Full PostgreSQL-compatible JSONB implementation with:
+PostgreSQL like (partial) JSONB implementation with:
 
 - JSONPath query language (`$.key`, `[n]`, `[*]`, `..key`, filter expressions)
 - Containment operators (`@>`, `<@`, `?`, `?|`, `?&`)
