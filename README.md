@@ -310,7 +310,7 @@ pnpm build
 
 ## Browser / Runtime Compatibility
 
-WASM is a first-class target for Cynos, so the root README should call out the runtime assumptions explicitly.
+Compilation to WASM and execution in browser-like environments are first-class features of cynos. To provide a complete picture, this section presents additional compatibility data.
 
 The current JS package and generated glue code rely on these platform features:
 
