@@ -90,7 +90,13 @@ fn sort_merge_join(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Join", "sort_merge_join", Some(size), result, Some(throughput));
+        report.add_result(
+            "Join",
+            "sort_merge_join",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -124,7 +130,13 @@ fn nested_loop_join(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Join", "nested_loop_join", Some(size), result, Some(throughput));
+        report.add_result(
+            "Join",
+            "nested_loop_join",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -180,10 +192,7 @@ fn join_comparison(report: &mut Report) {
         },
     );
 
-    println!(
-        "    Hash:        {:>10}",
-        format_duration(hash_result.mean)
-    );
+    println!("    Hash:        {:>10}", format_duration(hash_result.mean));
     println!(
         "    Sort-Merge:  {:>10}",
         format_duration(merge_result.mean)
@@ -194,6 +203,18 @@ fn join_comparison(report: &mut Report) {
     );
 
     report.add_result("Join/Comparison", "hash", Some(1000), hash_result, None);
-    report.add_result("Join/Comparison", "sort_merge", Some(1000), merge_result, None);
-    report.add_result("Join/Comparison", "nested_loop", Some(1000), nested_result, None);
+    report.add_result(
+        "Join/Comparison",
+        "sort_merge",
+        Some(1000),
+        merge_result,
+        None,
+    );
+    report.add_result(
+        "Join/Comparison",
+        "nested_loop",
+        Some(1000),
+        nested_result,
+        None,
+    );
 }

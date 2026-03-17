@@ -385,8 +385,14 @@ mod tests {
 
     #[test]
     fn test_default_for_type() {
-        assert_eq!(Value::default_for_type(DataType::Boolean), Value::Boolean(false));
+        assert_eq!(
+            Value::default_for_type(DataType::Boolean),
+            Value::Boolean(false)
+        );
         assert_eq!(Value::default_for_type(DataType::Int32), Value::Int32(0));
-        assert_eq!(Value::default_for_type(DataType::String), Value::String(String::new()));
+        assert_eq!(
+            Value::default_for_type(DataType::String),
+            Value::String(String::new())
+        );
     }
 }

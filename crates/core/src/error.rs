@@ -12,51 +12,25 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug)]
 pub enum Error {
     /// Type mismatch error.
-    TypeMismatch {
-        expected: DataType,
-        got: DataType,
-    },
+    TypeMismatch { expected: DataType, got: DataType },
     /// Null constraint violation.
-    NullConstraint {
-        column: String,
-    },
+    NullConstraint { column: String },
     /// Unique constraint violation.
-    UniqueConstraint {
-        column: String,
-        value: Value,
-    },
+    UniqueConstraint { column: String, value: Value },
     /// Row or record not found.
-    NotFound {
-        table: String,
-        key: Value,
-    },
+    NotFound { table: String, key: Value },
     /// Invalid schema definition.
-    InvalidSchema {
-        message: String,
-    },
+    InvalidSchema { message: String },
     /// Column not found.
-    ColumnNotFound {
-        table: String,
-        column: String,
-    },
+    ColumnNotFound { table: String, column: String },
     /// Table not found.
-    TableNotFound {
-        name: String,
-    },
+    TableNotFound { name: String },
     /// Index not found.
-    IndexNotFound {
-        table: String,
-        index: String,
-    },
+    IndexNotFound { table: String, index: String },
     /// Foreign key constraint violation.
-    ForeignKeyViolation {
-        constraint: String,
-        message: String,
-    },
+    ForeignKeyViolation { constraint: String, message: String },
     /// Invalid operation.
-    InvalidOperation {
-        message: String,
-    },
+    InvalidOperation { message: String },
 }
 
 impl fmt::Display for Error {
@@ -90,7 +64,10 @@ impl fmt::Display for Error {
             Error::IndexNotFound { table, index } => {
                 write!(f, "Index {} not found in table {}", index, table)
             }
-            Error::ForeignKeyViolation { constraint, message } => {
+            Error::ForeignKeyViolation {
+                constraint,
+                message,
+            } => {
                 write!(f, "Foreign key violation ({}): {}", constraint, message)
             }
             Error::InvalidOperation { message } => {

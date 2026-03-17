@@ -65,7 +65,7 @@ impl QueryPlanner {
     /// - Physical: TopNPushdown, OrderByIndexPass, LimitSkipByIndexPass
     pub fn new(ctx: ExecutionContext) -> Self {
         Self {
-            ctx,
+            ctx: ctx.clone(),
             logical_passes: alloc::vec![
                 Box::new(NotSimplification),
                 Box::new(AndPredicatePass),
@@ -73,7 +73,7 @@ impl QueryPlanner {
                 Box::new(ImplicitJoinsPass),
                 Box::new(OuterJoinSimplification),
                 Box::new(PredicatePushdown),
-                Box::new(JoinReorder::new()),
+                Box::new(JoinReorder::with_context(ctx.clone())),
             ],
         }
     }
@@ -113,19 +113,7 @@ impl QueryPlanner {
         logical = index_selection.optimize(logical);
 
         // Phase 3: Convert to physical plan
-        let mut physical = self.logical_to_physical(logical);
-
-        // Phase 4: Physical optimizations
-        // TopNPushdown: Sort + Limit -> TopN
-        physical = TopNPushdown::new().optimize(physical);
-
-        // OrderByIndexPass: leverage indexes for sorting (needs context)
-        physical = OrderByIndexPass::new(&self.ctx).optimize(physical);
-
-        // LimitSkipByIndexPass: push limit/offset to IndexScan (needs context)
-        physical = LimitSkipByIndexPass::new(&self.ctx).optimize(physical);
-
-        physical
+        self.optimize_physical(self.logical_to_physical(logical))
     }
 
     /// Optimizes only the logical plan without converting to physical.
@@ -150,14 +138,7 @@ impl QueryPlanner {
     ///
     /// Assumes the logical plan has already been optimized.
     pub fn to_physical(&self, plan: LogicalPlan) -> PhysicalPlan {
-        let mut physical = self.logical_to_physical(plan);
-
-        // Physical optimizations
-        physical = TopNPushdown::new().optimize(physical);
-        physical = OrderByIndexPass::new(&self.ctx).optimize(physical);
-        physical = LimitSkipByIndexPass::new(&self.ctx).optimize(physical);
-
-        physical
+        self.optimize_physical(self.logical_to_physical(plan))
     }
 
     /// Converts a logical plan to a physical plan without optimizations.
@@ -170,17 +151,11 @@ impl QueryPlanner {
             LogicalPlan::IndexScan {
                 table,
                 index,
-                range_start,
-                range_end,
-                include_start,
-                include_end,
+                bounds,
             } => PhysicalPlan::IndexScan {
                 table,
                 index,
-                range_start,
-                range_end,
-                include_start,
-                include_end,
+                bounds,
                 limit: None,
                 offset: None,
                 reverse: false,
@@ -327,6 +302,12 @@ impl QueryPlanner {
         }
         crate::planner::JoinAlgorithm::NestedLoop
     }
+
+    fn optimize_physical(&self, mut physical: PhysicalPlan) -> PhysicalPlan {
+        physical = TopNPushdown::new().optimize(physical);
+        physical = OrderByIndexPass::new(&self.ctx).optimize(physical);
+        LimitSkipByIndexPass::new(&self.ctx).optimize(physical)
+    }
 }
 
 #[cfg(test)]
@@ -334,6 +315,7 @@ mod tests {
     use super::*;
     use crate::ast::{Expr, SortOrder};
     use crate::context::{IndexInfo, TableStats};
+    use alloc::string::String;
 
     fn create_test_context() -> ExecutionContext {
         let mut ctx = ExecutionContext::new();
@@ -349,6 +331,29 @@ mod tests {
             },
         );
         ctx
+    }
+
+    fn collect_scan_order(plan: &LogicalPlan, order: &mut Vec<String>) {
+        match plan {
+            LogicalPlan::Scan { table }
+            | LogicalPlan::IndexScan { table, .. }
+            | LogicalPlan::IndexGet { table, .. }
+            | LogicalPlan::IndexInGet { table, .. }
+            | LogicalPlan::GinIndexScan { table, .. }
+            | LogicalPlan::GinIndexScanMulti { table, .. } => order.push(table.clone()),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => collect_scan_order(input, order),
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::CrossProduct { left, right }
+            | LogicalPlan::Union { left, right, .. } => {
+                collect_scan_order(left, order);
+                collect_scan_order(right, order);
+            }
+            LogicalPlan::Empty => {}
+        }
     }
 
     #[test]
@@ -415,11 +420,7 @@ mod tests {
 
         // Should become IndexScan with limit and reverse
         match physical {
-            PhysicalPlan::IndexScan {
-                limit,
-                reverse,
-                ..
-            } => {
+            PhysicalPlan::IndexScan { limit, reverse, .. } => {
                 assert_eq!(limit, Some(10));
                 assert!(reverse);
             }
@@ -441,5 +442,58 @@ mod tests {
 
         // Should convert to IndexGet
         assert!(matches!(optimized, LogicalPlan::IndexGet { .. }));
+    }
+
+    #[test]
+    fn test_query_planner_join_reorder_uses_context() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "a",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "b",
+            TableStats {
+                row_count: 10,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "c",
+            TableStats {
+                row_count: 100,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+
+        let planner = QueryPlanner::new(ctx);
+        let plan = LogicalPlan::inner_join(
+            LogicalPlan::inner_join(
+                LogicalPlan::scan("a"),
+                LogicalPlan::scan("c"),
+                Expr::eq(Expr::column("a", "id", 0), Expr::column("c", "a_id", 0)),
+            ),
+            LogicalPlan::scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+        );
+
+        let optimized = planner.optimize_logical(plan);
+        let mut order = Vec::new();
+        collect_scan_order(&optimized, &mut order);
+
+        assert_eq!(
+            order,
+            alloc::vec![
+                alloc::string::String::from("b"),
+                alloc::string::String::from("a"),
+                alloc::string::String::from("c")
+            ]
+        );
     }
 }

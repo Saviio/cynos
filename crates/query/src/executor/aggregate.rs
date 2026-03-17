@@ -132,11 +132,7 @@ impl AggregateExecutor {
                     // COUNT(column) - count non-null values
                     let count = entries
                         .iter()
-                        .filter(|e| {
-                            e.get_field(idx)
-                                .map(|v| !v.is_null())
-                                .unwrap_or(false)
-                        })
+                        .filter(|e| e.get_field(idx).map(|v| !v.is_null()).unwrap_or(false))
                         .count();
                     Value::Int64(count as i64)
                 } else {
@@ -240,10 +236,7 @@ impl AggregateExecutor {
                     Value::Null
                 } else {
                     let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
-                    let variance: f64 = values
-                        .iter()
-                        .map(|v| (v - mean) * (v - mean))
-                        .sum::<f64>()
+                    let variance: f64 = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>()
                         / values.len() as f64;
                     Value::Float64(sqrt(variance))
                 }
@@ -534,7 +527,7 @@ mod tests {
         // GeoMean filters out non-positive values
         let rows = vec![
             Row::new(0, vec![Value::Float64(2.0)]),
-            Row::new(1, vec![Value::Float64(0.0)]),  // filtered
+            Row::new(1, vec![Value::Float64(0.0)]), // filtered
             Row::new(2, vec![Value::Float64(-1.0)]), // filtered
             Row::new(3, vec![Value::Float64(8.0)]),
         ];
@@ -730,11 +723,11 @@ mod tests {
         ]);
         let result = executor.execute(input);
 
-        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(4)));    // COUNT
-        assert_eq!(result.entries[0].get_field(1), Some(&Value::Int64(100)));  // SUM
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(4))); // COUNT
+        assert_eq!(result.entries[0].get_field(1), Some(&Value::Int64(100))); // SUM
         assert_eq!(result.entries[0].get_field(2), Some(&Value::Float64(25.0))); // AVG
-        assert_eq!(result.entries[0].get_field(3), Some(&Value::Int64(10)));   // MIN
-        assert_eq!(result.entries[0].get_field(4), Some(&Value::Int64(40)));   // MAX
+        assert_eq!(result.entries[0].get_field(3), Some(&Value::Int64(10))); // MIN
+        assert_eq!(result.entries[0].get_field(4), Some(&Value::Int64(40))); // MAX
     }
 
     #[test]
@@ -764,14 +757,16 @@ mod tests {
             let group_key = entry.get_field(0);
             match group_key {
                 Some(Value::String(s)) if s == "A" => {
-                    assert_eq!(entry.get_field(1), Some(&Value::Int64(3)));    // COUNT
-                    assert_eq!(entry.get_field(2), Some(&Value::Int64(60)));   // SUM
-                    assert_eq!(entry.get_field(3), Some(&Value::Float64(20.0))); // AVG
+                    assert_eq!(entry.get_field(1), Some(&Value::Int64(3))); // COUNT
+                    assert_eq!(entry.get_field(2), Some(&Value::Int64(60))); // SUM
+                    assert_eq!(entry.get_field(3), Some(&Value::Float64(20.0)));
+                    // AVG
                 }
                 Some(Value::String(s)) if s == "B" => {
-                    assert_eq!(entry.get_field(1), Some(&Value::Int64(1)));    // COUNT
-                    assert_eq!(entry.get_field(2), Some(&Value::Int64(100)));  // SUM
-                    assert_eq!(entry.get_field(3), Some(&Value::Float64(100.0))); // AVG
+                    assert_eq!(entry.get_field(1), Some(&Value::Int64(1))); // COUNT
+                    assert_eq!(entry.get_field(2), Some(&Value::Int64(100))); // SUM
+                    assert_eq!(entry.get_field(3), Some(&Value::Float64(100.0)));
+                    // AVG
                 }
                 _ => panic!("Unexpected group key"),
             }
@@ -788,8 +783,22 @@ mod tests {
         // Group 2: ("a", "b|c") - first column is "a", second is "b|c"
         // BUG: Both generate the same key "a|b|c" and get incorrectly merged
         let rows = vec![
-            Row::new(0, vec![Value::String("a|b".into()), Value::String("c".into()), Value::Int64(10)]),
-            Row::new(1, vec![Value::String("a".into()), Value::String("b|c".into()), Value::Int64(20)]),
+            Row::new(
+                0,
+                vec![
+                    Value::String("a|b".into()),
+                    Value::String("c".into()),
+                    Value::Int64(10),
+                ],
+            ),
+            Row::new(
+                1,
+                vec![
+                    Value::String("a".into()),
+                    Value::String("b|c".into()),
+                    Value::Int64(20),
+                ],
+            ),
         ];
         let input = Relation::from_rows_owned(rows, vec!["t".into()]);
 

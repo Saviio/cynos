@@ -263,7 +263,11 @@ impl JoinReorder {
 
     /// Apply greedy join reordering.
     /// Strategy: Always join the two smallest relations that have a join condition.
-    fn greedy_reorder(&self, mut nodes: Vec<JoinNode>, conditions: Vec<JoinCondition>) -> LogicalPlan {
+    fn greedy_reorder(
+        &self,
+        mut nodes: Vec<JoinNode>,
+        conditions: Vec<JoinCondition>,
+    ) -> LogicalPlan {
         if nodes.is_empty() {
             return LogicalPlan::Empty;
         }
@@ -296,12 +300,22 @@ impl JoinReorder {
                             continue;
                         }
                         // Check if this condition connects result_node and this node
-                        let result_has_left = cond.left_tables.iter().any(|t| result_node.tables.contains(t));
-                        let result_has_right = cond.right_tables.iter().any(|t| result_node.tables.contains(t));
-                        let node_has_left = cond.left_tables.iter().any(|t| node.tables.contains(t));
-                        let node_has_right = cond.right_tables.iter().any(|t| node.tables.contains(t));
+                        let result_has_left = cond
+                            .left_tables
+                            .iter()
+                            .any(|t| result_node.tables.contains(t));
+                        let result_has_right = cond
+                            .right_tables
+                            .iter()
+                            .any(|t| result_node.tables.contains(t));
+                        let node_has_left =
+                            cond.left_tables.iter().any(|t| node.tables.contains(t));
+                        let node_has_right =
+                            cond.right_tables.iter().any(|t| node.tables.contains(t));
 
-                        if (result_has_left && node_has_right) || (result_has_right && node_has_left) {
+                        if (result_has_left && node_has_right)
+                            || (result_has_right && node_has_left)
+                        {
                             found_idx = Some(i);
                             found_cond_idx = Some(j);
                             break;
@@ -351,10 +365,8 @@ impl JoinReorder {
 
                 result_node = JoinNode {
                     plan: new_plan,
-                    cardinality: self.estimate_join_cardinality(
-                        result_node.cardinality,
-                        next_node.cardinality,
-                    ),
+                    cardinality: self
+                        .estimate_join_cardinality(result_node.cardinality, next_node.cardinality),
                     tables: new_tables,
                 };
                 continue;
@@ -387,10 +399,8 @@ impl JoinReorder {
             result_node = JoinNode {
                 plan: new_plan,
                 // Estimate new cardinality (simplified: product with selectivity factor)
-                cardinality: self.estimate_join_cardinality(
-                    result_node.cardinality,
-                    next_node.cardinality,
-                ),
+                cardinality: self
+                    .estimate_join_cardinality(result_node.cardinality, next_node.cardinality),
                 tables: new_tables,
             };
         }
@@ -569,8 +579,8 @@ impl JoinReorder {
 
         // Default estimates based on plan type
         match plan {
-            LogicalPlan::Scan { .. } => 1000, // Default table size
-            LogicalPlan::IndexGet { .. } => 1,  // Point lookup
+            LogicalPlan::Scan { .. } => 1000,  // Default table size
+            LogicalPlan::IndexGet { .. } => 1, // Point lookup
             LogicalPlan::IndexInGet { keys, .. } => keys.len(), // Multi-point lookup
             LogicalPlan::IndexScan { .. } => 100, // Range scan
             LogicalPlan::Filter { input, .. } => {

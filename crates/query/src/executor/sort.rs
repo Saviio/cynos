@@ -111,9 +111,18 @@ mod tests {
     #[test]
     fn test_sort_executor_multi_column() {
         let rows = vec![
-            Rc::new(Row::new(1, vec![Value::Int64(1), Value::String("B".into())])),
-            Rc::new(Row::new(2, vec![Value::Int64(1), Value::String("A".into())])),
-            Rc::new(Row::new(3, vec![Value::Int64(2), Value::String("A".into())])),
+            Rc::new(Row::new(
+                1,
+                vec![Value::Int64(1), Value::String("B".into())],
+            )),
+            Rc::new(Row::new(
+                2,
+                vec![Value::Int64(1), Value::String("A".into())],
+            )),
+            Rc::new(Row::new(
+                3,
+                vec![Value::Int64(2), Value::String("A".into())],
+            )),
         ];
         let input = Relation::from_rows(rows, vec!["t".into()]);
 
@@ -121,8 +130,14 @@ mod tests {
         let result = executor.execute(input);
 
         // Should be sorted by col 0 first, then col 1
-        assert_eq!(result.entries[0].get_field(1), Some(&Value::String("A".into())));
-        assert_eq!(result.entries[1].get_field(1), Some(&Value::String("B".into())));
+        assert_eq!(
+            result.entries[0].get_field(1),
+            Some(&Value::String("A".into()))
+        );
+        assert_eq!(
+            result.entries[1].get_field(1),
+            Some(&Value::String("B".into()))
+        );
         assert_eq!(result.entries[2].get_field(0), Some(&Value::Int64(2)));
     }
 }

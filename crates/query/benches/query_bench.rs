@@ -8,6 +8,7 @@
 //! End-to-end benchmarks use PhysicalPlanRunner to measure the full query
 //! execution pipeline including plan interpretation overhead.
 
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use cynos_core::{Row, Value};
 use cynos_query::ast::{ColumnRef, Expr, JoinType, SortOrder, ValuePredicate};
 use cynos_query::executor::join::{HashJoin, NestedLoopJoin, SortMergeJoin};
@@ -16,8 +17,7 @@ use cynos_query::executor::{
     Relation, SortExecutor,
 };
 use cynos_query::optimizer::Optimizer;
-use cynos_query::planner::{LogicalPlan, PhysicalPlan};
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use cynos_query::planner::{IndexBounds, LogicalPlan, PhysicalPlan};
 
 // ============================================================================
 // Data Generation Utilities
@@ -573,10 +573,12 @@ fn bench_e2e_index_scan(c: &mut Criterion) {
         let plan = PhysicalPlan::IndexScan {
             table: "users".into(),
             index: "idx_id".into(),
-            range_start: Some(Value::Int64(0)),
-            range_end: Some(Value::Int64(range_end)),
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::Scalar(cynos_index::KeyRange::bound(
+                Value::Int64(0),
+                Value::Int64(range_end),
+                false,
+                false,
+            )),
             limit: None,
             offset: None,
             reverse: false,
@@ -683,7 +685,15 @@ fn bench_topn_heap_vs_sort(c: &mut Criterion) {
     let mut group = c.benchmark_group("topn_heap_vs_sort");
 
     // Test with varying data sizes and k values
-    for (size, k) in [(1000, 10), (10000, 10), (10000, 100), (100000, 10), (100000, 100)].iter() {
+    for (size, k) in [
+        (1000, 10),
+        (10000, 10),
+        (10000, 100),
+        (100000, 10),
+        (100000, 100),
+    ]
+    .iter()
+    {
         let ds = {
             let mut ds = InMemoryDataSource::new();
             let rows: Vec<Row> = shuffle_indices(*size, 12345)
@@ -691,10 +701,7 @@ fn bench_topn_heap_vs_sort(c: &mut Criterion) {
                 .map(|i| {
                     Row::new(
                         i as u64,
-                        vec![
-                            Value::Int64(i as i64),
-                            Value::String(format!("name_{}", i)),
-                        ],
+                        vec![Value::Int64(i as i64), Value::String(format!("name_{}", i))],
                     )
                 })
                 .collect();
@@ -751,19 +758,43 @@ fn bench_optimized_join_reorder(c: &mut Criterion) {
 
         // Small table
         let small_rows: Vec<Row> = (0..small_size)
-            .map(|i| Row::new(i as u64, vec![Value::Int64(i as i64), Value::String(format!("small_{}", i))]))
+            .map(|i| {
+                Row::new(
+                    i as u64,
+                    vec![
+                        Value::Int64(i as i64),
+                        Value::String(format!("small_{}", i)),
+                    ],
+                )
+            })
             .collect();
         ds.add_table("small", small_rows, 2);
 
         // Medium table
         let medium_rows: Vec<Row> = (0..medium_size)
-            .map(|i| Row::new(i as u64, vec![Value::Int64((i % small_size) as i64), Value::String(format!("medium_{}", i))]))
+            .map(|i| {
+                Row::new(
+                    i as u64,
+                    vec![
+                        Value::Int64((i % small_size) as i64),
+                        Value::String(format!("medium_{}", i)),
+                    ],
+                )
+            })
             .collect();
         ds.add_table("medium", medium_rows, 2);
 
         // Large table
         let large_rows: Vec<Row> = (0..large_size)
-            .map(|i| Row::new(i as u64, vec![Value::Int64((i % medium_size) as i64), Value::String(format!("large_{}", i))]))
+            .map(|i| {
+                Row::new(
+                    i as u64,
+                    vec![
+                        Value::Int64((i % medium_size) as i64),
+                        Value::String(format!("large_{}", i)),
+                    ],
+                )
+            })
             .collect();
         ds.add_table("large", large_rows, 2);
 

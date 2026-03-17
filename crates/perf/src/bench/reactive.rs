@@ -22,7 +22,9 @@ fn observable_query_create(report: &mut Report) {
     println!("  Observable Query Creation:");
 
     for &size in &SMALL_SIZES {
-        let initial_rows: Vec<Row> = (0..size).map(|i| make_row(i as u64, (i % 50) as i64)).collect();
+        let initial_rows: Vec<Row> = (0..size)
+            .map(|i| make_row(i as u64, (i % 50) as i64))
+            .collect();
 
         let result = measure(ITERATIONS, || {
             let dataflow = DataflowNode::source(1);
@@ -44,7 +46,9 @@ fn observable_query_subscribe(report: &mut Report) {
     println!("  Observable Query with Subscription:");
 
     for &size in &SMALL_SIZES {
-        let initial_rows: Vec<Row> = (0..size).map(|i| make_row(i as u64, (i % 50) as i64)).collect();
+        let initial_rows: Vec<Row> = (0..size)
+            .map(|i| make_row(i as u64, (i % 50) as i64))
+            .collect();
 
         let result = measure(ITERATIONS, || {
             let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
@@ -65,7 +69,13 @@ fn observable_query_subscribe(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Reactive", "subscribe", Some(size), result, Some(throughput));
+        report.add_result(
+            "Reactive",
+            "subscribe",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -73,7 +83,9 @@ fn change_propagation(report: &mut Report) {
     println!("  Change Propagation:");
 
     for &size in &SMALL_SIZES {
-        let initial_rows: Vec<Row> = (0..size).map(|i| make_row(i as u64, (i % 50) as i64)).collect();
+        let initial_rows: Vec<Row> = (0..size)
+            .map(|i| make_row(i as u64, (i % 50) as i64))
+            .collect();
 
         // Setup query with subscription
         let dataflow = DataflowNode::source(1);
@@ -116,7 +128,9 @@ fn change_propagation(report: &mut Report) {
     // Batch change propagation
     println!("  Batch Change Propagation:");
     for &batch_size in &[1, 10, 100] {
-        let initial_rows: Vec<Row> = (0..1000).map(|i| make_row(i as u64, (i % 50) as i64)).collect();
+        let initial_rows: Vec<Row> = (0..1000)
+            .map(|i| make_row(i as u64, (i % 50) as i64))
+            .collect();
 
         let dataflow = DataflowNode::source(1);
         let query = Rc::new(RefCell::new(ObservableQuery::with_initial(
@@ -141,6 +155,12 @@ fn change_propagation(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Reactive", "batch_propagation", Some(batch_size), result, Some(throughput));
+        report.add_result(
+            "Reactive",
+            "batch_propagation",
+            Some(batch_size),
+            result,
+            Some(throughput),
+        );
     }
 }

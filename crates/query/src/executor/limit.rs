@@ -52,14 +52,13 @@ impl LimitExecutor {
 pub fn limit_relation(input: Relation, limit: usize, offset: usize) -> Relation {
     let tables = input.tables().to_vec();
     let table_column_counts = input.table_column_counts().to_vec();
-    let entries = input
-        .entries
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .collect();
+    let entries = input.entries.into_iter().skip(offset).take(limit).collect();
 
-    Relation { entries, tables, table_column_counts }
+    Relation {
+        entries,
+        tables,
+        table_column_counts,
+    }
 }
 
 #[cfg(test)]

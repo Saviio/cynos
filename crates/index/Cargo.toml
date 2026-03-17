@@ -17,3 +17,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "btree_bench"
 harness = false
+
+[[bench]]
+name = "gin_bench"
+harness = false

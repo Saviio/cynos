@@ -1,5 +1,6 @@
 //! Physical query plan definitions.
 
+use crate::planner::IndexBounds;
 use crate::ast::JoinType;
 use crate::ast::{AggregateFunc, Expr, SortOrder};
 use alloc::boxed::Box;
@@ -30,10 +31,7 @@ pub enum PhysicalPlan {
     IndexScan {
         table: String,
         index: String,
-        range_start: Option<Value>,
-        range_end: Option<Value>,
-        include_start: bool,
-        include_end: bool,
+        bounds: IndexBounds,
         /// Optional limit for early termination.
         limit: Option<usize>,
         /// Optional offset to skip rows.
@@ -185,10 +183,7 @@ impl PhysicalPlan {
         PhysicalPlan::IndexScan {
             table: table.into(),
             index: index.into(),
-            range_start,
-            range_end,
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::from_scalar_range(range_start, range_end, true, true),
             limit: None,
             offset: None,
             reverse: false,
@@ -207,10 +202,7 @@ impl PhysicalPlan {
         PhysicalPlan::IndexScan {
             table: table.into(),
             index: index.into(),
-            range_start,
-            range_end,
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::from_scalar_range(range_start, range_end, true, true),
             limit,
             offset,
             reverse: false,
@@ -230,10 +222,26 @@ impl PhysicalPlan {
         PhysicalPlan::IndexScan {
             table: table.into(),
             index: index.into(),
-            range_start,
-            range_end,
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::from_scalar_range(range_start, range_end, true, true),
+            limit,
+            offset,
+            reverse,
+        }
+    }
+
+    /// Creates an index scan plan with explicit bounds.
+    pub fn index_scan_with_bounds(
+        table: impl Into<String>,
+        index: impl Into<String>,
+        bounds: IndexBounds,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        reverse: bool,
+    ) -> Self {
+        PhysicalPlan::IndexScan {
+            table: table.into(),
+            index: index.into(),
+            bounds,
             limit,
             offset,
             reverse,
@@ -484,7 +492,9 @@ impl PhysicalPlan {
                     tables.push(table.clone());
                 }
             }
-            PhysicalPlan::IndexNestedLoopJoin { outer, inner_table, .. } => {
+            PhysicalPlan::IndexNestedLoopJoin {
+                outer, inner_table, ..
+            } => {
                 outer.collect_tables_into(tables);
                 if !tables.contains(inner_table) {
                     tables.push(inner_table.clone());

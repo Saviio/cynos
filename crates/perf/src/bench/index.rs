@@ -31,7 +31,13 @@ fn btree_insert(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Index/BTree", "insert", Some(size), result, Some(throughput));
+        report.add_result(
+            "Index/BTree",
+            "insert",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -84,9 +90,7 @@ fn btree_range(report: &mut Report) {
 
     for &range_size in &[100, 1000, 10000] {
         let range = KeyRange::bound(1000i64, 1000 + range_size as i64, false, false);
-        let result = measure(ITERATIONS, || {
-            tree.get_range(Some(&range), false, None, 0)
-        });
+        let result = measure(ITERATIONS, || tree.get_range(Some(&range), false, None, 0));
 
         let throughput = range_size as f64 / result.mean.as_secs_f64();
         println!(
@@ -95,7 +99,13 @@ fn btree_range(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Index/BTree", "range", Some(range_size), result, Some(throughput));
+        report.add_result(
+            "Index/BTree",
+            "range",
+            Some(range_size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -205,6 +215,18 @@ fn btree_vs_hash(report: &mut Report) {
         format_duration(hash_result.mean)
     );
 
-    report.add_result("Index/Comparison", "btree_lookup", Some(10_000), btree_result, None);
-    report.add_result("Index/Comparison", "hash_lookup", Some(10_000), hash_result, None);
+    report.add_result(
+        "Index/Comparison",
+        "btree_lookup",
+        Some(10_000),
+        btree_result,
+        None,
+    );
+    report.add_result(
+        "Index/Comparison",
+        "hash_lookup",
+        Some(10_000),
+        hash_result,
+        None,
+    );
 }

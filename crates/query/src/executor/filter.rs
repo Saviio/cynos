@@ -24,7 +24,11 @@ impl<P: Predicate> FilterExecutor<P> {
             .filter(|entry| self.predicate.eval(&entry.row))
             .collect();
 
-        Relation { entries, tables, table_column_counts }
+        Relation {
+            entries,
+            tables,
+            table_column_counts,
+        }
     }
 }
 
@@ -38,7 +42,11 @@ where
     let table_column_counts = input.table_column_counts().to_vec();
     let entries: Vec<RelationEntry> = input.into_iter().filter(|e| predicate(e)).collect();
 
-    Relation { entries, tables, table_column_counts }
+    Relation {
+        entries,
+        tables,
+        table_column_counts,
+    }
 }
 
 #[cfg(test)]

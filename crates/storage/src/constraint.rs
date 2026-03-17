@@ -55,13 +55,13 @@ impl ConstraintChecker {
                 continue;
             }
 
-            let parent_store = cache.get_table(&fk.parent_table).ok_or_else(|| {
-                Error::table_not_found(&fk.parent_table)
-            })?;
+            let parent_store = cache
+                .get_table(&fk.parent_table)
+                .ok_or_else(|| Error::table_not_found(&fk.parent_table))?;
 
-            let child_col_idx = schema.get_column_index(&fk.child_column).ok_or_else(|| {
-                Error::column_not_found(schema.name(), &fk.child_column)
-            })?;
+            let child_col_idx = schema
+                .get_column_index(&fk.child_column)
+                .ok_or_else(|| Error::column_not_found(schema.name(), &fk.child_column))?;
 
             for row in rows {
                 if let Some(value) = row.get(child_col_idx) {
@@ -99,9 +99,9 @@ impl ConstraintChecker {
                         continue;
                     }
 
-                    let parent_col_idx = schema.get_column_index(&fk.parent_column).ok_or_else(|| {
-                        Error::column_not_found(schema.name(), &fk.parent_column)
-                    })?;
+                    let parent_col_idx = schema
+                        .get_column_index(&fk.parent_column)
+                        .ok_or_else(|| Error::column_not_found(schema.name(), &fk.parent_column))?;
 
                     for row in rows {
                         if let Some(pk_value) = row.get(parent_col_idx) {
@@ -141,13 +141,13 @@ impl ConstraintChecker {
                 continue;
             }
 
-            let parent_store = cache.get_table(&fk.parent_table).ok_or_else(|| {
-                Error::table_not_found(&fk.parent_table)
-            })?;
+            let parent_store = cache
+                .get_table(&fk.parent_table)
+                .ok_or_else(|| Error::table_not_found(&fk.parent_table))?;
 
-            let child_col_idx = schema.get_column_index(&fk.child_column).ok_or_else(|| {
-                Error::column_not_found(schema.name(), &fk.child_column)
-            })?;
+            let child_col_idx = schema
+                .get_column_index(&fk.child_column)
+                .ok_or_else(|| Error::column_not_found(schema.name(), &fk.child_column))?;
 
             for (_, new_row) in modifications {
                 if let Some(value) = new_row.get(child_col_idx) {
@@ -175,9 +175,9 @@ impl ConstraintChecker {
                         continue;
                     }
 
-                    let parent_col_idx = schema.get_column_index(&fk.parent_column).ok_or_else(|| {
-                        Error::column_not_found(schema.name(), &fk.parent_column)
-                    })?;
+                    let parent_col_idx = schema
+                        .get_column_index(&fk.parent_column)
+                        .ok_or_else(|| Error::column_not_found(schema.name(), &fk.parent_column))?;
 
                     for (old_row, new_row) in modifications {
                         let old_value = old_row.get(parent_col_idx);
@@ -216,9 +216,9 @@ impl ConstraintChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Value};
-    use alloc::vec;
 
     fn test_schema_with_not_null() -> Table {
         TableBuilder::new("test")
@@ -331,7 +331,10 @@ mod tests {
         cache.create_table(create_orders_table_with_fk()).unwrap();
 
         // Try to insert child row without parent
-        let order = Row::new(1, vec![Value::Int64(1), Value::Int64(999), Value::Int64(100)]);
+        let order = Row::new(
+            1,
+            vec![Value::Int64(1), Value::Int64(999), Value::Int64(100)],
+        );
         let orders_schema = cache.get_table("orders").unwrap().schema().clone();
 
         let result = ConstraintChecker::check_foreign_keys_for_insert(
@@ -370,11 +373,19 @@ mod tests {
 
         // Insert parent
         let user = Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())]);
-        cache.get_table_mut("users").unwrap().insert(user.clone()).unwrap();
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(user.clone())
+            .unwrap();
 
         // Insert child referencing parent
         let order = Row::new(1, vec![Value::Int64(1), Value::Int64(1), Value::Int64(100)]);
-        cache.get_table_mut("orders").unwrap().insert(order).unwrap();
+        cache
+            .get_table_mut("orders")
+            .unwrap()
+            .insert(order)
+            .unwrap();
 
         // Try to delete parent - should fail
         let users_schema = cache.get_table("users").unwrap().schema().clone();
@@ -395,7 +406,11 @@ mod tests {
 
         // Insert parent only
         let user = Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())]);
-        cache.get_table_mut("users").unwrap().insert(user.clone()).unwrap();
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(user.clone())
+            .unwrap();
 
         // Delete parent - should succeed (no children)
         let users_schema = cache.get_table("users").unwrap().schema().clone();
@@ -422,7 +437,11 @@ mod tests {
 
         // Insert order referencing user1
         let order = Row::new(1, vec![Value::Int64(1), Value::Int64(1), Value::Int64(100)]);
-        cache.get_table_mut("orders").unwrap().insert(order.clone()).unwrap();
+        cache
+            .get_table_mut("orders")
+            .unwrap()
+            .insert(order.clone())
+            .unwrap();
 
         // Update order to reference user2 - should succeed
         let updated_order = Row::new(1, vec![Value::Int64(1), Value::Int64(2), Value::Int64(100)]);
@@ -449,10 +468,17 @@ mod tests {
 
         // Insert order referencing user
         let order = Row::new(1, vec![Value::Int64(1), Value::Int64(1), Value::Int64(100)]);
-        cache.get_table_mut("orders").unwrap().insert(order.clone()).unwrap();
+        cache
+            .get_table_mut("orders")
+            .unwrap()
+            .insert(order.clone())
+            .unwrap();
 
         // Update order to reference non-existent user - should fail
-        let updated_order = Row::new(1, vec![Value::Int64(1), Value::Int64(999), Value::Int64(100)]);
+        let updated_order = Row::new(
+            1,
+            vec![Value::Int64(1), Value::Int64(999), Value::Int64(100)],
+        );
         let orders_schema = cache.get_table("orders").unwrap().schema().clone();
 
         let result = ConstraintChecker::check_foreign_keys_for_update(
@@ -472,11 +498,19 @@ mod tests {
 
         // Insert parent
         let user = Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())]);
-        cache.get_table_mut("users").unwrap().insert(user.clone()).unwrap();
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(user.clone())
+            .unwrap();
 
         // Insert child referencing parent
         let order = Row::new(1, vec![Value::Int64(1), Value::Int64(1), Value::Int64(100)]);
-        cache.get_table_mut("orders").unwrap().insert(order).unwrap();
+        cache
+            .get_table_mut("orders")
+            .unwrap()
+            .insert(order)
+            .unwrap();
 
         // Try to update parent PK - should fail (has children)
         let updated_user = Row::new(1, vec![Value::Int64(999), Value::String("Alice".into())]);

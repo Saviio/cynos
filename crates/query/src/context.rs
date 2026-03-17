@@ -109,27 +109,29 @@ impl ExecutionContext {
             .get(table)
             .map(|s| {
                 s.indexes.iter().any(|idx| {
-                    idx.columns.len() >= columns.len()
-                        && idx
-                            .columns
-                            .iter()
-                            .zip(columns.iter())
-                            .all(|(a, b)| a == *b)
+                    idx.columns.len() == columns.len()
+                        && idx.columns.iter().zip(columns.iter()).all(|(a, b)| a == *b)
                 })
             })
             .unwrap_or(false)
     }
 
-    /// Finds an index for the given columns.
+    /// Finds an index whose key columns exactly match the requested columns.
     pub fn find_index(&self, table: &str, columns: &[&str]) -> Option<&IndexInfo> {
         self.table_stats.get(table).and_then(|s| {
             s.indexes.iter().find(|idx| {
+                idx.columns.len() == columns.len()
+                    && idx.columns.iter().zip(columns.iter()).all(|(a, b)| a == *b)
+            })
+        })
+    }
+
+    /// Finds an index whose leading columns match the requested columns.
+    pub fn find_index_prefix(&self, table: &str, columns: &[&str]) -> Option<&IndexInfo> {
+        self.table_stats.get(table).and_then(|s| {
+            s.indexes.iter().find(|idx| {
                 idx.columns.len() >= columns.len()
-                    && idx
-                        .columns
-                        .iter()
-                        .zip(columns.iter())
-                        .all(|(a, b)| a == *b)
+                    && idx.columns.iter().zip(columns.iter()).all(|(a, b)| a == *b)
             })
         })
     }
@@ -144,9 +146,9 @@ impl ExecutionContext {
     /// Finds a GIN index for the given column.
     pub fn find_gin_index(&self, table: &str, column: &str) -> Option<&IndexInfo> {
         self.table_stats.get(table).and_then(|s| {
-            s.indexes.iter().find(|idx| {
-                idx.is_gin() && idx.columns.iter().any(|c| c == column)
-            })
+            s.indexes
+                .iter()
+                .find(|idx| idx.is_gin() && idx.columns.iter().any(|c| c == column))
         })
     }
 
@@ -154,9 +156,9 @@ impl ExecutionContext {
     /// Returns the first unique BTree index found, which is typically the primary key.
     pub fn find_primary_index(&self, table: &str) -> Option<&IndexInfo> {
         self.table_stats.get(table).and_then(|s| {
-            s.indexes.iter().find(|idx| {
-                idx.is_unique && idx.index_type == QueryIndexType::BTree
-            })
+            s.indexes
+                .iter()
+                .find(|idx| idx.is_unique && idx.index_type == QueryIndexType::BTree)
         })
     }
 }
@@ -172,11 +174,7 @@ mod tests {
         let stats = TableStats {
             row_count: 1000,
             is_sorted: true,
-            indexes: alloc::vec![IndexInfo::new(
-                "idx_id",
-                alloc::vec!["id".into()],
-                true
-            )],
+            indexes: alloc::vec![IndexInfo::new("idx_id", alloc::vec!["id".into()], true)],
         };
 
         ctx.register_table("users", stats);
@@ -195,7 +193,11 @@ mod tests {
             is_sorted: false,
             indexes: alloc::vec![
                 IndexInfo::new("idx_id", alloc::vec!["id".into()], true),
-                IndexInfo::new("idx_name_age", alloc::vec!["name".into(), "age".into()], false),
+                IndexInfo::new(
+                    "idx_name_age",
+                    alloc::vec!["name".into(), "age".into()],
+                    false
+                ),
             ],
         };
 
@@ -206,6 +208,9 @@ mod tests {
         assert_eq!(idx.unwrap().name, "idx_id");
 
         let idx = ctx.find_index("users", &["name"]);
+        assert!(idx.is_none());
+
+        let idx = ctx.find_index_prefix("users", &["name"]);
         assert!(idx.is_some());
         assert_eq!(idx.unwrap().name, "idx_name_age");
 

@@ -218,6 +218,18 @@ impl JsonbValue {
         }
     }
 
+    /// Stringifies the value using the same representation as JSONB_CONTAINS.
+    pub fn stringify_for_contains(&self) -> String {
+        match self {
+            JsonbValue::Null => "null".into(),
+            JsonbValue::Bool(true) => "true".into(),
+            JsonbValue::Bool(false) => "false".into(),
+            JsonbValue::Number(n) => alloc::format!("{n}"),
+            JsonbValue::String(s) => s.clone(),
+            JsonbValue::Array(_) | JsonbValue::Object(_) => alloc::format!("{self:?}"),
+        }
+    }
+
     /// Returns a mutable reference to the array if this is an Array.
     pub fn as_array_mut(&mut self) -> Option<&mut Vec<JsonbValue>> {
         match self {

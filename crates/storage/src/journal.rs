@@ -219,7 +219,8 @@ impl Journal {
     pub fn record_update(&mut self, table: &str, old: Row, new: Row) {
         let row_id = old.id();
 
-        self.get_or_create_diff(table).modify(old.clone(), new.clone());
+        self.get_or_create_diff(table)
+            .modify(old.clone(), new.clone());
 
         self.entries.push(JournalEntry::Update {
             table: table.into(),
@@ -289,7 +290,12 @@ impl Journal {
                         let _ = store.delete(*row_id);
                     }
                 }
-                JournalEntry::Update { table, row_id, old, new } => {
+                JournalEntry::Update {
+                    table,
+                    row_id,
+                    old,
+                    new,
+                } => {
                     if let Some(store) = cache.get_table_mut(table) {
                         // Restore old values but keep version incrementing to maintain monotonicity
                         let rollback_row = Row::new_with_version(
@@ -329,9 +335,9 @@ impl Default for Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Value};
-    use alloc::vec;
 
     fn test_schema() -> cynos_core::schema::Table {
         TableBuilder::new("test")
@@ -355,7 +361,11 @@ mod tests {
         let row = Row::new(1, vec![Value::Int64(1), Value::String("test".into())]);
 
         // Insert into cache first
-        cache.get_table_mut("test").unwrap().insert(row.clone()).unwrap();
+        cache
+            .get_table_mut("test")
+            .unwrap()
+            .insert(row.clone())
+            .unwrap();
         journal.record_insert("test", row);
 
         assert_eq!(journal.get_entries().len(), 1);
@@ -375,7 +385,11 @@ mod tests {
         // Start journal and insert second row
         let mut journal = Journal::new();
         let row2 = Row::new(2, vec![Value::Int64(2), Value::String("second".into())]);
-        cache.get_table_mut("test").unwrap().insert(row2.clone()).unwrap();
+        cache
+            .get_table_mut("test")
+            .unwrap()
+            .insert(row2.clone())
+            .unwrap();
         journal.record_insert("test", row2);
 
         assert_eq!(cache.get_table("test").unwrap().len(), 2);

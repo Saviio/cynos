@@ -75,7 +75,10 @@ impl LockManager {
 
     /// Acquires a lock on a resource.
     pub fn acquire(&mut self, resource: &str, tx_id: u64, lock_type: LockType) -> Result<()> {
-        let state = self.locks.entry(resource.to_string()).or_insert_with(LockState::new);
+        let state = self
+            .locks
+            .entry(resource.to_string())
+            .or_insert_with(LockState::new);
 
         match lock_type {
             LockType::Shared => {

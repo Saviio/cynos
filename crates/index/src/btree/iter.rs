@@ -48,12 +48,7 @@ impl<'a, K: Clone + Ord> BTreeIterator<'a, K> {
     }
 
     /// Creates an iterator starting at a specific position.
-    pub fn new_at(
-        arena: &'a [Node<K>],
-        node_id: NodeId,
-        pos: usize,
-        reverse: bool,
-    ) -> Self {
+    pub fn new_at(arena: &'a [Node<K>], node_id: NodeId, pos: usize, reverse: bool) -> Self {
         Self {
             arena,
             current_node: Some(node_id),

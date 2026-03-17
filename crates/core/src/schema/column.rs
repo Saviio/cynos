@@ -86,15 +86,13 @@ impl Column {
 
     /// Returns the default value for this column.
     pub fn get_default_value(&self) -> Value {
-        self.default_value
-            .clone()
-            .unwrap_or_else(|| {
-                if self.nullable {
-                    Value::Null
-                } else {
-                    Value::default_for_type(self.data_type)
-                }
-            })
+        self.default_value.clone().unwrap_or_else(|| {
+            if self.nullable {
+                Value::Null
+            } else {
+                Value::default_for_type(self.data_type)
+            }
+        })
     }
 
     /// Returns the column index.

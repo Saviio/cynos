@@ -64,12 +64,12 @@ impl BinaryDataType {
         match self {
             BinaryDataType::Boolean => 1,
             BinaryDataType::Int32 => 4,
-            BinaryDataType::Int64 => 8,   // stored as f64 for JS compatibility
+            BinaryDataType::Int64 => 8, // stored as f64 for JS compatibility
             BinaryDataType::Float64 => 8,
-            BinaryDataType::String => 8,  // (offset: u32, len: u32)
+            BinaryDataType::String => 8, // (offset: u32, len: u32)
             BinaryDataType::DateTime => 8,
-            BinaryDataType::Bytes => 8,   // (offset: u32, len: u32)
-            BinaryDataType::Jsonb => 8,   // (offset: u32, len: u32)
+            BinaryDataType::Bytes => 8, // (offset: u32, len: u32)
+            BinaryDataType::Jsonb => 8, // (offset: u32, len: u32)
         }
     }
 
@@ -138,7 +138,8 @@ impl BinaryResult {
     #[wasm_bindgen(js_name = asView)]
     pub fn as_view(&self) -> js_sys::Uint8Array {
         let memory = wasm_bindgen::memory();
-        let buffer = memory.dyn_ref::<js_sys::WebAssembly::Memory>()
+        let buffer = memory
+            .dyn_ref::<js_sys::WebAssembly::Memory>()
             .expect("wasm_bindgen::memory() should return WebAssembly.Memory")
             .buffer();
 

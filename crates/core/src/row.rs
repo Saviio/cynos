@@ -53,12 +53,20 @@ impl Row {
     /// Creates a new row with the given ID and values.
     /// Version defaults to 1 for new rows.
     pub fn new(id: RowId, values: Vec<Value>) -> Self {
-        Self { id, version: 1, values }
+        Self {
+            id,
+            version: 1,
+            values,
+        }
     }
 
     /// Creates a new row with the given ID, version, and values.
     pub fn new_with_version(id: RowId, version: u64, values: Vec<Value>) -> Self {
-        Self { id, version, values }
+        Self {
+            id,
+            version,
+            values,
+        }
     }
 
     /// Creates a new row with an automatically assigned ID.

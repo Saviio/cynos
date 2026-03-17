@@ -85,12 +85,24 @@ impl<K: Clone + Ord> KeyRange<K> {
                 true
             }
             (
-                KeyRange::LowerBound { value: lower, exclusive: lower_ex },
-                KeyRange::UpperBound { value: upper, exclusive: upper_ex },
+                KeyRange::LowerBound {
+                    value: lower,
+                    exclusive: lower_ex,
+                },
+                KeyRange::UpperBound {
+                    value: upper,
+                    exclusive: upper_ex,
+                },
             )
             | (
-                KeyRange::UpperBound { value: upper, exclusive: upper_ex },
-                KeyRange::LowerBound { value: lower, exclusive: lower_ex },
+                KeyRange::UpperBound {
+                    value: upper,
+                    exclusive: upper_ex,
+                },
+                KeyRange::LowerBound {
+                    value: lower,
+                    exclusive: lower_ex,
+                },
             ) => {
                 // Check if lower <= upper (with exclusivity)
                 if *lower_ex || *upper_ex {
@@ -100,8 +112,18 @@ impl<K: Clone + Ord> KeyRange<K> {
                 }
             }
             (
-                KeyRange::Bound { lower: l1, upper: u1, lower_exclusive: le1, upper_exclusive: ue1 },
-                KeyRange::Bound { lower: l2, upper: u2, lower_exclusive: le2, upper_exclusive: ue2 },
+                KeyRange::Bound {
+                    lower: l1,
+                    upper: u1,
+                    lower_exclusive: le1,
+                    upper_exclusive: ue1,
+                },
+                KeyRange::Bound {
+                    lower: l2,
+                    upper: u2,
+                    lower_exclusive: le2,
+                    upper_exclusive: ue2,
+                },
             ) => {
                 // Two bounded ranges overlap if neither is completely before the other
                 // Range 1 is before Range 2 if u1 < l2 (or u1 <= l2 if either bound is exclusive)
@@ -110,12 +132,20 @@ impl<K: Clone + Ord> KeyRange<K> {
                 !first_before_second && !second_before_first
             }
             (
-                KeyRange::Bound { upper, upper_exclusive, .. },
+                KeyRange::Bound {
+                    upper,
+                    upper_exclusive,
+                    ..
+                },
                 KeyRange::LowerBound { value, exclusive },
             )
             | (
                 KeyRange::LowerBound { value, exclusive },
-                KeyRange::Bound { upper, upper_exclusive, .. },
+                KeyRange::Bound {
+                    upper,
+                    upper_exclusive,
+                    ..
+                },
             ) => {
                 // Bound overlaps with lower bound if upper >= value
                 if *upper_exclusive || *exclusive {
@@ -125,12 +155,20 @@ impl<K: Clone + Ord> KeyRange<K> {
                 }
             }
             (
-                KeyRange::Bound { lower, lower_exclusive, .. },
+                KeyRange::Bound {
+                    lower,
+                    lower_exclusive,
+                    ..
+                },
                 KeyRange::UpperBound { value, exclusive },
             )
             | (
                 KeyRange::UpperBound { value, exclusive },
-                KeyRange::Bound { lower, lower_exclusive, .. },
+                KeyRange::Bound {
+                    lower,
+                    lower_exclusive,
+                    ..
+                },
             ) => {
                 // Bound overlaps with upper bound if lower <= value
                 if *lower_exclusive || *exclusive {
@@ -470,8 +508,14 @@ mod tests {
 
         for range in &ranges {
             assert!(range.overlaps(range), "Range should overlap with itself");
-            assert!(range.overlaps(&KeyRange::all()), "Range should overlap with all");
-            assert!(KeyRange::all().overlaps(range), "All should overlap with range");
+            assert!(
+                range.overlaps(&KeyRange::all()),
+                "Range should overlap with all"
+            );
+            assert!(
+                KeyRange::all().overlaps(range),
+                "All should overlap with range"
+            );
         }
     }
 
@@ -549,8 +593,18 @@ mod tests {
         ];
 
         for (a, b) in &excluding_pairs {
-            assert!(!a.overlaps(b), "Expected {:?} NOT to overlap with {:?}", a, b);
-            assert!(!b.overlaps(a), "Expected {:?} NOT to overlap with {:?}", b, a);
+            assert!(
+                !a.overlaps(b),
+                "Expected {:?} NOT to overlap with {:?}",
+                a,
+                b
+            );
+            assert!(
+                !b.overlaps(a),
+                "Expected {:?} NOT to overlap with {:?}",
+                b,
+                a
+            );
         }
     }
 }

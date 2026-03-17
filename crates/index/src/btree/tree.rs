@@ -89,7 +89,9 @@ impl<K: Clone + Ord> BTreeIndex<K> {
     fn find_child_position(&self, node: &Node<K>, key: &K) -> usize {
         // Binary search: find the first key that is greater than the search key
         // The child at that position is where we should descend
-        let pos = node.keys.partition_point(|k| !self.comparator.is_less(key, k));
+        let pos = node
+            .keys
+            .partition_point(|k| !self.comparator.is_less(key, k));
         // partition_point returns the index where the predicate becomes false
         // i.e., the first position where key < k
         pos.min(node.children.len().saturating_sub(1))
@@ -699,9 +701,12 @@ impl<K: Clone + Ord> RangeIndex<K> for BTreeIndex<K> {
                             }
                         }
                         KeyRange::Bound {
-                            upper, upper_exclusive, ..
+                            upper,
+                            upper_exclusive,
+                            ..
                         } => {
-                            if *upper_exclusive && key >= upper || !*upper_exclusive && key > upper {
+                            if *upper_exclusive && key >= upper || !*upper_exclusive && key > upper
+                            {
                                 break;
                             }
                         }

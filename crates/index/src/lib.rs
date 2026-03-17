@@ -44,8 +44,12 @@ pub mod stats;
 pub mod traits;
 
 pub use btree::BTreeIndex;
-pub use comparator::{Comparator, MultiKeyComparator, MultiKeyComparatorWithNull, Order, SimpleComparator};
-pub use gin::{GinIndex, PostingList};
+pub use comparator::{
+    Comparator, MultiKeyComparator, MultiKeyComparatorWithNull, Order, SimpleComparator,
+};
+pub use gin::{
+    contains_trigram_key, contains_trigram_pairs, contains_trigrams, GinIndex, PostingList,
+};
 pub use hash::HashIndex;
 pub use nullable::NullableIndex;
 pub use stats::IndexStats;

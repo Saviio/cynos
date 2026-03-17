@@ -124,35 +124,17 @@ pub enum Expr {
         high: Box<Expr>,
     },
     /// IN expression.
-    In {
-        expr: Box<Expr>,
-        list: Vec<Expr>,
-    },
+    In { expr: Box<Expr>, list: Vec<Expr> },
     /// NOT IN expression.
-    NotIn {
-        expr: Box<Expr>,
-        list: Vec<Expr>,
-    },
+    NotIn { expr: Box<Expr>, list: Vec<Expr> },
     /// LIKE expression.
-    Like {
-        expr: Box<Expr>,
-        pattern: String,
-    },
+    Like { expr: Box<Expr>, pattern: String },
     /// NOT LIKE expression.
-    NotLike {
-        expr: Box<Expr>,
-        pattern: String,
-    },
+    NotLike { expr: Box<Expr>, pattern: String },
     /// MATCH (regex) expression.
-    Match {
-        expr: Box<Expr>,
-        pattern: String,
-    },
+    Match { expr: Box<Expr>, pattern: String },
     /// NOT MATCH (regex) expression.
-    NotMatch {
-        expr: Box<Expr>,
-        pattern: String,
-    },
+    NotMatch { expr: Box<Expr>, pattern: String },
 }
 
 impl Expr {
@@ -410,10 +392,10 @@ impl Expr {
     }
 
     /// Creates a JSONB contains expression.
-    pub fn jsonb_contains(expr: Expr, path: &str) -> Self {
+    pub fn jsonb_contains(expr: Expr, path: &str, value: Value) -> Self {
         Expr::Function {
             name: "jsonb_contains".into(),
-            args: alloc::vec![expr, Expr::literal(path)],
+            args: alloc::vec![expr, Expr::literal(path), Expr::Literal(value)],
         }
     }
 
@@ -472,7 +454,13 @@ mod tests {
         assert!(matches!(lit, Expr::Literal(Value::Int64(42))));
 
         let eq = Expr::eq(Expr::column("t", "a", 0), Expr::column("t", "b", 1));
-        assert!(matches!(eq, Expr::BinaryOp { op: BinaryOp::Eq, .. }));
+        assert!(matches!(
+            eq,
+            Expr::BinaryOp {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ));
     }
 
     #[test]

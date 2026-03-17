@@ -391,10 +391,7 @@ mod tests {
     fn test_array_indexing_via_path() {
         use crate::path::JsonPath;
         // Arrays can be accessed via JSONPath, not direct GetIndex
-        let arr = JsonbValue::Array(vec![
-            JsonbValue::Number(1.0),
-            JsonbValue::Number(2.0),
-        ]);
+        let arr = JsonbValue::Array(vec![JsonbValue::Number(1.0), JsonbValue::Number(2.0)]);
         // Test array access via query
         let path = JsonPath::parse("$[0]").unwrap();
         let results = arr.query(&path);
@@ -582,7 +579,10 @@ mod tests {
     #[test]
     fn test_get_field_text_array() {
         let mut obj = JsonbObject::new();
-        obj.insert("arr".into(), JsonbValue::Array(vec![JsonbValue::Number(1.0)]));
+        obj.insert(
+            "arr".into(),
+            JsonbValue::Array(vec![JsonbValue::Number(1.0)]),
+        );
         let json = JsonbValue::Object(obj);
 
         let result = json.apply_op(&JsonbOp::GetFieldText("arr".into()));

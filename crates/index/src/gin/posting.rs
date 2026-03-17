@@ -9,7 +9,16 @@ use cynos_core::RowId;
 /// A posting list storing row IDs in sorted order.
 ///
 /// Uses `BTreeSet` for `no_std` compatibility instead of `RoaringBitmap`.
-/// For production use with large datasets, consider using `roaring` crate.
+/// For production use with large datasets, consider evolving this into a
+/// hybrid representation while keeping the current API stable:
+/// - `Small(Vec<RowId>)` for short postings, which improves cache locality and
+///   makes two-pointer intersections cheap.
+/// - `Large(CompressedBitmap)` for wide postings, which can make AND/OR/DIFF
+///   operations much faster on hot terms.
+///
+/// Because `RowId` is a global `u64`, avoid dense bitmaps unless there is a
+/// table-local ID remapping layer; sparse or compressed bitmaps are the safer
+/// direction here.
 #[derive(Debug, Clone, Default)]
 pub struct PostingList {
     /// Sorted set of row IDs.
@@ -65,6 +74,42 @@ impl PostingList {
         PostingList {
             rows: self.rows.intersection(&other.rows).copied().collect(),
         }
+    }
+
+    /// Intersects this posting list with a sorted list of candidate row IDs.
+    ///
+    /// This avoids repeated membership lookups when the caller already has an
+    /// ordered intermediate result, which is common in multi-term GIN AND scans.
+    pub fn intersect_sorted_candidates(&self, candidates: &[RowId]) -> Vec<RowId> {
+        if candidates.is_empty() || self.is_empty() {
+            return Vec::new();
+        }
+
+        let mut result = Vec::with_capacity(core::cmp::min(candidates.len(), self.len()));
+        let mut candidate_idx = 0usize;
+        let mut posting_iter = self.rows.iter().copied();
+        let mut posting_row = posting_iter.next();
+
+        while candidate_idx < candidates.len() {
+            let candidate = candidates[candidate_idx];
+
+            match posting_row {
+                Some(current) if current < candidate => {
+                    posting_row = posting_iter.next();
+                }
+                Some(current) if current == candidate => {
+                    result.push(candidate);
+                    candidate_idx += 1;
+                    posting_row = posting_iter.next();
+                }
+                Some(_) => {
+                    candidate_idx += 1;
+                }
+                None => break,
+            }
+        }
+
+        result
     }
 
     /// Computes the union of two posting lists.
@@ -195,5 +240,17 @@ mod tests {
 
         let collected: Vec<_> = pl.iter().collect();
         assert_eq!(collected, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_intersect_sorted_candidates() {
+        let mut pl = PostingList::new();
+        pl.add(2);
+        pl.add(4);
+        pl.add(6);
+        pl.add(8);
+
+        let result = pl.intersect_sorted_candidates(&[1, 2, 3, 4, 8, 9]);
+        assert_eq!(result, vec![2, 4, 8]);
     }
 }

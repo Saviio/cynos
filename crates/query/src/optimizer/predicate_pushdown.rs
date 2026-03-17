@@ -125,9 +125,7 @@ impl PredicatePushdown {
                 right,
                 condition,
                 join_type,
-            } => {
-                self.push_filter_into_join(*left, *right, condition, join_type, predicate)
-            }
+            } => self.push_filter_into_join(*left, *right, condition, join_type, predicate),
 
             // Can't push filter below aggregate
             LogicalPlan::Aggregate { .. } => LogicalPlan::Filter {
@@ -569,7 +567,10 @@ mod tests {
         let optimized = pass.optimize(plan);
 
         // Should push to left side
-        if let LogicalPlan::Join { left, join_type, .. } = optimized {
+        if let LogicalPlan::Join {
+            left, join_type, ..
+        } = optimized
+        {
             assert_eq!(join_type, JoinType::LeftOuter);
             assert!(matches!(*left, LogicalPlan::Filter { .. }));
         } else {

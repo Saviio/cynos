@@ -2,7 +2,7 @@
 
 use super::column::Column;
 use super::constraint::{Constraints, ForeignKey};
-use super::index::{IndexDef, IndexedColumn, IndexType};
+use super::index::{IndexDef, IndexType, IndexedColumn};
 use crate::error::{Error, Result};
 use crate::types::DataType;
 use alloc::format;
@@ -193,7 +193,11 @@ impl TableBuilder {
                         message: format!("Column is not indexable: {}", col.name),
                     })
                 }
-                Some(c) if col.auto_increment && c.data_type() != DataType::Int32 && c.data_type() != DataType::Int64 => {
+                Some(c)
+                    if col.auto_increment
+                        && c.data_type() != DataType::Int32
+                        && c.data_type() != DataType::Int64 =>
+                {
                     return Err(Error::InvalidSchema {
                         message: "Auto-increment requires integer type".into(),
                     })
@@ -299,13 +303,7 @@ impl TableBuilder {
             });
         }
 
-        let fk = ForeignKey::new(
-            &name,
-            &self.name,
-            child_column,
-            parent_table,
-            parent_column,
-        );
+        let fk = ForeignKey::new(&name, &self.name, child_column, parent_table, parent_column);
         self.foreign_keys.push(fk);
 
         // Add index for foreign key column
@@ -442,24 +440,30 @@ mod tests {
     }
 }
 
-    #[test]
-    fn test_primary_key_in_indices() {
-        let table = TableBuilder::new("users")
-            .unwrap()
-            .add_column("id", DataType::Int64)
-            .unwrap()
-            .add_column("name", DataType::String)
-            .unwrap()
-            .add_primary_key(&["id"], true)
-            .unwrap()
-            .build()
-            .unwrap();
+#[test]
+fn test_primary_key_in_indices() {
+    let table = TableBuilder::new("users")
+        .unwrap()
+        .add_column("id", DataType::Int64)
+        .unwrap()
+        .add_column("name", DataType::String)
+        .unwrap()
+        .add_primary_key(&["id"], true)
+        .unwrap()
+        .build()
+        .unwrap();
 
-        // Primary key should be in indices list
-        let indices = table.indices();
+    // Primary key should be in indices list
+    let indices = table.indices();
 
-        assert!(indices.iter().any(|idx| idx.name() == "pkUsers"),
-            "Primary key index 'pkUsers' should be in indices list");
-        assert!(indices.iter().any(|idx| idx.columns().iter().any(|c| c.name == "id")),
-            "Primary key index should contain 'id' column");
-    }
+    assert!(
+        indices.iter().any(|idx| idx.name() == "pkUsers"),
+        "Primary key index 'pkUsers' should be in indices list"
+    );
+    assert!(
+        indices
+            .iter()
+            .any(|idx| idx.columns().iter().any(|c| c.name == "id")),
+        "Primary key index should contain 'id' column"
+    );
+}

@@ -173,13 +173,9 @@ mod tests {
 
     #[test]
     fn test_index_def() {
-        let idx = IndexDef::new(
-            "idx_user_email",
-            "users",
-            vec![IndexedColumn::new("email")],
-        )
-        .unique(true)
-        .index_type(IndexType::Hash);
+        let idx = IndexDef::new("idx_user_email", "users", vec![IndexedColumn::new("email")])
+            .unique(true)
+            .index_type(IndexType::Hash);
 
         assert_eq!(idx.name(), "idx_user_email");
         assert_eq!(idx.table_name(), "users");

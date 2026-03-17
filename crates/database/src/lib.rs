@@ -37,6 +37,7 @@
 
 extern crate alloc;
 
+pub mod binary_protocol;
 pub mod convert;
 pub mod database;
 pub mod dataflow_compiler;
@@ -46,8 +47,8 @@ pub mod query_engine;
 pub mod reactive_bridge;
 pub mod table;
 pub mod transaction;
-pub mod binary_protocol;
 
+pub use binary_protocol::{BinaryResult, SchemaLayout};
 pub use convert::{js_to_row, js_to_value, row_to_js, value_to_js};
 pub use database::Database;
 pub use expr::{Column, Expr};
@@ -55,7 +56,6 @@ pub use query_builder::{DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuild
 pub use reactive_bridge::{JsChangesStream, JsIvmObservableQuery, JsObservableQuery};
 pub use table::{JsTable, JsTableBuilder};
 pub use transaction::JsTransaction;
-pub use binary_protocol::{BinaryResult, SchemaLayout};
 
 use wasm_bindgen::prelude::*;
 

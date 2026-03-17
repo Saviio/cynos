@@ -218,7 +218,7 @@ mod tests {
 
         assert_eq!(layout.columns().len(), 3);
         assert_eq!(layout.null_mask_size(), 1); // ceil(3/8) = 1
-        // row_stride = null_mask(1) + id(8) + name(8) + value(8) = 25
+                                                // row_stride = null_mask(1) + id(8) + name(8) + value(8) = 25
         assert_eq!(layout.row_stride(), 25);
     }
 

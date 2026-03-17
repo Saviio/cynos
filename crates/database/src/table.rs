@@ -126,10 +126,7 @@ impl JsTableBuilder {
     #[wasm_bindgen(js_name = primaryKey)]
     pub fn primary_key(mut self, columns: &JsValue) -> Self {
         if let Some(arr) = columns.dyn_ref::<js_sys::Array>() {
-            let cols: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_string())
-                .collect();
+            let cols: Vec<String> = arr.iter().filter_map(|v| v.as_string()).collect();
             self.primary_key = Some(cols);
         } else if let Some(s) = columns.as_string() {
             self.primary_key = Some(alloc::vec![s]);
@@ -258,9 +255,9 @@ impl JsTable {
 
     /// Returns a column reference.
     pub fn col(&self, name: &str) -> Option<Column> {
-        self.schema.get_column(name).map(|c| {
-            Column::new(self.schema.name(), c.name()).with_index(c.index())
-        })
+        self.schema
+            .get_column(name)
+            .map(|c| Column::new(self.schema.name(), c.name()).with_index(c.index()))
     }
 
     /// Returns the column names.
@@ -317,7 +314,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_table_builder_basic() {
         let builder = JsTableBuilder::new("users")
-            .column("id", JsDataType::Int64, Some(ColumnOptions::new().set_primary_key(true)))
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
             .column("name", JsDataType::String, None)
             .column("age", JsDataType::Int32, None);
 
@@ -329,7 +330,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_table_builder_with_index() {
         let builder = JsTableBuilder::new("users")
-            .column("id", JsDataType::Int64, Some(ColumnOptions::new().set_primary_key(true)))
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
             .column("email", JsDataType::String, None)
             .unique_index("idx_email", &JsValue::from_str("email"));
 
@@ -340,8 +345,16 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_table_builder_nullable() {
         let builder = JsTableBuilder::new("users")
-            .column("id", JsDataType::Int64, Some(ColumnOptions::new().set_primary_key(true)))
-            .column("bio", JsDataType::String, Some(ColumnOptions::new().set_nullable(true)));
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column(
+                "bio",
+                JsDataType::String,
+                Some(ColumnOptions::new().set_nullable(true)),
+            );
 
         let table = builder.build_internal().unwrap();
         let bio_col = table.get_column("bio").unwrap();
@@ -351,7 +364,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_js_table_col() {
         let builder = JsTableBuilder::new("users")
-            .column("id", JsDataType::Int64, Some(ColumnOptions::new().set_primary_key(true)))
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
             .column("name", JsDataType::String, None);
 
         let schema = builder.build_internal().unwrap();
@@ -364,7 +381,11 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_js_table_column_names() {
         let builder = JsTableBuilder::new("users")
-            .column("id", JsDataType::Int64, Some(ColumnOptions::new().set_primary_key(true)))
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
             .column("name", JsDataType::String, None)
             .column("age", JsDataType::Int32, None);
 

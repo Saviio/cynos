@@ -117,9 +117,9 @@ impl Default for TableCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Value};
-    use alloc::vec;
 
     fn test_schema(name: &str) -> Table {
         TableBuilder::new(name)
@@ -193,14 +193,29 @@ mod tests {
         cache.create_table(test_schema("users")).unwrap();
         cache.create_table(test_schema("orders")).unwrap();
 
-        cache.get_table_mut("users").unwrap()
-            .insert(Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())]))
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
             .unwrap();
-        cache.get_table_mut("users").unwrap()
-            .insert(Row::new(2, vec![Value::Int64(2), Value::String("Bob".into())]))
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                2,
+                vec![Value::Int64(2), Value::String("Bob".into())],
+            ))
             .unwrap();
-        cache.get_table_mut("orders").unwrap()
-            .insert(Row::new(3, vec![Value::Int64(1), Value::String("Order1".into())]))
+        cache
+            .get_table_mut("orders")
+            .unwrap()
+            .insert(Row::new(
+                3,
+                vec![Value::Int64(1), Value::String("Order1".into())],
+            ))
             .unwrap();
 
         assert_eq!(cache.total_row_count(), 3);
@@ -210,8 +225,13 @@ mod tests {
     fn test_cache_clear() {
         let mut cache = TableCache::new();
         cache.create_table(test_schema("users")).unwrap();
-        cache.get_table_mut("users").unwrap()
-            .insert(Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())]))
+        cache
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
             .unwrap();
 
         cache.clear();

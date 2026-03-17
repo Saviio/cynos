@@ -282,11 +282,7 @@ impl<'a> MultiColumnOrPass<'a> {
     }
 
     /// Finds an index that can be used for the given predicate.
-    fn find_index_for_predicate(
-        &self,
-        table: &str,
-        predicate: &Expr,
-    ) -> Option<(String, String)> {
+    fn find_index_for_predicate(&self, table: &str, predicate: &Expr) -> Option<(String, String)> {
         // Extract the column from the predicate
         let column = self.extract_indexed_column(predicate)?;
 
@@ -358,11 +354,7 @@ mod tests {
             TableStats {
                 row_count: 100, // Small table
                 is_sorted: false,
-                indexes: alloc::vec![IndexInfo::new(
-                    "idx_id",
-                    alloc::vec!["id".into()],
-                    true
-                )],
+                indexes: alloc::vec![IndexInfo::new("idx_id", alloc::vec!["id".into()], true)],
             },
         );
 

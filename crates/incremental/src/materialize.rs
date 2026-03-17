@@ -131,7 +131,10 @@ impl JoinState {
 
     /// Process a left insert for outer join. Returns deltas including antijoin transitions.
     fn on_left_insert_outer(
-        &mut self, row: Row, key: Vec<Value>, join_type: JoinType,
+        &mut self,
+        row: Row,
+        key: Vec<Value>,
+        join_type: JoinType,
     ) -> Vec<Delta<Row>> {
         let mut output = Vec::new();
         if self.left_col_count == 0 {
@@ -155,7 +158,10 @@ impl JoinState {
             self.left_match_count.insert(row.id(), right_matches);
         } else if matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter) {
             // No matches → emit antijoin row (left + NULLs)
-            output.push(Delta::insert(merge_rows_null_right(&row, self.right_col_count)));
+            output.push(Delta::insert(merge_rows_null_right(
+                &row,
+                self.right_col_count,
+            )));
             self.left_match_count.insert(row.id(), 0);
         }
 
@@ -165,7 +171,10 @@ impl JoinState {
 
     /// Process a left delete for outer join.
     fn on_left_delete_outer(
-        &mut self, row: &Row, key: Vec<Value>, join_type: JoinType,
+        &mut self,
+        row: &Row,
+        key: Vec<Value>,
+        join_type: JoinType,
     ) -> Vec<Delta<Row>> {
         let mut output = Vec::new();
         let match_count = self.left_match_count.remove(&row.id()).unwrap_or(0);
@@ -178,27 +187,38 @@ impl JoinState {
                     // Always decrement right match count
                     if let Some(rc) = self.right_match_count.get_mut(&r.id()) {
                         *rc = rc.saturating_sub(1);
-                        if matches!(join_type, JoinType::RightOuter | JoinType::FullOuter) && *rc == 0 {
-                            output.push(Delta::insert(merge_rows_null_left(r, self.left_col_count)));
+                        if matches!(join_type, JoinType::RightOuter | JoinType::FullOuter)
+                            && *rc == 0
+                        {
+                            output
+                                .push(Delta::insert(merge_rows_null_left(r, self.left_col_count)));
                         }
                     }
                 }
             }
         } else if matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter) {
             // Was unmatched → remove antijoin row
-            output.push(Delta::delete(merge_rows_null_right(row, self.right_col_count)));
+            output.push(Delta::delete(merge_rows_null_right(
+                row,
+                self.right_col_count,
+            )));
         }
 
         if let Some(left_rows) = self.left_index.get_mut(&key) {
             left_rows.retain(|l| l.id() != row.id());
-            if left_rows.is_empty() { self.left_index.remove(&key); }
+            if left_rows.is_empty() {
+                self.left_index.remove(&key);
+            }
         }
         output
     }
 
     /// Process a right insert for outer join.
     fn on_right_insert_outer(
-        &mut self, row: Row, key: Vec<Value>, join_type: JoinType,
+        &mut self,
+        row: Row,
+        key: Vec<Value>,
+        join_type: JoinType,
     ) -> Vec<Delta<Row>> {
         let mut output = Vec::new();
         let left_matches = self.left_index.get(&key).map(|v| v.len()).unwrap_or(0);
@@ -213,14 +233,20 @@ impl JoinState {
                 // Track left match count for all outer join types
                 let lc = self.left_match_count.entry(l.id()).or_insert(0);
                 if matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter) && *lc == 0 {
-                    output.push(Delta::delete(merge_rows_null_right(l, self.right_col_count)));
+                    output.push(Delta::delete(merge_rows_null_right(
+                        l,
+                        self.right_col_count,
+                    )));
                 }
                 *lc += 1;
             }
             // Always track right match count so we can handle right deletes
             self.right_match_count.insert(row.id(), left_matches);
         } else if matches!(join_type, JoinType::RightOuter | JoinType::FullOuter) {
-            output.push(Delta::insert(merge_rows_null_left(&row, self.left_col_count)));
+            output.push(Delta::insert(merge_rows_null_left(
+                &row,
+                self.left_col_count,
+            )));
             self.right_match_count.insert(row.id(), 0);
         }
 
@@ -230,7 +256,10 @@ impl JoinState {
 
     /// Process a right delete for outer join.
     fn on_right_delete_outer(
-        &mut self, row: &Row, key: Vec<Value>, join_type: JoinType,
+        &mut self,
+        row: &Row,
+        key: Vec<Value>,
+        join_type: JoinType,
     ) -> Vec<Delta<Row>> {
         let mut output = Vec::new();
         let match_count = self.right_match_count.remove(&row.id()).unwrap_or(0);
@@ -242,26 +271,38 @@ impl JoinState {
                     // Always decrement left match count
                     if let Some(lc) = self.left_match_count.get_mut(&l.id()) {
                         *lc = lc.saturating_sub(1);
-                        if matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter) && *lc == 0 {
-                            output.push(Delta::insert(merge_rows_null_right(l, self.right_col_count)));
+                        if matches!(join_type, JoinType::LeftOuter | JoinType::FullOuter)
+                            && *lc == 0
+                        {
+                            output.push(Delta::insert(merge_rows_null_right(
+                                l,
+                                self.right_col_count,
+                            )));
                         }
                     }
                 }
             }
         } else if matches!(join_type, JoinType::RightOuter | JoinType::FullOuter) {
-            output.push(Delta::delete(merge_rows_null_left(row, self.left_col_count)));
+            output.push(Delta::delete(merge_rows_null_left(
+                row,
+                self.left_col_count,
+            )));
         }
 
         if let Some(right_rows) = self.right_index.get_mut(&key) {
             right_rows.retain(|r| r.id() != row.id());
-            if right_rows.is_empty() { self.right_index.remove(&key); }
+            if right_rows.is_empty() {
+                self.right_index.remove(&key);
+            }
         }
         output
     }
 }
 
 impl Default for JoinState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Merges two rows into a single joined row.
@@ -296,13 +337,25 @@ fn merge_rows_null_left(right: &Row, left_col_count: usize) -> Row {
 /// - MIN/MAX: maintain ordered multiset (BTreeMap), O(log n) per delta
 ///   This eliminates the `needs_recompute` fallback entirely.
 pub enum AggregateState {
-    Count { count: i64 },
-    Sum { sum: f64, count: i64 },
-    Avg { sum: f64, count: i64 },
+    Count {
+        count: i64,
+    },
+    Sum {
+        sum: f64,
+        count: i64,
+    },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     /// BTreeMap<Value, multiplicity> — ordered multiset for O(log n) min on delete
-    Min { values: BTreeMap<Value, i32> },
+    Min {
+        values: BTreeMap<Value, i32>,
+    },
     /// BTreeMap<Value, multiplicity> — ordered multiset for O(log n) max on delete
-    Max { values: BTreeMap<Value, i32> },
+    Max {
+        values: BTreeMap<Value, i32>,
+    },
 }
 
 impl AggregateState {
@@ -311,8 +364,12 @@ impl AggregateState {
             AggregateType::Count => AggregateState::Count { count: 0 },
             AggregateType::Sum => AggregateState::Sum { sum: 0.0, count: 0 },
             AggregateType::Avg => AggregateState::Avg { sum: 0.0, count: 0 },
-            AggregateType::Min => AggregateState::Min { values: BTreeMap::new() },
-            AggregateType::Max => AggregateState::Max { values: BTreeMap::new() },
+            AggregateType::Min => AggregateState::Min {
+                values: BTreeMap::new(),
+            },
+            AggregateType::Max => AggregateState::Max {
+                values: BTreeMap::new(),
+            },
         }
     }
 
@@ -352,9 +409,7 @@ impl AggregateState {
                     Value::Float64(*sum / *count as f64)
                 }
             }
-            AggregateState::Min { values } => {
-                values.keys().next().cloned().unwrap_or(Value::Null)
-            }
+            AggregateState::Min { values } => values.keys().next().cloned().unwrap_or(Value::Null),
             AggregateState::Max { values } => {
                 values.keys().next_back().cloned().unwrap_or(Value::Null)
             }
@@ -408,7 +463,9 @@ impl GroupAggregateState {
         // Collect deltas by group key
         let mut grouped: HashMap<Vec<Value>, Vec<(&Row, i32)>> = HashMap::new();
         for d in deltas {
-            let key: Vec<Value> = self.group_by.iter()
+            let key: Vec<Value> = self
+                .group_by
+                .iter()
                 .map(|&col| d.data.get(col).cloned().unwrap_or(Value::Null))
                 .collect();
             grouped.entry(key).or_default().push((&d.data, d.diff));
@@ -428,7 +485,10 @@ impl GroupAggregateState {
 
             // Get or create group state
             let states = self.groups.entry(key.clone()).or_insert_with(|| {
-                self.functions.iter().map(|(_, agg_type)| AggregateState::new(*agg_type)).collect()
+                self.functions
+                    .iter()
+                    .map(|(_, agg_type)| AggregateState::new(*agg_type))
+                    .collect()
             });
 
             // Apply all deltas for this group
@@ -537,11 +597,19 @@ impl MaterializedView {
         let join_state = self.join_states.entry(0).or_insert_with(JoinState::new);
         for row in left_rows {
             let key = left_key_fn(row);
-            join_state.left_index.entry(key).or_default().push(row.clone());
+            join_state
+                .left_index
+                .entry(key)
+                .or_default()
+                .push(row.clone());
         }
         for row in right_rows {
             let key = right_key_fn(row);
-            join_state.right_index.entry(key).or_default().push(row.clone());
+            join_state
+                .right_index
+                .entry(key)
+                .or_default()
+                .push(row.clone());
         }
     }
 
@@ -551,13 +619,19 @@ impl MaterializedView {
     }
 
     #[inline]
-    pub fn len(&self) -> usize { self.result_map.len() }
+    pub fn len(&self) -> usize {
+        self.result_map.len()
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.result_map.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.result_map.is_empty()
+    }
 
     #[inline]
-    pub fn dependencies(&self) -> &[TableId] { &self.dependencies }
+    pub fn dependencies(&self) -> &[TableId] {
+        &self.dependencies
+    }
 
     pub fn depends_on(&self, table_id: TableId) -> bool {
         self.dependencies.contains(&table_id)
@@ -583,7 +657,8 @@ impl MaterializedView {
             deltas,
             0,
             0,
-        ).0;
+        )
+        .0;
 
         // Apply output deltas to result
         for delta in &output_deltas {
@@ -631,25 +706,54 @@ fn propagate_deltas(
         }
 
         DataflowNode::Filter { input, predicate } => {
-            let (input_deltas, jid, aid) =
-                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, agg_id);
-            (filter_incremental(&input_deltas, |row| predicate(row)), jid, aid)
+            let (input_deltas, jid, aid) = propagate_deltas(
+                input,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                join_id,
+                agg_id,
+            );
+            (
+                filter_incremental(&input_deltas, |row| predicate(row)),
+                jid,
+                aid,
+            )
         }
 
         DataflowNode::Project { input, columns } => {
-            let (input_deltas, jid, aid) =
-                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, agg_id);
+            let (input_deltas, jid, aid) = propagate_deltas(
+                input,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                join_id,
+                agg_id,
+            );
             (project_incremental(&input_deltas, columns), jid, aid)
         }
 
         DataflowNode::Map { input, mapper } => {
-            let (input_deltas, jid, aid) =
-                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, agg_id);
+            let (input_deltas, jid, aid) = propagate_deltas(
+                input,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                join_id,
+                agg_id,
+            );
             (map_incremental(&input_deltas, |row| mapper(row)), jid, aid)
         }
 
         DataflowNode::Join {
-            left, right, left_key, right_key, join_type,
+            left,
+            right,
+            left_key,
+            right_key,
+            join_type,
         } => {
             let current_join_id = join_id;
             if !join_states.contains_key(&current_join_id) {
@@ -665,8 +769,15 @@ fn propagate_deltas(
             let mut output_deltas = Vec::new();
 
             if is_left_side {
-                let (left_deltas, _, _) =
-                    propagate_deltas(left, join_states, aggregate_states, source_table, deltas.clone(), current_join_id + 1, agg_id);
+                let (left_deltas, _, _) = propagate_deltas(
+                    left,
+                    join_states,
+                    aggregate_states,
+                    source_table,
+                    deltas.clone(),
+                    current_join_id + 1,
+                    agg_id,
+                );
 
                 let join_state = join_states.get_mut(&current_join_id).unwrap();
                 for delta in left_deltas {
@@ -691,8 +802,15 @@ fn propagate_deltas(
             }
 
             if is_right_side {
-                let (right_deltas, _, _) =
-                    propagate_deltas(right, join_states, aggregate_states, source_table, deltas, current_join_id + 1, agg_id);
+                let (right_deltas, _, _) = propagate_deltas(
+                    right,
+                    join_states,
+                    aggregate_states,
+                    source_table,
+                    deltas,
+                    current_join_id + 1,
+                    agg_id,
+                );
 
                 let join_state = join_states.get_mut(&current_join_id).unwrap();
                 for delta in right_deltas {
@@ -710,7 +828,11 @@ fn propagate_deltas(
                     } else if delta.is_insert() {
                         output_deltas.extend(join_state.on_right_insert_outer(delta.data, key, jt));
                     } else if delta.is_delete() {
-                        output_deltas.extend(join_state.on_right_delete_outer(&delta.data, key, jt));
+                        output_deltas.extend(join_state.on_right_delete_outer(
+                            &delta.data,
+                            key,
+                            jt,
+                        ));
                     }
                 }
             }
@@ -718,10 +840,21 @@ fn propagate_deltas(
             (output_deltas, current_join_id + 1, agg_id)
         }
 
-        DataflowNode::Aggregate { input, group_by, functions } => {
+        DataflowNode::Aggregate {
+            input,
+            group_by,
+            functions,
+        } => {
             let current_agg_id = agg_id;
-            let (input_deltas, jid, _) =
-                propagate_deltas(input, join_states, aggregate_states, source_table, deltas, join_id, current_agg_id + 1);
+            let (input_deltas, jid, _) = propagate_deltas(
+                input,
+                join_states,
+                aggregate_states,
+                source_table,
+                deltas,
+                join_id,
+                current_agg_id + 1,
+            );
 
             if input_deltas.is_empty() {
                 return (Vec::new(), jid, current_agg_id + 1);
@@ -750,12 +883,17 @@ pub struct MaterializedViewBuilder {
 }
 
 impl Default for MaterializedViewBuilder {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MaterializedViewBuilder {
     pub fn new() -> Self {
-        Self { dataflow: None, initial: Vec::new() }
+        Self {
+            dataflow: None,
+            initial: Vec::new(),
+        }
     }
 
     pub fn dataflow(mut self, dataflow: DataflowNode) -> Self {
@@ -802,7 +940,10 @@ mod tests {
     fn test_materialized_view_source_propagation() {
         let dataflow = DataflowNode::source(1);
         let mut view = MaterializedView::new(dataflow);
-        let deltas = vec![Delta::insert(make_row(1, 25)), Delta::insert(make_row(2, 30))];
+        let deltas = vec![
+            Delta::insert(make_row(1, 25)),
+            Delta::insert(make_row(2, 30)),
+        ];
         let output = view.on_table_change(1, deltas);
         assert_eq!(output.len(), 2);
         assert_eq!(view.len(), 2);
@@ -811,7 +952,10 @@ mod tests {
     #[test]
     fn test_materialized_view_filter_propagation() {
         let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
-            row.get(1).and_then(|v| v.as_i64()).map(|age| age > 18).unwrap_or(false)
+            row.get(1)
+                .and_then(|v| v.as_i64())
+                .map(|age| age > 18)
+                .unwrap_or(false)
         });
         let mut view = MaterializedView::new(dataflow);
         let deltas = vec![
@@ -844,7 +988,14 @@ mod tests {
     }
 
     fn make_employee(id: u64, name_hash: i64, dept_id: i64) -> Row {
-        Row::new(id, vec![Value::Int64(id as i64), Value::Int64(name_hash), Value::Int64(dept_id)])
+        Row::new(
+            id,
+            vec![
+                Value::Int64(id as i64),
+                Value::Int64(name_hash),
+                Value::Int64(dept_id),
+            ],
+        )
     }
 
     fn make_department(id: u64, name_hash: i64) -> Row {
@@ -920,7 +1071,7 @@ mod tests {
         let deletes: Vec<_> = output.iter().filter(|d| d.is_delete()).collect();
         assert_eq!(deletes.len(), 1); // remove inner join
         assert_eq!(inserts.len(), 1); // add antijoin
-        // Antijoin row should have NULLs for right side
+                                      // Antijoin row should have NULLs for right side
         assert_eq!(inserts[0].data.get(3), Some(&Value::Null));
     }
 
@@ -935,10 +1086,13 @@ mod tests {
         let mut view = MaterializedView::new(dataflow);
 
         // Insert rows with group key = 1
-        let output = view.on_table_change(1, vec![
-            Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
-            Delta::insert(Row::new(2, vec![Value::Int64(1), Value::Int64(20)])),
-        ]);
+        let output = view.on_table_change(
+            1,
+            vec![
+                Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
+                Delta::insert(Row::new(2, vec![Value::Int64(1), Value::Int64(20)])),
+            ],
+        );
 
         // Should have one group with count=2, sum=30
         let inserts: Vec<_> = output.iter().filter(|d| d.is_insert()).collect();
@@ -961,16 +1115,23 @@ mod tests {
         let mut view = MaterializedView::new(dataflow);
 
         // Insert 3 rows
-        view.on_table_change(1, vec![
-            Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
-            Delta::insert(Row::new(2, vec![Value::Int64(1), Value::Int64(30)])),
-            Delta::insert(Row::new(3, vec![Value::Int64(1), Value::Int64(20)])),
-        ]);
+        view.on_table_change(
+            1,
+            vec![
+                Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
+                Delta::insert(Row::new(2, vec![Value::Int64(1), Value::Int64(30)])),
+                Delta::insert(Row::new(3, vec![Value::Int64(1), Value::Int64(20)])),
+            ],
+        );
 
         // Delete the min value (10) — should NOT need recompute, BTreeMap handles it
-        let output = view.on_table_change(1, vec![
-            Delta::delete(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
-        ]);
+        let output = view.on_table_change(
+            1,
+            vec![Delta::delete(Row::new(
+                1,
+                vec![Value::Int64(1), Value::Int64(10)],
+            ))],
+        );
 
         // Should have delete(old) + insert(new)
         let inserts: Vec<_> = output.iter().filter(|d| d.is_insert()).collect();
@@ -1005,10 +1166,13 @@ mod tests {
         let mut view = MaterializedView::new(dataflow);
 
         // Insert two rows with values that sum to zero: +5 and -5
-        let output = view.on_table_change(1, vec![
-            Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(5)])),
-            Delta::insert(Row::new(2, vec![Value::Int64(1), Value::Int64(-5)])),
-        ]);
+        let output = view.on_table_change(
+            1,
+            vec![
+                Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(5)])),
+                Delta::insert(Row::new(2, vec![Value::Int64(1), Value::Int64(-5)])),
+            ],
+        );
 
         // The group should still exist with sum=0, not be deleted
         // BUG: The group is incorrectly deleted because sum == 0.0 is used to check emptiness
@@ -1026,7 +1190,11 @@ mod tests {
         // Verify the group exists with sum=0
         let result = view.result();
         assert_eq!(result.len(), 1, "Group should exist even when sum is zero");
-        assert_eq!(result[0].get(1), Some(&Value::Float64(0.0)), "Sum should be 0.0");
+        assert_eq!(
+            result[0].get(1),
+            Some(&Value::Float64(0.0)),
+            "Sum should be 0.0"
+        );
     }
 
     #[test]
@@ -1037,7 +1205,7 @@ mod tests {
         let mut state = AggregateState::new(AggregateType::Sum);
 
         // Apply two values that sum to zero
-        state.apply(&Value::Int64(5), 1);  // +5
+        state.apply(&Value::Int64(5), 1); // +5
         state.apply(&Value::Int64(-5), 1); // -5
 
         // BUG: is_empty() returns true because sum == 0.0

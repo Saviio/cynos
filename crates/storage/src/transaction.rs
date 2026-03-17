@@ -5,8 +5,8 @@
 use crate::cache::TableCache;
 use crate::journal::{Journal, JournalEntry};
 use alloc::vec::Vec;
-use cynos_core::{Error, Result, Row, RowId};
 use core::sync::atomic::{AtomicU64, Ordering};
+use cynos_core::{Error, Result, Row, RowId};
 
 /// Global transaction ID counter.
 static NEXT_TX_ID: AtomicU64 = AtomicU64::new(1);
@@ -72,7 +72,9 @@ impl Transaction {
     pub fn insert(&mut self, cache: &mut TableCache, table: &str, row: Row) -> Result<RowId> {
         self.check_active()?;
 
-        let store = cache.get_table_mut(table).ok_or_else(|| Error::table_not_found(table))?;
+        let store = cache
+            .get_table_mut(table)
+            .ok_or_else(|| Error::table_not_found(table))?;
         let row_id = store.insert(row.clone())?;
 
         self.journal.record_insert(table, row);
@@ -80,13 +82,21 @@ impl Transaction {
     }
 
     /// Updates a row within this transaction.
-    pub fn update(&mut self, cache: &mut TableCache, table: &str, row_id: RowId, new_row: Row) -> Result<()> {
+    pub fn update(
+        &mut self,
+        cache: &mut TableCache,
+        table: &str,
+        row_id: RowId,
+        new_row: Row,
+    ) -> Result<()> {
         self.check_active()?;
 
-        let store = cache.get_table_mut(table).ok_or_else(|| Error::table_not_found(table))?;
-        let old_row = store.get(row_id).ok_or_else(|| {
-            Error::not_found(table, cynos_core::Value::Int64(row_id as i64))
-        })?;
+        let store = cache
+            .get_table_mut(table)
+            .ok_or_else(|| Error::table_not_found(table))?;
+        let old_row = store
+            .get(row_id)
+            .ok_or_else(|| Error::not_found(table, cynos_core::Value::Int64(row_id as i64)))?;
 
         let old_row_owned = (*old_row).clone();
         store.update(row_id, new_row.clone())?;
@@ -98,7 +108,9 @@ impl Transaction {
     pub fn delete(&mut self, cache: &mut TableCache, table: &str, row_id: RowId) -> Result<Row> {
         self.check_active()?;
 
-        let store = cache.get_table_mut(table).ok_or_else(|| Error::table_not_found(table))?;
+        let store = cache
+            .get_table_mut(table)
+            .ok_or_else(|| Error::table_not_found(table))?;
         let row = store.delete(row_id)?;
 
         let row_owned = (*row).clone();
@@ -134,10 +146,10 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cynos_core::schema::TableBuilder;
-    use cynos_core::{DataType, Value};
     use alloc::format;
     use alloc::vec;
+    use cynos_core::schema::TableBuilder;
+    use cynos_core::{DataType, Value};
 
     fn test_schema() -> cynos_core::schema::Table {
         TableBuilder::new("test")
@@ -246,7 +258,10 @@ mod tests {
 
         // Insert multiple rows
         for i in 1..=3 {
-            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("row{}", i))]);
+            let row = Row::new(
+                i,
+                vec![Value::Int64(i as i64), Value::String(format!("row{}", i))],
+            );
             tx.insert(&mut cache, "test", row).unwrap();
         }
 

@@ -27,11 +27,7 @@ fn rows_strategy(max_rows: usize) -> impl Strategy<Value = Vec<Row>> {
 
 /// Strategy for generating rows with multiple columns.
 fn multi_column_rows_strategy(max_rows: usize) -> impl Strategy<Value = Vec<Row>> {
-    prop::collection::vec(
-        (value_strategy(), value_strategy()),
-        0..max_rows,
-    )
-    .prop_map(|values| {
+    prop::collection::vec((value_strategy(), value_strategy()), 0..max_rows).prop_map(|values| {
         values
             .into_iter()
             .enumerate()

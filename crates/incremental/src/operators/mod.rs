@@ -11,7 +11,9 @@ mod filter;
 mod join;
 mod map;
 
-pub use aggregate::{IncrementalAvg, IncrementalCount, IncrementalMax, IncrementalMin, IncrementalSum};
+pub use aggregate::{
+    IncrementalAvg, IncrementalCount, IncrementalMax, IncrementalMin, IncrementalSum,
+};
 pub use filter::filter_incremental;
 pub use join::IncrementalHashJoin;
 pub use map::{map_incremental, project_incremental};

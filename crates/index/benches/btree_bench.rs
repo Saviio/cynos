@@ -1,7 +1,7 @@
 //! Benchmarks for cynos-index using criterion.
 
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use cynos_index::{BTreeIndex, HashIndex, Index, KeyRange, RangeIndex};
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 
 fn btree_insert_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("btree_insert");
@@ -189,9 +189,8 @@ fn btree_remove_benchmark(c: &mut Criterion) {
                             tree.add(i, i as u64).unwrap();
                         }
                         // Prepare entries to remove
-                        let entries: Vec<(i64, u64)> = (0..delete_count as i64)
-                            .map(|i| (i, i as u64))
-                            .collect();
+                        let entries: Vec<(i64, u64)> =
+                            (0..delete_count as i64).map(|i| (i, i as u64)).collect();
                         (tree, entries)
                     },
                     |(mut tree, entries)| {

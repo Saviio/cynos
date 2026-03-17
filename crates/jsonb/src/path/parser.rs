@@ -245,7 +245,10 @@ impl JsonPath {
                         Some(c) if c.is_ascii_digit() || c == ':' || c == '-' => {
                             let (start, end) = parse_index_or_slice(&mut parser)?;
                             parser.expect(']')?;
-                            if start.is_some() && end.is_none() && !parser.input[..parser.pos].contains(':') {
+                            if start.is_some()
+                                && end.is_none()
+                                && !parser.input[..parser.pos].contains(':')
+                            {
                                 path = JsonPath::Index(Box::new(path), start.unwrap());
                             } else {
                                 path = JsonPath::Slice(Box::new(path), start, end);

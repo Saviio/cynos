@@ -1,5 +1,6 @@
 //! Logical query plan definitions.
 
+use crate::planner::IndexBounds;
 use crate::ast::JoinType;
 use crate::ast::{AggregateFunc, Expr, SortOrder};
 use alloc::boxed::Box;
@@ -17,10 +18,7 @@ pub enum LogicalPlan {
     IndexScan {
         table: String,
         index: String,
-        range_start: Option<Value>,
-        range_end: Option<Value>,
-        include_start: bool,
-        include_end: bool,
+        bounds: IndexBounds,
     },
 
     /// Index point lookup.
@@ -229,6 +227,40 @@ impl LogicalPlan {
             | LogicalPlan::Union { left, right, .. } => alloc::vec![left.as_ref(), right.as_ref()],
         }
     }
+
+    /// Collects all table names referenced by this plan.
+    pub fn collect_tables(&self) -> Vec<String> {
+        let mut tables = Vec::new();
+        self.collect_tables_into(&mut tables);
+        tables
+    }
+
+    fn collect_tables_into(&self, tables: &mut Vec<String>) {
+        match self {
+            LogicalPlan::Scan { table }
+            | LogicalPlan::IndexScan { table, .. }
+            | LogicalPlan::IndexGet { table, .. }
+            | LogicalPlan::IndexInGet { table, .. }
+            | LogicalPlan::GinIndexScan { table, .. }
+            | LogicalPlan::GinIndexScanMulti { table, .. } => {
+                if !tables.contains(table) {
+                    tables.push(table.clone());
+                }
+            }
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => input.collect_tables_into(tables),
+            LogicalPlan::Join { left, right, .. }
+            | LogicalPlan::CrossProduct { left, right }
+            | LogicalPlan::Union { left, right, .. } => {
+                left.collect_tables_into(tables);
+                right.collect_tables_into(tables);
+            }
+            LogicalPlan::Empty => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -271,5 +303,29 @@ mod tests {
             Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
         );
         assert_eq!(join.inputs().len(), 2);
+    }
+
+    #[test]
+    fn test_logical_plan_collect_tables() {
+        let plan = LogicalPlan::filter(
+            LogicalPlan::inner_join(
+                LogicalPlan::scan("users"),
+                LogicalPlan::scan("orders"),
+                Expr::eq(
+                    Expr::column("users", "id", 0),
+                    Expr::column("orders", "user_id", 1),
+                ),
+            ),
+            Expr::gt(Expr::column("orders", "amount", 2), Expr::literal(100i64)),
+        );
+
+        let tables = plan.collect_tables();
+        assert_eq!(
+            tables,
+            alloc::vec![
+                alloc::string::String::from("users"),
+                alloc::string::String::from("orders")
+            ]
+        );
     }
 }

@@ -5,7 +5,7 @@
 //! physical plan can be reused, skipping the optimization phase.
 
 use crate::ast::Expr;
-use crate::planner::{LogicalPlan, PhysicalPlan};
+use crate::planner::{IndexBounds, LogicalPlan, PhysicalPlan};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -59,21 +59,12 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
         LogicalPlan::IndexScan {
             table,
             index,
-            range_start,
-            range_end,
-            include_start,
-            include_end,
+            bounds,
         } => {
             hasher.write(b"index_scan");
             hasher.write(table.as_bytes());
             hasher.write(index.as_bytes());
-            if let Some(v) = range_start {
-                hash_value(v, hasher);
-            }
-            if let Some(v) = range_end {
-                hash_value(v, hasher);
-            }
-            hasher.write(&[*include_start as u8, *include_end as u8]);
+            hash_index_bounds(bounds, hasher);
         }
         LogicalPlan::IndexGet { table, index, key } => {
             hasher.write(b"index_get");
@@ -194,6 +185,92 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
         LogicalPlan::Empty => {
             hasher.write(b"empty");
         }
+    }
+}
+
+fn hash_index_bounds<H: Hasher>(bounds: &IndexBounds, hasher: &mut H) {
+    match bounds {
+        IndexBounds::Unbounded => hasher.write(b"all"),
+        IndexBounds::Scalar(range) => {
+            hasher.write(b"scalar");
+            hash_scalar_key_range(range, hasher);
+        }
+        IndexBounds::Composite(range) => {
+            hasher.write(b"composite");
+            hash_composite_key_range(range, hasher);
+        }
+    }
+}
+
+fn hash_scalar_key_range<H: Hasher>(range: &cynos_index::KeyRange<cynos_core::Value>, hasher: &mut H) {
+    match range {
+        cynos_index::KeyRange::All => hasher.write(b"all"),
+        cynos_index::KeyRange::Only(value) => {
+            hasher.write(b"only");
+            hash_value(value, hasher);
+        }
+        cynos_index::KeyRange::LowerBound { value, exclusive } => {
+            hasher.write(b"lower");
+            hash_value(value, hasher);
+            hasher.write(&[*exclusive as u8]);
+        }
+        cynos_index::KeyRange::UpperBound { value, exclusive } => {
+            hasher.write(b"upper");
+            hash_value(value, hasher);
+            hasher.write(&[*exclusive as u8]);
+        }
+        cynos_index::KeyRange::Bound {
+            lower,
+            upper,
+            lower_exclusive,
+            upper_exclusive,
+        } => {
+            hasher.write(b"bound");
+            hash_value(lower, hasher);
+            hash_value(upper, hasher);
+            hasher.write(&[*lower_exclusive as u8, *upper_exclusive as u8]);
+        }
+    }
+}
+
+fn hash_composite_key_range<H: Hasher>(
+    range: &cynos_index::KeyRange<alloc::vec::Vec<cynos_core::Value>>,
+    hasher: &mut H,
+) {
+    match range {
+        cynos_index::KeyRange::All => hasher.write(b"all"),
+        cynos_index::KeyRange::Only(values) => {
+            hasher.write(b"only");
+            hash_value_vec(values, hasher);
+        }
+        cynos_index::KeyRange::LowerBound { value, exclusive } => {
+            hasher.write(b"lower");
+            hash_value_vec(value, hasher);
+            hasher.write(&[*exclusive as u8]);
+        }
+        cynos_index::KeyRange::UpperBound { value, exclusive } => {
+            hasher.write(b"upper");
+            hash_value_vec(value, hasher);
+            hasher.write(&[*exclusive as u8]);
+        }
+        cynos_index::KeyRange::Bound {
+            lower,
+            upper,
+            lower_exclusive,
+            upper_exclusive,
+        } => {
+            hasher.write(b"bound");
+            hash_value_vec(lower, hasher);
+            hash_value_vec(upper, hasher);
+            hasher.write(&[*lower_exclusive as u8, *upper_exclusive as u8]);
+        }
+    }
+}
+
+fn hash_value_vec<H: Hasher>(values: &[cynos_core::Value], hasher: &mut H) {
+    hasher.write(&values.len().to_le_bytes());
+    for value in values {
+        hash_value(value, hasher);
     }
 }
 
@@ -702,7 +779,8 @@ mod tests {
 
         // Should only remove the users plan, keeping orders and products
         assert_eq!(
-            cache.len(), 2,
+            cache.len(),
+            2,
             "Defect 2: invalidate_table should only remove plans for the specified table"
         );
 
@@ -734,7 +812,11 @@ mod tests {
         // Invalidating "users" should remove the join plan (which references users)
         cache.invalidate_table("users");
 
-        assert_eq!(cache.len(), 1, "Join plan referencing users should be invalidated");
+        assert_eq!(
+            cache.len(),
+            1,
+            "Join plan referencing users should be invalidated"
+        );
         assert!(cache.get(1).is_none(), "join plan should be invalidated");
         assert!(cache.get(2).is_some(), "products plan should remain");
     }

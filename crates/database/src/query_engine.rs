@@ -104,7 +104,29 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         Ok(store.index_scan_with_options(index, range.as_ref(), limit, offset, reverse))
     }
 
-    fn get_index_point(&self, table: &str, index: &str, key: &Value) -> ExecutionResult<Vec<Rc<Row>>> {
+    fn get_index_range_composite_with_limit(
+        &self,
+        table: &str,
+        index: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        Ok(store.index_scan_composite_with_options(index, range, limit, offset, reverse))
+    }
+
+    fn get_index_point(
+        &self,
+        table: &str,
+        index: &str,
+        key: &Value,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
         let store = self
             .cache
             .get_table(table)
@@ -186,17 +208,11 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
     }
 }
 
-/// Builds ExecutionContext from TableCache for optimizer.
-pub fn build_execution_context(cache: &TableCache, table_name: &str) -> ExecutionContext {
-    let mut ctx = ExecutionContext::new();
-
+fn register_table_context(cache: &TableCache, ctx: &mut ExecutionContext, table_name: &str) {
     if let Some(store) = cache.get_table(table_name) {
         let schema = store.schema();
 
-        // Collect index information
         let mut indexes = Vec::new();
-
-        // Add secondary indexes
         for idx in schema.indices() {
             let index_type = match idx.get_index_type() {
                 cynos_core::schema::IndexType::Gin => QueryIndexType::Gin,
@@ -212,13 +228,41 @@ pub fn build_execution_context(cache: &TableCache, table_name: &str) -> Executio
             );
         }
 
-        let stats = TableStats {
-            row_count: store.len(),
-            is_sorted: false,
-            indexes,
-        };
+        ctx.register_table(
+            table_name,
+            TableStats {
+                row_count: store.len(),
+                is_sorted: false,
+                indexes,
+            },
+        );
+    }
+}
 
-        ctx.register_table(table_name, stats);
+/// Builds ExecutionContext from TableCache for optimizer.
+pub fn build_execution_context(cache: &TableCache, table_name: &str) -> ExecutionContext {
+    let mut ctx = ExecutionContext::new();
+    register_table_context(cache, &mut ctx, table_name);
+    ctx
+}
+
+/// Builds an ExecutionContext for every table referenced by the plan.
+///
+/// This keeps the optimizer context small for single-table queries while still
+/// exposing row counts and indexes for all join inputs.
+pub fn build_execution_context_for_plan(
+    cache: &TableCache,
+    table_name: &str,
+    plan: &LogicalPlan,
+) -> ExecutionContext {
+    let mut ctx = ExecutionContext::new();
+    let mut tables = plan.collect_tables();
+    if !tables.iter().any(|table| table == table_name) {
+        tables.push(table_name.into());
+    }
+
+    for table in tables {
+        register_table_context(cache, &mut ctx, &table);
     }
 
     ctx
@@ -255,7 +299,7 @@ fn execute_plan_internal(
     _debug: bool,
 ) -> ExecutionResult<Vec<Rc<Row>>> {
     // Build execution context with index info
-    let ctx = build_execution_context(cache, table_name);
+    let ctx = build_execution_context_for_plan(cache, table_name, &plan);
 
     // Use unified QueryPlanner for complete optimization pipeline
     let planner = QueryPlanner::new(ctx);
@@ -274,13 +318,9 @@ fn execute_plan_internal(
 
 /// Compiles a logical plan to a physical plan.
 /// The physical plan can be cached and reused for repeated executions.
-pub fn compile_plan(
-    cache: &TableCache,
-    table_name: &str,
-    plan: LogicalPlan,
-) -> PhysicalPlan {
+pub fn compile_plan(cache: &TableCache, table_name: &str, plan: LogicalPlan) -> PhysicalPlan {
     // Build execution context with index info
-    let ctx = build_execution_context(cache, table_name);
+    let ctx = build_execution_context_for_plan(cache, table_name, &plan);
 
     // Use unified QueryPlanner for complete optimization pipeline
     let planner = QueryPlanner::new(ctx);
@@ -298,15 +338,11 @@ pub struct ExplainResult {
 /// Explains a logical plan by showing the optimization stages.
 ///
 /// Returns the logical plan, optimized plan, and physical plan as strings.
-pub fn explain_plan(
-    cache: &TableCache,
-    table_name: &str,
-    plan: LogicalPlan,
-) -> ExplainResult {
+pub fn explain_plan(cache: &TableCache, table_name: &str, plan: LogicalPlan) -> ExplainResult {
     let logical_plan = alloc::format!("{:#?}", plan);
 
     // Build execution context with index info
-    let ctx = build_execution_context(cache, table_name);
+    let ctx = build_execution_context_for_plan(cache, table_name, &plan);
 
     // Use unified QueryPlanner
     let planner = QueryPlanner::new(ctx);
@@ -343,14 +379,117 @@ pub fn execute_physical_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cynos_core::schema::TableBuilder;
+    use cynos_core::{DataType, Row, Value};
     use cynos_query::ast::Expr as AstExpr;
     use cynos_query::optimizer::{IndexSelection, OptimizerPass};
+
+    fn create_join_test_cache() -> TableCache {
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let orders = TableBuilder::new("orders")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("user_id", DataType::Int64)
+            .unwrap()
+            .add_column("amount", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_user_id", &["user_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(users).unwrap();
+        cache.create_table(orders).unwrap();
+
+        {
+            let users_store = cache.get_table_mut("users").unwrap();
+            for id in 0..32 {
+                users_store
+                    .insert(Row::new(
+                        id as u64,
+                        alloc::vec![
+                            Value::Int64(id),
+                            Value::String(alloc::format!("user_{}", id)),
+                        ],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        {
+            let orders_store = cache.get_table_mut("orders").unwrap();
+            for id in 0..4096 {
+                orders_store
+                    .insert(Row::new(
+                        (10_000 + id) as u64,
+                        alloc::vec![
+                            Value::Int64(id),
+                            Value::Int64((id % 32) as i64),
+                            Value::Int64((id % 100) as i64),
+                        ],
+                    ))
+                    .unwrap();
+            }
+        }
+
+        cache
+    }
 
     #[test]
     fn test_table_cache_data_source() {
         // Basic test to ensure the module compiles
         let cache = TableCache::new();
         let _data_source = TableCacheDataSource::new(&cache);
+    }
+
+    #[test]
+    fn test_build_execution_context_for_plan_includes_join_tables() {
+        let cache = create_join_test_cache();
+        let plan = LogicalPlan::inner_join(
+            LogicalPlan::scan("users"),
+            LogicalPlan::scan("orders"),
+            AstExpr::eq(
+                AstExpr::column("users", "id", 0),
+                AstExpr::column("orders", "user_id", 1),
+            ),
+        );
+
+        let ctx = build_execution_context_for_plan(&cache, "users", &plan);
+
+        assert_eq!(ctx.row_count("users"), 32);
+        assert_eq!(ctx.row_count("orders"), 4096);
+        assert!(ctx.find_index("orders", &["user_id"]).is_some());
+    }
+
+    #[test]
+    fn test_compile_plan_keeps_hash_join_for_in_memory_fk_join() {
+        let cache = create_join_test_cache();
+        let plan = LogicalPlan::inner_join(
+            LogicalPlan::scan("users"),
+            LogicalPlan::scan("orders"),
+            AstExpr::eq(
+                AstExpr::column("users", "id", 0),
+                AstExpr::column("orders", "user_id", 1),
+            ),
+        );
+
+        let physical = compile_plan(&cache, "users", plan);
+
+        assert!(matches!(physical, PhysicalPlan::HashJoin { .. }));
     }
 
     #[test]
@@ -447,18 +586,21 @@ mod tests {
 
     #[test]
     fn test_end_to_end_with_real_table() {
-        use cynos_core::schema::TableBuilder;
-        use cynos_core::{DataType, Row, Value};
-
         // Create a table with indexes
         let table = TableBuilder::new("tasks")
             .unwrap()
-            .add_column("id", DataType::Int64).unwrap()
-            .add_column("status", DataType::String).unwrap()
-            .add_column("priority", DataType::String).unwrap()
-            .add_primary_key(&["id"], false).unwrap()
-            .add_index("idx_status", &["status"], false).unwrap()
-            .add_index("idx_priority", &["priority"], false).unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("status", DataType::String)
+            .unwrap()
+            .add_column("priority", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_status", &["status"], false)
+            .unwrap()
+            .add_index("idx_priority", &["priority"], false)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -471,14 +613,16 @@ mod tests {
         for i in 0..1000 {
             let status = if i % 5 == 0 { "todo" } else { "done" };
             let priority = if i % 4 == 0 { "high" } else { "low" };
-            store.insert(Row::new(
-                i as u64,
-                alloc::vec![
-                    Value::Int64(i),
-                    Value::String(status.into()),
-                    Value::String(priority.into()),
-                ],
-            )).unwrap();
+            store
+                .insert(Row::new(
+                    i as u64,
+                    alloc::vec![
+                        Value::Int64(i),
+                        Value::String(status.into()),
+                        Value::String(priority.into()),
+                    ],
+                ))
+                .unwrap();
         }
 
         // Create a filter plan: WHERE status = 'todo'
@@ -496,7 +640,10 @@ mod tests {
 
         // Build context and use QueryPlanner
         let ctx = build_execution_context(&cache, "tasks");
-        println!("Context indexes: {:?}", ctx.get_stats("tasks").map(|s| &s.indexes));
+        println!(
+            "Context indexes: {:?}",
+            ctx.get_stats("tasks").map(|s| &s.indexes)
+        );
 
         let planner = QueryPlanner::new(ctx);
         let optimized = planner.optimize_logical(plan.clone());
@@ -531,11 +678,16 @@ mod tests {
         // Create a table with indexes
         let table = TableBuilder::new("tasks")
             .unwrap()
-            .add_column("id", DataType::Int64).unwrap()
-            .add_column("status", DataType::String).unwrap()
-            .add_column("priority", DataType::String).unwrap()
-            .add_primary_key(&["id"], false).unwrap()
-            .add_index("idx_status", &["status"], false).unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("status", DataType::String)
+            .unwrap()
+            .add_column("priority", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_status", &["status"], false)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -547,14 +699,16 @@ mod tests {
         let store = cache.get_table_mut("tasks").unwrap();
         for i in 0..1000 {
             let status = if i % 5 == 0 { "todo" } else { "done" };
-            store.insert(Row::new(
-                i as u64,
-                alloc::vec![
-                    Value::Int64(i),
-                    Value::String(status.into()),
-                    Value::String("low".into()),
-                ],
-            )).unwrap();
+            store
+                .insert(Row::new(
+                    i as u64,
+                    alloc::vec![
+                        Value::Int64(i),
+                        Value::String(status.into()),
+                        Value::String("low".into()),
+                    ],
+                ))
+                .unwrap();
         }
 
         // Create a filter + limit plan: WHERE status = 'todo' LIMIT 10
@@ -602,10 +756,14 @@ mod tests {
         // Create a table with an index on 'score'
         let table = TableBuilder::new("scores")
             .unwrap()
-            .add_column("id", DataType::Int64).unwrap()
-            .add_column("score", DataType::Int64).unwrap()
-            .add_primary_key(&["id"], false).unwrap()
-            .add_index("idx_score", &["score"], false).unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("score", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_score", &["score"], false)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -616,13 +774,12 @@ mod tests {
         // Insert rows with scores: 10, 20, 30, 40, 50
         let store = cache.get_table_mut("scores").unwrap();
         for i in 1..=5 {
-            store.insert(Row::new(
-                i as u64,
-                alloc::vec![
-                    Value::Int64(i),
-                    Value::Int64(i * 10),
-                ],
-            )).unwrap();
+            store
+                .insert(Row::new(
+                    i as u64,
+                    alloc::vec![Value::Int64(i), Value::Int64(i * 10),],
+                ))
+                .unwrap();
         }
 
         // Create a plan: SELECT * FROM scores ORDER BY score DESC LIMIT 3
@@ -641,18 +798,27 @@ mod tests {
 
         // Build context and use QueryPlanner
         let ctx = build_execution_context(&cache, "scores");
-        println!("Context indexes: {:?}", ctx.get_stats("scores").map(|s| &s.indexes));
+        println!(
+            "Context indexes: {:?}",
+            ctx.get_stats("scores").map(|s| &s.indexes)
+        );
 
         let planner = QueryPlanner::new(ctx.clone());
         let physical = planner.plan(plan.clone());
         println!("Physical plan (single line): {:?}", physical);
         println!("Physical plan (pretty): {:#?}", physical);
-        println!("Context indexes: {:?}", ctx.get_stats("scores").map(|s| &s.indexes));
+        println!(
+            "Context indexes: {:?}",
+            ctx.get_stats("scores").map(|s| &s.indexes)
+        );
 
         // Verify the physical plan is an IndexScan with reverse=true
         match &physical {
             PhysicalPlan::IndexScan { reverse, limit, .. } => {
-                assert!(reverse, "IndexScan should have reverse=true for DESC ordering");
+                assert!(
+                    reverse,
+                    "IndexScan should have reverse=true for DESC ordering"
+                );
                 assert_eq!(*limit, Some(3), "IndexScan should have limit=3");
             }
             _ => panic!("Expected IndexScan, got {:?}", physical),
@@ -660,12 +826,27 @@ mod tests {
 
         // Execute and verify results are in DESC order
         let result = execute_plan(&cache, "scores", plan).unwrap();
-        println!("Result: {:?}", result.iter().map(|r| r.get(1)).collect::<Vec<_>>());
+        println!(
+            "Result: {:?}",
+            result.iter().map(|r| r.get(1)).collect::<Vec<_>>()
+        );
 
         assert_eq!(result.len(), 3, "Expected 3 rows");
-        assert_eq!(result[0].get(1), Some(&Value::Int64(50)), "First row should have score=50");
-        assert_eq!(result[1].get(1), Some(&Value::Int64(40)), "Second row should have score=40");
-        assert_eq!(result[2].get(1), Some(&Value::Int64(30)), "Third row should have score=30");
+        assert_eq!(
+            result[0].get(1),
+            Some(&Value::Int64(50)),
+            "First row should have score=50"
+        );
+        assert_eq!(
+            result[1].get(1),
+            Some(&Value::Int64(40)),
+            "Second row should have score=40"
+        );
+        assert_eq!(
+            result[2].get(1),
+            Some(&Value::Int64(30)),
+            "Third row should have score=30"
+        );
     }
 
     #[test]
@@ -678,10 +859,14 @@ mod tests {
         // Create a table with an index on 'score'
         let table = TableBuilder::new("scores_asc")
             .unwrap()
-            .add_column("id", DataType::Int64).unwrap()
-            .add_column("score", DataType::Int64).unwrap()
-            .add_primary_key(&["id"], false).unwrap()
-            .add_index("idx_score", &["score"], false).unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("score", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_score", &["score"], false)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -692,13 +877,12 @@ mod tests {
         // Insert rows with scores: 10, 20, 30, 40, 50
         let store = cache.get_table_mut("scores_asc").unwrap();
         for i in 1..=5 {
-            store.insert(Row::new(
-                i as u64,
-                alloc::vec![
-                    Value::Int64(i),
-                    Value::Int64(i * 10),
-                ],
-            )).unwrap();
+            store
+                .insert(Row::new(
+                    i as u64,
+                    alloc::vec![Value::Int64(i), Value::Int64(i * 10),],
+                ))
+                .unwrap();
         }
 
         // Create a plan: SELECT * FROM scores_asc ORDER BY score ASC LIMIT 3
@@ -717,7 +901,10 @@ mod tests {
 
         // Build context and use QueryPlanner
         let ctx = build_execution_context(&cache, "scores_asc");
-        println!("Context indexes: {:?}", ctx.get_stats("scores_asc").map(|s| &s.indexes));
+        println!(
+            "Context indexes: {:?}",
+            ctx.get_stats("scores_asc").map(|s| &s.indexes)
+        );
 
         let planner = QueryPlanner::new(ctx);
         let physical = planner.plan(plan.clone());
@@ -727,7 +914,10 @@ mod tests {
         // Verify the physical plan is an IndexScan with reverse=false
         match &physical {
             PhysicalPlan::IndexScan { reverse, limit, .. } => {
-                assert!(!reverse, "IndexScan should have reverse=false for ASC ordering");
+                assert!(
+                    !reverse,
+                    "IndexScan should have reverse=false for ASC ordering"
+                );
                 assert_eq!(*limit, Some(3), "IndexScan should have limit=3");
             }
             _ => panic!("Expected IndexScan, got {:?}", physical),
@@ -735,12 +925,213 @@ mod tests {
 
         // Execute and verify results are in ASC order
         let result = execute_plan(&cache, "scores_asc", plan).unwrap();
-        println!("Result: {:?}", result.iter().map(|r| r.get(1)).collect::<Vec<_>>());
+        println!(
+            "Result: {:?}",
+            result.iter().map(|r| r.get(1)).collect::<Vec<_>>()
+        );
 
         assert_eq!(result.len(), 3, "Expected 3 rows");
-        assert_eq!(result[0].get(1), Some(&Value::Int64(10)), "First row should have score=10");
-        assert_eq!(result[1].get(1), Some(&Value::Int64(20)), "Second row should have score=20");
-        assert_eq!(result[2].get(1), Some(&Value::Int64(30)), "Third row should have score=30");
+        assert_eq!(
+            result[0].get(1),
+            Some(&Value::Int64(10)),
+            "First row should have score=10"
+        );
+        assert_eq!(
+            result[1].get(1),
+            Some(&Value::Int64(20)),
+            "Second row should have score=20"
+        );
+        assert_eq!(
+            result[2].get(1),
+            Some(&Value::Int64(30)),
+            "Third row should have score=30"
+        );
+    }
+
+    /// Test: composite index used for ORDER BY must preserve real tuple order.
+    /// Bug: storage currently serializes multi-column keys as debug strings,
+    /// so lexicographic string order can diverge from `(col1, col2, ...)` order.
+    #[test]
+    fn test_order_by_composite_index_preserves_tuple_order() {
+        use cynos_core::schema::TableBuilder;
+        use cynos_core::{DataType, Row, Value};
+        use cynos_query::ast::SortOrder;
+        use cynos_query::planner::PhysicalPlan;
+
+        let table = TableBuilder::new("composite_scores")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("a", DataType::Int64)
+            .unwrap()
+            .add_column("b", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_a_b", &["a", "b"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(table).unwrap();
+
+        let store = cache.get_table_mut("composite_scores").unwrap();
+        for (id, a, b) in [(1_i64, 1_i64, 2_i64), (2, 1, 10), (3, 2, 1)] {
+            store
+                .insert(Row::new(
+                    id as u64,
+                    alloc::vec![Value::Int64(id), Value::Int64(a), Value::Int64(b),],
+                ))
+                .unwrap();
+        }
+
+        let plan = LogicalPlan::Sort {
+            input: Box::new(LogicalPlan::Scan {
+                table: "composite_scores".into(),
+            }),
+            order_by: alloc::vec![
+                (AstExpr::column("composite_scores", "a", 1), SortOrder::Asc,),
+                (AstExpr::column("composite_scores", "b", 2), SortOrder::Asc,),
+            ],
+        };
+
+        let ctx = build_execution_context(&cache, "composite_scores");
+        let planner = QueryPlanner::new(ctx);
+        let physical = planner.plan(plan.clone());
+        println!("Physical plan: {:?}", physical);
+
+        match &physical {
+            PhysicalPlan::IndexScan { index, reverse, .. } => {
+                assert_eq!(index, "idx_a_b", "ORDER BY should use the composite index");
+                assert!(
+                    !reverse,
+                    "Ascending ORDER BY should use the natural composite-index order"
+                );
+            }
+            _ => panic!(
+                "Expected composite ORDER BY to optimize to IndexScan, got {:?}",
+                physical
+            ),
+        }
+
+        let result = execute_plan(&cache, "composite_scores", plan).unwrap();
+        let actual: Vec<(i64, i64, i64)> = result
+            .iter()
+            .map(|row| {
+                let id = match row.get(0) {
+                    Some(&Value::Int64(v)) => v,
+                    other => panic!("Expected Int64 id, got {:?}", other),
+                };
+                let a = match row.get(1) {
+                    Some(&Value::Int64(v)) => v,
+                    other => panic!("Expected Int64 a, got {:?}", other),
+                };
+                let b = match row.get(2) {
+                    Some(&Value::Int64(v)) => v,
+                    other => panic!("Expected Int64 b, got {:?}", other),
+                };
+                (id, a, b)
+            })
+            .collect();
+
+        println!("Composite ORDER BY result: {:?}", actual);
+
+        assert_eq!(
+            actual,
+            alloc::vec![(1, 1, 2), (2, 1, 10), (3, 2, 1)],
+            "Composite index scan must follow tuple order `(a, b)`, not serialized-string order",
+        );
+    }
+
+    #[test]
+    fn test_order_by_composite_index_limit_offset_preserves_pagination_order() {
+        use cynos_core::schema::TableBuilder;
+        use cynos_core::{DataType, Row, Value};
+        use cynos_query::ast::SortOrder;
+        use cynos_query::planner::PhysicalPlan;
+
+        let table = TableBuilder::new("composite_scores_paged")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("a", DataType::Int64)
+            .unwrap()
+            .add_column("b", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_a_b", &["a", "b"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(table).unwrap();
+
+        let store = cache.get_table_mut("composite_scores_paged").unwrap();
+        for (id, a, b) in [(1_i64, 1_i64, 2_i64), (2, 1, 10), (3, 2, 1)] {
+            store
+                .insert(Row::new(
+                    id as u64,
+                    alloc::vec![Value::Int64(id), Value::Int64(a), Value::Int64(b),],
+                ))
+                .unwrap();
+        }
+
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::Scan {
+                    table: "composite_scores_paged".into(),
+                }),
+                order_by: alloc::vec![
+                    (
+                        AstExpr::column("composite_scores_paged", "a", 1),
+                        SortOrder::Asc,
+                    ),
+                    (
+                        AstExpr::column("composite_scores_paged", "b", 2),
+                        SortOrder::Asc,
+                    ),
+                ],
+            }),
+            limit: 1,
+            offset: 1,
+        };
+
+        let ctx = build_execution_context(&cache, "composite_scores_paged");
+        let planner = QueryPlanner::new(ctx);
+        let physical = planner.plan(plan.clone());
+        println!("Paged physical plan: {:?}", physical);
+
+        match &physical {
+            PhysicalPlan::IndexScan {
+                index,
+                limit,
+                offset,
+                reverse,
+                ..
+            } => {
+                assert_eq!(index, "idx_a_b");
+                assert_eq!(*limit, Some(1));
+                assert_eq!(*offset, Some(1));
+                assert!(!reverse);
+            }
+            _ => panic!(
+                "Expected paged composite ORDER BY to optimize to IndexScan, got {:?}",
+                physical
+            ),
+        }
+
+        let result = execute_plan(&cache, "composite_scores_paged", plan).unwrap();
+        assert_eq!(
+            result.len(),
+            1,
+            "LIMIT 1 OFFSET 1 should return exactly one row"
+        );
+        assert_eq!(result[0].get(0), Some(&Value::Int64(2)));
+        assert_eq!(result[0].get(1), Some(&Value::Int64(1)));
+        assert_eq!(result[0].get(2), Some(&Value::Int64(10)));
     }
 
     /// Test that index lookup via execute_plan is much faster than full table scan.
@@ -754,9 +1145,12 @@ mod tests {
         // Create a table with primary key index
         let table = TableBuilder::new("perf_test")
             .unwrap()
-            .add_column("id", DataType::Int64).unwrap()
-            .add_column("value", DataType::Int64).unwrap()
-            .add_primary_key(&["id"], false).unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("value", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -767,13 +1161,12 @@ mod tests {
         let row_count = 100_000;
         let store = cache.get_table_mut("perf_test").unwrap();
         for i in 0..row_count {
-            store.insert(Row::new(
-                i as u64,
-                alloc::vec![
-                    Value::Int64(i as i64),
-                    Value::Int64(i as i64 * 10),
-                ],
-            )).unwrap();
+            store
+                .insert(Row::new(
+                    i as u64,
+                    alloc::vec![Value::Int64(i as i64), Value::Int64(i as i64 * 10),],
+                ))
+                .unwrap();
         }
 
         let iterations = 100;
@@ -840,11 +1233,16 @@ mod tests {
         // Create a table with price index but no name index
         let table = TableBuilder::new("stocks")
             .unwrap()
-            .add_column("id", DataType::Int64).unwrap()
-            .add_column("name", DataType::String).unwrap()
-            .add_column("price", DataType::Float64).unwrap()
-            .add_primary_key(&["id"], false).unwrap()
-            .add_index("idx_price", &["price"], false).unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_column("price", DataType::Float64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_price", &["price"], false)
+            .unwrap()
             .build()
             .unwrap();
 
@@ -855,20 +1253,22 @@ mod tests {
         let store = cache.get_table_mut("stocks").unwrap();
         let test_data = [
             (1, "Apple Inc", 150.0),
-            (2, "E82 Group", 200.0),  // Target row
+            (2, "E82 Group", 200.0), // Target row
             (3, "Microsoft", 300.0),
             (4, "Google", 250.0),
             (5, "Amazon", 180.0),
         ];
         for (id, name, price) in test_data {
-            store.insert(Row::new(
-                id as u64,
-                alloc::vec![
-                    Value::Int64(id),
-                    Value::String(name.into()),
-                    Value::Float64(price),
-                ],
-            )).unwrap();
+            store
+                .insert(Row::new(
+                    id as u64,
+                    alloc::vec![
+                        Value::Int64(id),
+                        Value::String(name.into()),
+                        Value::Float64(price),
+                    ],
+                ))
+                .unwrap();
         }
 
         // Query: WHERE name = 'E82 Group' ORDER BY price DESC LIMIT 100
@@ -907,7 +1307,11 @@ mod tests {
         }
 
         // Should return exactly 1 row with name = 'E82 Group'
-        assert_eq!(result.len(), 1, "Expected exactly 1 row with name='E82 Group'");
+        assert_eq!(
+            result.len(),
+            1,
+            "Expected exactly 1 row with name='E82 Group'"
+        );
         assert_eq!(
             result[0].get(1),
             Some(&Value::String("E82 Group".into())),

@@ -4,17 +4,22 @@
 //! database queries.
 
 use crate::binary_protocol::{SchemaLayout, SchemaLayoutCache};
-use crate::convert::{js_array_to_rows, js_to_value, joined_rows_to_js_array, projected_rows_to_js_array, rows_to_js_array};
+use crate::convert::{
+    joined_rows_to_js_array, js_array_to_rows, js_to_value, projected_rows_to_js_array,
+    rows_to_js_array,
+};
+use crate::dataflow_compiler::compile_to_dataflow;
 use crate::expr::{Expr, ExprInner};
 use crate::query_engine::{compile_plan, execute_physical_plan, execute_plan, explain_plan};
-use crate::dataflow_compiler::compile_to_dataflow;
-use crate::reactive_bridge::{JsChangesStream, JsIvmObservableQuery, JsObservableQuery, QueryRegistry, ReQueryObservable};
-use cynos_storage::TableCache;
+use crate::reactive_bridge::{
+    JsChangesStream, JsIvmObservableQuery, JsObservableQuery, QueryRegistry, ReQueryObservable,
+};
 use crate::JsSortOrder;
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use cynos_core::schema::Table;
 use cynos_core::{reserve_row_ids, DataType, Row, Value};
 use cynos_incremental::Delta;
@@ -22,7 +27,7 @@ use cynos_query::ast::{AggregateFunc, SortOrder};
 use cynos_query::plan_cache::{compute_plan_fingerprint, PlanCache};
 use cynos_query::planner::LogicalPlan;
 use cynos_reactive::{ObservableQuery, TableId};
-use core::cell::RefCell;
+use cynos_storage::TableCache;
 use wasm_bindgen::prelude::*;
 
 /// SELECT query builder.
@@ -47,7 +52,7 @@ pub struct SelectBuilder {
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 struct JoinClause {
-    table: String,       // The actual table name (for schema lookup)
+    table: String,         // The actual table name (for schema lookup)
     alias: Option<String>, // Optional alias (for column reference)
     condition: Expr,
     join_type: JoinType,
@@ -138,13 +143,12 @@ impl SelectBuilder {
             }
 
             // Try direct table lookup (for cases without alias)
-            if let Some(info) = self.cache
-                .borrow()
-                .get_table(table_part)
-                .and_then(|store| {
-                    store.schema().get_column(col_part).map(|c| (table_part.to_string(), c.index(), c.data_type()))
-                })
-            {
+            if let Some(info) = self.cache.borrow().get_table(table_part).and_then(|store| {
+                store
+                    .schema()
+                    .get_column(col_part)
+                    .map(|c| (table_part.to_string(), c.index(), c.data_type()))
+            }) {
                 return Some(info);
             }
         }
@@ -160,11 +164,15 @@ impl SelectBuilder {
 
         // Try all joined tables
         for join in &self.joins {
-            if let Some(info) = self.cache
+            if let Some(info) = self
+                .cache
                 .borrow()
                 .get_table(&join.table)
                 .and_then(|store| {
-                    store.schema().get_column(col_name).map(|c| (join.reference_name().to_string(), c.index(), c.data_type()))
+                    store
+                        .schema()
+                        .get_column(col_name)
+                        .map(|c| (join.reference_name().to_string(), c.index(), c.data_type()))
                 })
             {
                 return Some(info);
@@ -248,7 +256,9 @@ impl SelectBuilder {
                 table_offsets.insert(ref_name.clone(), current_offset);
 
                 // Convert join condition to AST with correct offsets
-                let get_col_info = |name: &str| self.get_column_info_for_join_with_offsets_alias(name, join, &table_offsets);
+                let get_col_info = |name: &str| {
+                    self.get_column_info_for_join_with_offsets_alias(name, join, &table_offsets)
+                };
                 let ast_condition = join.condition.to_ast_with_table(&get_col_info);
 
                 plan = match join.join_type {
@@ -278,9 +288,7 @@ impl SelectBuilder {
                 plan = match join.join_type {
                     JoinType::Inner => LogicalPlan::inner_join(plan, right_plan, ast_condition),
                     JoinType::Left => LogicalPlan::left_join(plan, right_plan, ast_condition),
-                    JoinType::Right => {
-                        LogicalPlan::left_join(right_plan, plan, ast_condition)
-                    }
+                    JoinType::Right => LogicalPlan::left_join(right_plan, plan, ast_condition),
                 };
             }
         }
@@ -289,9 +297,7 @@ impl SelectBuilder {
         if let Some(ref predicate) = self.where_clause {
             // Use get_column_info_any_table to get the correct table-relative index
             // The optimizer may push this filter to a single table, so we need table-relative indices
-            let get_col_info = |name: &str| {
-                self.get_column_info_any_table(name)
-            };
+            let get_col_info = |name: &str| self.get_column_info_any_table(name);
             let ast_predicate = predicate.to_ast_with_table(&get_col_info);
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
@@ -301,50 +307,68 @@ impl SelectBuilder {
 
         // Add aggregate if GROUP BY or aggregate functions are specified
         if !self.group_by_cols.is_empty() || !self.aggregates.is_empty() {
-            let group_by_exprs: Vec<_> = self.group_by_cols.iter().filter_map(|col| {
-                self.get_column_info_for_projection(col).map(|(tbl, idx, _)| {
-                    let col_name = if let Some(dot_pos) = col.find('.') {
-                        &col[dot_pos + 1..]
-                    } else {
-                        col.as_str()
-                    };
-                    cynos_query::ast::Expr::column(&tbl, col_name, idx)
+            let group_by_exprs: Vec<_> = self
+                .group_by_cols
+                .iter()
+                .filter_map(|col| {
+                    self.get_column_info_for_projection(col)
+                        .map(|(tbl, idx, _)| {
+                            let col_name = if let Some(dot_pos) = col.find('.') {
+                                &col[dot_pos + 1..]
+                            } else {
+                                col.as_str()
+                            };
+                            cynos_query::ast::Expr::column(&tbl, col_name, idx)
+                        })
                 })
-            }).collect();
+                .collect();
 
-            let agg_exprs: Vec<_> = self.aggregates.iter().filter_map(|(func, col_opt)| {
-                if let Some(col) = col_opt {
-                    self.get_column_info_for_projection(col).map(|(tbl, idx, _)| {
-                        let col_name = if let Some(dot_pos) = col.find('.') {
-                            &col[dot_pos + 1..]
-                        } else {
-                            col.as_str()
-                        };
-                        (*func, cynos_query::ast::Expr::column(&tbl, col_name, idx))
-                    })
-                } else {
-                    // COUNT(*) - use a dummy column expression
-                    Some((*func, cynos_query::ast::Expr::literal(cynos_core::Value::Int64(1))))
-                }
-            }).collect();
+            let agg_exprs: Vec<_> = self
+                .aggregates
+                .iter()
+                .filter_map(|(func, col_opt)| {
+                    if let Some(col) = col_opt {
+                        self.get_column_info_for_projection(col)
+                            .map(|(tbl, idx, _)| {
+                                let col_name = if let Some(dot_pos) = col.find('.') {
+                                    &col[dot_pos + 1..]
+                                } else {
+                                    col.as_str()
+                                };
+                                (*func, cynos_query::ast::Expr::column(&tbl, col_name, idx))
+                            })
+                    } else {
+                        // COUNT(*) - use a dummy column expression
+                        Some((
+                            *func,
+                            cynos_query::ast::Expr::literal(cynos_core::Value::Int64(1)),
+                        ))
+                    }
+                })
+                .collect();
 
             plan = LogicalPlan::aggregate(plan, group_by_exprs, agg_exprs);
         }
 
         // Add ORDER BY if specified
         if !self.order_by.is_empty() {
-            let order_exprs: Vec<_> = self.order_by.iter().filter_map(|(col, order)| {
-                // Use get_column_info_for_projection to correctly handle JOIN queries
-                self.get_column_info_for_projection(col).map(|(tbl, idx, _)| {
-                    // Extract just the column name if qualified
-                    let col_name = if let Some(dot_pos) = col.find('.') {
-                        &col[dot_pos + 1..]
-                    } else {
-                        col.as_str()
-                    };
-                    (cynos_query::ast::Expr::column(&tbl, col_name, idx), *order)
+            let order_exprs: Vec<_> = self
+                .order_by
+                .iter()
+                .filter_map(|(col, order)| {
+                    // Use get_column_info_for_projection to correctly handle JOIN queries
+                    self.get_column_info_for_projection(col)
+                        .map(|(tbl, idx, _)| {
+                            // Extract just the column name if qualified
+                            let col_name = if let Some(dot_pos) = col.find('.') {
+                                &col[dot_pos + 1..]
+                            } else {
+                                col.as_str()
+                            };
+                            (cynos_query::ast::Expr::column(&tbl, col_name, idx), *order)
+                        })
                 })
-            }).collect();
+                .collect();
             plan = LogicalPlan::Sort {
                 input: Box::new(plan),
                 order_by: order_exprs,
@@ -367,15 +391,16 @@ impl SelectBuilder {
                 .iter()
                 .filter_map(|col| {
                     // Use get_column_info_for_projection to get the correct index for JOIN queries
-                    self.get_column_info_for_projection(col).map(|(tbl, idx, _)| {
-                        // Extract just the column name if qualified
-                        let col_name = if let Some(dot_pos) = col.find('.') {
-                            &col[dot_pos + 1..]
-                        } else {
-                            col.as_str()
-                        };
-                        cynos_query::ast::Expr::column(&tbl, col_name, idx)
-                    })
+                    self.get_column_info_for_projection(col)
+                        .map(|(tbl, idx, _)| {
+                            // Extract just the column name if qualified
+                            let col_name = if let Some(dot_pos) = col.find('.') {
+                                &col[dot_pos + 1..]
+                            } else {
+                                col.as_str()
+                            };
+                            cynos_query::ast::Expr::column(&tbl, col_name, idx)
+                        })
                 })
                 .collect();
 
@@ -420,7 +445,10 @@ impl SelectBuilder {
                 let schema = store.schema();
                 let ref_name = join.reference_name();
                 // Match against both the reference name (alias) and the actual table name
-                if target_table.is_none() || target_table == Some(ref_name) || target_table == Some(join.table.as_str()) {
+                if target_table.is_none()
+                    || target_table == Some(ref_name)
+                    || target_table == Some(join.table.as_str())
+                {
                     if let Some(col) = schema.get_column(target_col) {
                         // Return table-relative index, not absolute offset
                         return Some((ref_name.to_string(), col.index(), col.data_type()));
@@ -433,7 +461,10 @@ impl SelectBuilder {
     }
 
     /// Creates a SchemaLayout for projected columns, supporting multi-table column references.
-    fn create_projection_layout(&self, column_names: &[String]) -> crate::binary_protocol::SchemaLayout {
+    fn create_projection_layout(
+        &self,
+        column_names: &[String],
+    ) -> crate::binary_protocol::SchemaLayout {
         use crate::binary_protocol::{BinaryDataType, ColumnLayout, SchemaLayout};
 
         // Extract just the column part from qualified names and count occurrences
@@ -496,20 +527,23 @@ impl SelectBuilder {
     /// - The right column (id) should come from the join table
     ///
     /// Also supports qualified column names like `col('orders.year')`.
-    fn get_column_info_for_join(&self, col_name: &str, join_table: &str) -> Option<(String, usize, DataType)> {
+    fn get_column_info_for_join(
+        &self,
+        col_name: &str,
+        join_table: &str,
+    ) -> Option<(String, usize, DataType)> {
         // Check if column name is qualified (contains '.')
         if let Some(dot_pos) = col_name.find('.') {
             let table_part = &col_name[..dot_pos];
             let col_part = &col_name[dot_pos + 1..];
 
             // Try to find the table and column
-            if let Some(info) = self.cache
-                .borrow()
-                .get_table(table_part)
-                .and_then(|store| {
-                    store.schema().get_column(col_part).map(|c| (table_part.to_string(), c.index(), c.data_type()))
-                })
-            {
+            if let Some(info) = self.cache.borrow().get_table(table_part).and_then(|store| {
+                store
+                    .schema()
+                    .get_column(col_part)
+                    .map(|c| (table_part.to_string(), c.index(), c.data_type()))
+            }) {
                 return Some(info);
             }
 
@@ -526,13 +560,12 @@ impl SelectBuilder {
         }
 
         // First try the join table (for the right side of JOIN conditions)
-        if let Some(info) = self.cache
-            .borrow()
-            .get_table(join_table)
-            .and_then(|store| {
-                store.schema().get_column(col_name).map(|c| (join_table.to_string(), c.index(), c.data_type()))
-            })
-        {
+        if let Some(info) = self.cache.borrow().get_table(join_table).and_then(|store| {
+            store
+                .schema()
+                .get_column(col_name)
+                .map(|c| (join_table.to_string(), c.index(), c.data_type()))
+        }) {
             return Some(info);
         }
 
@@ -581,7 +614,11 @@ impl SelectBuilder {
                     if let Some(schema) = self.get_schema() {
                         if let Some(col) = schema.get_column(col_part) {
                             let offset = table_offsets.get(main_table).copied().unwrap_or(0);
-                            return Some((table_part.to_string(), offset + col.index(), col.data_type()));
+                            return Some((
+                                table_part.to_string(),
+                                offset + col.index(),
+                                col.data_type(),
+                            ));
                         }
                     }
                 }
@@ -594,7 +631,11 @@ impl SelectBuilder {
                     if let Some(store) = self.cache.borrow().get_table(&join.table) {
                         if let Some(col) = store.schema().get_column(col_part) {
                             let offset = table_offsets.get(ref_name).copied().unwrap_or(0);
-                            return Some((table_part.to_string(), offset + col.index(), col.data_type()));
+                            return Some((
+                                table_part.to_string(),
+                                offset + col.index(),
+                                col.data_type(),
+                            ));
                         }
                     }
                 }
@@ -735,56 +776,64 @@ impl SelectBuilder {
     /// Adds a COUNT(column) aggregate.
     #[wasm_bindgen(js_name = countCol)]
     pub fn count_col(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::Count, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::Count, Some(column.to_string())));
         self
     }
 
     /// Adds a SUM(column) aggregate.
     #[wasm_bindgen(js_name = sum)]
     pub fn sum(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::Sum, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::Sum, Some(column.to_string())));
         self
     }
 
     /// Adds an AVG(column) aggregate.
     #[wasm_bindgen(js_name = avg)]
     pub fn avg(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::Avg, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::Avg, Some(column.to_string())));
         self
     }
 
     /// Adds a MIN(column) aggregate.
     #[wasm_bindgen(js_name = min)]
     pub fn min(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::Min, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::Min, Some(column.to_string())));
         self
     }
 
     /// Adds a MAX(column) aggregate.
     #[wasm_bindgen(js_name = max)]
     pub fn max(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::Max, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::Max, Some(column.to_string())));
         self
     }
 
     /// Adds a STDDEV(column) aggregate.
     #[wasm_bindgen(js_name = stddev)]
     pub fn stddev(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::StdDev, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::StdDev, Some(column.to_string())));
         self
     }
 
     /// Adds a GEOMEAN(column) aggregate.
     #[wasm_bindgen(js_name = geomean)]
     pub fn geomean(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::GeoMean, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::GeoMean, Some(column.to_string())));
         self
     }
 
     /// Adds a DISTINCT(column) aggregate (returns count of distinct values).
     #[wasm_bindgen(js_name = distinct)]
     pub fn distinct(mut self, column: &str) -> Self {
-        self.aggregates.push((AggregateFunc::Distinct, Some(column.to_string())));
+        self.aggregates
+            .push((AggregateFunc::Distinct, Some(column.to_string())));
         self
     }
 
@@ -937,7 +986,9 @@ impl SelectBuilder {
             .borrow()
             .get(table_name)
             .copied()
-            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table ID not found: {}", table_name)))?;
+            .ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table ID not found: {}", table_name))
+            })?;
 
         let cache_ref = self.cache.clone();
         let cache = cache_ref.borrow();
@@ -977,11 +1028,7 @@ impl SelectBuilder {
         drop(cache); // Release borrow
 
         // Create re-query observable with cached physical plan
-        let observable = ReQueryObservable::new(
-            physical_plan,
-            cache_ref.clone(),
-            initial_rows,
-        );
+        let observable = ReQueryObservable::new(physical_plan, cache_ref.clone(), initial_rows);
         let observable_rc = Rc::new(RefCell::new(observable));
 
         // Register with query registry
@@ -993,9 +1040,19 @@ impl SelectBuilder {
         if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
             // For aggregate queries, build column names from group_by + aggregates
             let aggregate_cols = self.build_aggregate_column_names();
-            Ok(JsObservableQuery::new_with_aggregates(observable_rc, schema, aggregate_cols, binary_layout))
+            Ok(JsObservableQuery::new_with_aggregates(
+                observable_rc,
+                schema,
+                aggregate_cols,
+                binary_layout,
+            ))
         } else if let Some(cols) = self.parse_columns() {
-            Ok(JsObservableQuery::new_with_projection(observable_rc, schema, cols, binary_layout))
+            Ok(JsObservableQuery::new_with_projection(
+                observable_rc,
+                schema,
+                cols,
+                binary_layout,
+            ))
         } else {
             Ok(JsObservableQuery::new(observable_rc, schema, binary_layout))
         }
@@ -1079,11 +1136,25 @@ impl SelectBuilder {
         // Return with appropriate column info
         if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
             let aggregate_cols = self.build_aggregate_column_names();
-            Ok(JsIvmObservableQuery::new_with_aggregates(observable_rc, schema, aggregate_cols, binary_layout))
+            Ok(JsIvmObservableQuery::new_with_aggregates(
+                observable_rc,
+                schema,
+                aggregate_cols,
+                binary_layout,
+            ))
         } else if let Some(cols) = self.parse_columns() {
-            Ok(JsIvmObservableQuery::new_with_projection(observable_rc, schema, cols, binary_layout))
+            Ok(JsIvmObservableQuery::new_with_projection(
+                observable_rc,
+                schema,
+                cols,
+                binary_layout,
+            ))
         } else {
-            Ok(JsIvmObservableQuery::new(observable_rc, schema, binary_layout))
+            Ok(JsIvmObservableQuery::new(
+                observable_rc,
+                schema,
+                binary_layout,
+            ))
         }
     }
 
@@ -1145,9 +1216,8 @@ impl SelectBuilder {
         // Get or compile physical plan (cached)
         let rows = {
             let mut plan_cache = self.plan_cache.borrow_mut();
-            let physical_plan = plan_cache.get_or_insert_with(fingerprint, || {
-                compile_plan(&cache, table_name, plan)
-            });
+            let physical_plan = plan_cache
+                .get_or_insert_with(fingerprint, || compile_plan(&cache, table_name, plan));
 
             // Execute the cached physical plan
             execute_physical_plan(&cache, physical_plan)
@@ -1221,9 +1291,9 @@ impl InsertBuilder {
             .ok_or_else(|| JsValue::from_str("No values specified"))?;
 
         let mut cache = self.cache.borrow_mut();
-        let store = cache
-            .get_table_mut(&self.table_name)
-            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+        let store = cache.get_table_mut(&self.table_name).ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+        })?;
 
         let schema = store.schema().clone();
 
@@ -1331,9 +1401,9 @@ impl UpdateBuilder {
     pub async fn exec(&self) -> Result<JsValue, JsValue> {
         let schema = {
             let cache = self.cache.borrow();
-            let store = cache
-                .get_table(&self.table_name)
-                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+            let store = cache.get_table(&self.table_name).ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+            })?;
             store.schema().clone()
         };
 
@@ -1341,9 +1411,9 @@ impl UpdateBuilder {
         let rows_to_update: Vec<Row> = if let Some(ref predicate) = self.where_clause {
             // Build logical plan: SELECT * FROM table WHERE predicate
             let get_col_info = |name: &str| -> Option<(String, usize, DataType)> {
-                schema.get_column(name).map(|col| {
-                    (self.table_name.clone(), col.index(), col.data_type())
-                })
+                schema
+                    .get_column(name)
+                    .map(|col| (self.table_name.clone(), col.index(), col.data_type()))
             };
             let ast_predicate = predicate.to_ast_with_table(&get_col_info);
 
@@ -1364,16 +1434,16 @@ impl UpdateBuilder {
         } else {
             // No WHERE clause - update all rows (full scan is necessary)
             let cache = self.cache.borrow();
-            let store = cache
-                .get_table(&self.table_name)
-                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+            let store = cache.get_table(&self.table_name).ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+            })?;
             store.scan().map(|rc| (*rc).clone()).collect()
         };
 
         let mut cache = self.cache.borrow_mut();
-        let store = cache
-            .get_table_mut(&self.table_name)
-            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+        let store = cache.get_table_mut(&self.table_name).ok_or_else(|| {
+            JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+        })?;
 
         let mut deltas = Vec::new();
         let mut update_count = 0;
@@ -1468,9 +1538,9 @@ impl DeleteBuilder {
     pub async fn exec(&self) -> Result<JsValue, JsValue> {
         let schema = {
             let cache = self.cache.borrow();
-            let store = cache
-                .get_table(&self.table_name)
-                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+            let store = cache.get_table(&self.table_name).ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+            })?;
             store.schema().clone()
         };
 
@@ -1479,13 +1549,14 @@ impl DeleteBuilder {
             // Collect all rows for IVM notification before clearing
             let (delete_count, deltas, deleted_ids) = {
                 let cache = self.cache.borrow();
-                let store = cache
-                    .get_table(&self.table_name)
-                    .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+                let store = cache.get_table(&self.table_name).ok_or_else(|| {
+                    JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+                })?;
 
                 let rows: Vec<_> = store.scan().collect();
                 let count = rows.len();
-                let deltas: Vec<Delta<Row>> = rows.iter().map(|r| Delta::delete((**r).clone())).collect();
+                let deltas: Vec<Delta<Row>> =
+                    rows.iter().map(|r| Delta::delete((**r).clone())).collect();
                 let ids: hashbrown::HashSet<_> = rows.iter().map(|r| r.id()).collect();
                 (count, deltas, ids)
             };
@@ -1493,17 +1564,19 @@ impl DeleteBuilder {
             // Clear the table (O(1) operation)
             {
                 let mut cache = self.cache.borrow_mut();
-                let store = cache
-                    .get_table_mut(&self.table_name)
-                    .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+                let store = cache.get_table_mut(&self.table_name).ok_or_else(|| {
+                    JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+                })?;
                 store.clear();
             }
 
             // Notify query registry
             if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
-                self.query_registry
-                    .borrow_mut()
-                    .on_table_change_ivm(table_id, deltas, &deleted_ids);
+                self.query_registry.borrow_mut().on_table_change_ivm(
+                    table_id,
+                    deltas,
+                    &deleted_ids,
+                );
             }
 
             return Ok(JsValue::from_f64(delete_count as f64));
@@ -1514,9 +1587,9 @@ impl DeleteBuilder {
             let predicate = self.where_clause.as_ref().unwrap();
             // Build logical plan: SELECT * FROM table WHERE predicate
             let get_col_info = |name: &str| -> Option<(String, usize, DataType)> {
-                schema.get_column(name).map(|col| {
-                    (self.table_name.clone(), col.index(), col.data_type())
-                })
+                schema
+                    .get_column(name)
+                    .map(|col| (self.table_name.clone(), col.index(), col.data_type()))
             };
             let ast_predicate = predicate.to_ast_with_table(&get_col_info);
 
@@ -1550,9 +1623,9 @@ impl DeleteBuilder {
         // Use batch delete for better performance
         {
             let mut cache = self.cache.borrow_mut();
-            let store = cache
-                .get_table_mut(&self.table_name)
-                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name)))?;
+            let store = cache.get_table_mut(&self.table_name).ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Table not found: {}", self.table_name))
+            })?;
             store.delete_batch(&row_ids);
         }
 
@@ -1592,9 +1665,7 @@ fn parse_json_text(s: &str) -> Option<cynos_jsonb::JsonbValue> {
     }
     if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
         let inner = &s[1..s.len() - 1];
-        return Some(cynos_jsonb::JsonbValue::String(
-            unescape_json(inner),
-        ));
+        return Some(cynos_jsonb::JsonbValue::String(unescape_json(inner)));
     }
     if s.starts_with('{') {
         return parse_json_object(s);
@@ -1744,8 +1815,12 @@ fn compare_jsonb_with_value(jsonb: &cynos_jsonb::JsonbValue, value: &Value) -> b
     match (jsonb, value) {
         (cynos_jsonb::JsonbValue::Null, Value::Null) => true,
         (cynos_jsonb::JsonbValue::Bool(a), Value::Boolean(b)) => a == b,
-        (cynos_jsonb::JsonbValue::Number(a), Value::Int32(b)) => (*a - *b as f64).abs() < f64::EPSILON,
-        (cynos_jsonb::JsonbValue::Number(a), Value::Int64(b)) => (*a - *b as f64).abs() < f64::EPSILON,
+        (cynos_jsonb::JsonbValue::Number(a), Value::Int32(b)) => {
+            (*a - *b as f64).abs() < f64::EPSILON
+        }
+        (cynos_jsonb::JsonbValue::Number(a), Value::Int64(b)) => {
+            (*a - *b as f64).abs() < f64::EPSILON
+        }
         (cynos_jsonb::JsonbValue::Number(a), Value::Float64(b)) => (*a - *b).abs() < f64::EPSILON,
         (cynos_jsonb::JsonbValue::String(a), Value::String(b)) => a == b,
         _ => false,
@@ -1756,7 +1831,13 @@ fn compare_jsonb_with_value(jsonb: &cynos_jsonb::JsonbValue, value: &Value) -> b
 fn jsonb_value_to_string(v: &cynos_jsonb::JsonbValue) -> String {
     match v {
         cynos_jsonb::JsonbValue::Null => String::from("null"),
-        cynos_jsonb::JsonbValue::Bool(b) => if *b { String::from("true") } else { String::from("false") },
+        cynos_jsonb::JsonbValue::Bool(b) => {
+            if *b {
+                String::from("true")
+            } else {
+                String::from("false")
+            }
+        }
         cynos_jsonb::JsonbValue::Number(n) => {
             use alloc::format;
             format!("{}", n)
@@ -1964,7 +2045,11 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 _ => true,
             }
         }
-        ExprInner::JsonbEq { column, path, value } => {
+        ExprInner::JsonbEq {
+            column,
+            path,
+            value,
+        } => {
             let col = schema.get_column(&column.name());
             if col.is_none() {
                 return false;
@@ -2001,7 +2086,11 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
                 false
             }
         }
-        ExprInner::JsonbContains { column, path, value } => {
+        ExprInner::JsonbContains {
+            column,
+            path,
+            value,
+        } => {
             let col = schema.get_column(&column.name());
             if col.is_none() {
                 return false;

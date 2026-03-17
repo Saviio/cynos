@@ -3,12 +3,15 @@
 use crate::ast::{BinaryOp, Expr};
 use crate::context::{ExecutionContext, IndexInfo};
 use crate::optimizer::OptimizerPass;
-use crate::planner::LogicalPlan;
+use crate::planner::{IndexBounds, LogicalPlan};
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use cynos_core::Value;
+use cynos_index::contains_trigram_pairs;
+use cynos_index::KeyRange;
+use cynos_jsonb::JsonPath;
 
 /// Index selection optimization.
 ///
@@ -189,7 +192,11 @@ struct GinPredicateInfo {
     column_index: usize,
     path: String,
     value: Option<Value>,
+    prefilter_pairs: Option<Vec<(String, Value)>>,
     query_type: String,
+    original_predicate: Expr,
+    requires_post_filter: bool,
+    supports_multi_scan: bool,
 }
 
 impl IndexSelection {
@@ -311,6 +318,11 @@ impl IndexSelection {
             return Some(gin_plan);
         }
 
+        // Then, try composite tuple bounds for multi-column B-Tree indexes
+        if let Some(composite_plan) = self.try_use_composite_btree_with_and(table, predicate, ctx) {
+            return Some(composite_plan);
+        }
+
         // Try to handle AND compound predicates for B-Tree indexes
         if let Some(btree_plan) = self.try_use_btree_with_and(table, predicate, ctx) {
             return Some(btree_plan);
@@ -344,10 +356,12 @@ impl IndexSelection {
             return Some(LogicalPlan::IndexScan {
                 table: table.into(),
                 index: index.name.clone(),
-                range_start,
-                range_end,
-                include_start,
-                include_end,
+                bounds: IndexBounds::from_scalar_range(
+                    range_start,
+                    range_end,
+                    include_start,
+                    include_end,
+                ),
             });
         }
 
@@ -365,7 +379,9 @@ impl IndexSelection {
             // Check if expr is a column reference
             if let Expr::Column(col) = expr.as_ref() {
                 // Check if low and high are literals
-                if let (Expr::Literal(low_val), Expr::Literal(high_val)) = (low.as_ref(), high.as_ref()) {
+                if let (Expr::Literal(low_val), Expr::Literal(high_val)) =
+                    (low.as_ref(), high.as_ref())
+                {
                     // Find an index for this column
                     if let Some(index) = ctx.find_index(table, &[col.column.as_str()]) {
                         // Skip GIN indexes
@@ -376,16 +392,101 @@ impl IndexSelection {
                         return Some(LogicalPlan::IndexScan {
                             table: table.into(),
                             index: index.name.clone(),
-                            range_start: Some(low_val.clone()),
-                            range_end: Some(high_val.clone()),
-                            include_start: true,
-                            include_end: true,
+                            bounds: IndexBounds::Scalar(KeyRange::bound(
+                                low_val.clone(),
+                                high_val.clone(),
+                                false,
+                                false,
+                            )),
                         });
                     }
                 }
             }
         }
         None
+    }
+
+    /// Attempts to use a composite B-Tree index for AND predicates.
+    ///
+    /// This is intentionally conservative: it only generates tuple bounds when
+    /// every indexed column is constrained, with equality on the leading
+    /// columns and equality or a fully-bounded range on the final column.
+    fn try_use_composite_btree_with_and(
+        &self,
+        table: &str,
+        predicate: &Expr,
+        ctx: &ExecutionContext,
+    ) -> Option<LogicalPlan> {
+        if !matches!(
+            predicate,
+            Expr::BinaryOp {
+                op: BinaryOp::And,
+                ..
+            }
+        ) {
+            return None;
+        }
+
+        let predicates = self.flatten_and_predicates(predicate);
+        let analyzed: Vec<(Expr, PredicateInfo)> = predicates
+            .iter()
+            .filter_map(|expr| {
+                let info = self.analyze_predicate(expr)?;
+                if info.table == table && info.value.is_some() {
+                    Some((expr.clone(), info))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let stats = ctx.get_stats(table)?;
+        let mut best: Option<(usize, bool, LogicalPlan, Vec<Expr>)> = None;
+
+        for index in &stats.indexes {
+            if index.is_gin() || index.columns.len() <= 1 {
+                continue;
+            }
+
+            let Some((bounds, used_predicates, is_point_lookup)) =
+                self.build_composite_bounds_for_index(&index.columns, &analyzed)
+            else {
+                continue;
+            };
+
+            let index_plan = LogicalPlan::IndexScan {
+                table: table.into(),
+                index: index.name.clone(),
+                bounds,
+            };
+
+            let mut remaining = Vec::new();
+            for expr in &predicates {
+                if !used_predicates.iter().any(|used| Self::expr_eq(used, expr)) {
+                    remaining.push(expr.clone());
+                }
+            }
+
+            let candidate = (
+                used_predicates.len(),
+                is_point_lookup,
+                self.wrap_with_filter_if_needed(index_plan, remaining),
+                used_predicates,
+            );
+
+            let replace = match &best {
+                None => true,
+                Some((best_used, best_point, _, _)) => {
+                    candidate.0 > *best_used || (candidate.0 == *best_used && candidate.1 && !*best_point)
+                }
+            };
+
+            if replace {
+                best = Some(candidate);
+            }
+        }
+
+        best.map(|(_, _, plan, _)| plan)
     }
 
     /// Attempts to use a B-Tree index for AND compound predicates.
@@ -398,12 +499,19 @@ impl IndexSelection {
         ctx: &ExecutionContext,
     ) -> Option<LogicalPlan> {
         // Only handle AND compound predicates
-        if !matches!(predicate, Expr::BinaryOp { op: BinaryOp::And, .. }) {
+        if !matches!(
+            predicate,
+            Expr::BinaryOp {
+                op: BinaryOp::And,
+                ..
+            }
+        ) {
             return None;
         }
 
         // Extract all sub-predicates from AND
-        let (indexable, remaining) = self.extract_btree_and_remaining_predicates(predicate, table, ctx);
+        let (indexable, remaining) =
+            self.extract_btree_and_remaining_predicates(predicate, table, ctx);
 
         if indexable.is_empty() {
             return None;
@@ -448,10 +556,12 @@ impl IndexSelection {
         let index_plan = LogicalPlan::IndexScan {
             table: table.into(),
             index: best_index.name.clone(),
-            range_start,
-            range_end,
-            include_start,
-            include_end,
+            bounds: IndexBounds::from_scalar_range(
+                range_start,
+                range_end,
+                include_start,
+                include_end,
+            ),
         };
 
         // Collect remaining predicates:
@@ -461,7 +571,8 @@ impl IndexSelection {
         let mut all_remaining: Vec<Expr> = remaining;
         for (pred, info, _) in &indexable {
             // Skip predicates that were used in the merged range
-            if info.column == best_column && used_predicates.iter().any(|p| Self::expr_eq(p, pred)) {
+            if info.column == best_column && used_predicates.iter().any(|p| Self::expr_eq(p, pred))
+            {
                 continue;
             }
             all_remaining.push(pred.clone());
@@ -503,10 +614,11 @@ impl IndexSelection {
         let mut by_column: HashMap<String, Vec<(Expr, PredicateInfo, IndexInfo)>> = HashMap::new();
         for (pred, info, index) in indexable {
             if info.is_range && info.value.is_some() {
-                by_column
-                    .entry(info.column.clone())
-                    .or_default()
-                    .push((pred.clone(), info.clone(), index.clone()));
+                by_column.entry(info.column.clone()).or_default().push((
+                    pred.clone(),
+                    info.clone(),
+                    index.clone(),
+                ));
             }
         }
 
@@ -594,7 +706,13 @@ impl IndexSelection {
     ) -> (Vec<(Expr, PredicateInfo, IndexInfo)>, Vec<Expr>) {
         let mut indexable = Vec::new();
         let mut remaining = Vec::new();
-        self.extract_btree_and_remaining_recursive(predicate, table, ctx, &mut indexable, &mut remaining);
+        self.extract_btree_and_remaining_recursive(
+            predicate,
+            table,
+            ctx,
+            &mut indexable,
+            &mut remaining,
+        );
         (indexable, remaining)
     }
 
@@ -630,6 +748,107 @@ impl IndexSelection {
                 remaining.push(predicate.clone());
             }
         }
+    }
+
+    fn flatten_and_predicates(&self, predicate: &Expr) -> Vec<Expr> {
+        let mut predicates = Vec::new();
+        Self::flatten_and_predicates_into(predicate, &mut predicates);
+        predicates
+    }
+
+    fn flatten_and_predicates_into(predicate: &Expr, predicates: &mut Vec<Expr>) {
+        match predicate {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOp::And,
+                right,
+            } => {
+                Self::flatten_and_predicates_into(left, predicates);
+                Self::flatten_and_predicates_into(right, predicates);
+            }
+            _ => predicates.push(predicate.clone()),
+        }
+    }
+
+    fn build_composite_bounds_for_index(
+        &self,
+        index_columns: &[String],
+        analyzed: &[(Expr, PredicateInfo)],
+    ) -> Option<(IndexBounds, Vec<Expr>, bool)> {
+        let mut prefix_values = Vec::with_capacity(index_columns.len());
+        let mut used_predicates = Vec::new();
+
+        for column in &index_columns[..index_columns.len().saturating_sub(1)] {
+            let (expr, info) = analyzed.iter().find(|(_, info)| {
+                info.column == *column && info.is_point_lookup && info.value.is_some()
+            })?;
+            prefix_values.push(info.value.clone()?);
+            used_predicates.push(expr.clone());
+        }
+
+        let last_column = index_columns.last()?;
+        if let Some((expr, info)) = analyzed.iter().find(|(_, info)| {
+            info.column == *last_column && info.is_point_lookup && info.value.is_some()
+        }) {
+            let mut values = prefix_values;
+            values.push(info.value.clone()?);
+            used_predicates.push(expr.clone());
+            return Some((
+                IndexBounds::Composite(KeyRange::only(values)),
+                used_predicates,
+                true,
+            ));
+        }
+
+        let mut range = MergedRange::new();
+        let mut range_predicates = Vec::new();
+        for (expr, info) in analyzed.iter().filter(|(_, info)| {
+            info.column == *last_column && info.is_range && info.value.is_some()
+        }) {
+            let value = info.value.clone()?;
+            match info.op {
+                BinaryOp::Gt => {
+                    range.update_lower(value, false);
+                    range_predicates.push(expr.clone());
+                }
+                BinaryOp::Ge => {
+                    range.update_lower(value, true);
+                    range_predicates.push(expr.clone());
+                }
+                BinaryOp::Lt => {
+                    range.update_upper(value, false);
+                    range_predicates.push(expr.clone());
+                }
+                BinaryOp::Le => {
+                    range.update_upper(value, true);
+                    range_predicates.push(expr.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let lower = range.lower_bound?;
+        let upper = range.upper_bound?;
+        let lower_inclusive = range.lower_inclusive;
+        let upper_inclusive = range.upper_inclusive;
+
+        let mut lower_values = prefix_values.clone();
+        lower_values.push(lower);
+        let mut upper_values = prefix_values;
+        upper_values.push(upper);
+
+        used_predicates.extend(range_predicates);
+
+        Some((
+            IndexBounds::Composite(KeyRange::bound(
+                lower_values,
+                upper_values,
+                !lower_inclusive,
+                !upper_inclusive,
+            )),
+            used_predicates,
+            false,
+        ))
     }
 
     /// Selects the best B-Tree predicate for index usage.
@@ -699,7 +918,6 @@ impl IndexSelection {
         }
     }
 
-
     /// Attempts to use a GIN index for JSONB function queries.
     /// Supports both single predicates and AND combinations of multiple predicates.
     ///
@@ -712,58 +930,69 @@ impl IndexSelection {
         ctx: &ExecutionContext,
     ) -> Option<LogicalPlan> {
         // Extract GIN predicates and collect remaining non-GIN predicates
-        let (gin_predicates, remaining_predicates) = self.extract_gin_and_remaining_predicates(predicate, table, ctx);
+        let (gin_predicates, mut remaining_predicates) =
+            self.extract_gin_and_remaining_predicates(predicate, table, ctx);
 
         if gin_predicates.is_empty() {
             return None;
         }
 
-        // Build the GIN plan
-        let gin_plan = if gin_predicates.len() > 1 {
-            // Multiple GIN predicates - try to use GinIndexScanMulti for better performance
-            let first_index = gin_predicates[0].index.clone();
-            let first_column = gin_predicates[0].column.clone();
-            let all_same_index = gin_predicates.iter().all(|p| p.index == first_index && p.column == first_column);
-            let all_have_values = gin_predicates.iter().all(|p| p.value.is_some());
+        let mut used_predicates = alloc::vec![false; gin_predicates.len()];
 
-            if all_same_index && all_have_values {
-                let pairs: Vec<(String, Value)> = gin_predicates
-                    .into_iter()
-                    .filter_map(|p| p.value.map(|v| (p.path, v)))
-                    .collect();
+        let gin_plan = if let Some(group) = self.choose_best_multi_gin_group(&gin_predicates) {
+            for &idx in &group {
+                used_predicates[idx] = true;
+            }
 
-                LogicalPlan::GinIndexScanMulti {
-                    table: table.into(),
-                    index: first_index,
-                    column: first_column,
-                    pairs,
-                }
-            } else {
-                // Fall back to single predicate if multi-predicate optimization fails
-                let info = gin_predicates.into_iter().next()?;
-                LogicalPlan::GinIndexScan {
-                    table: table.into(),
-                    index: info.index,
-                    column: info.column,
-                    column_index: info.column_index,
-                    path: info.path,
-                    value: info.value,
-                    query_type: info.query_type,
-                }
+            let first = &gin_predicates[group[0]];
+            let pairs = group
+                .iter()
+                .map(|&idx| {
+                    let info = &gin_predicates[idx];
+                    (
+                        info.path.clone(),
+                        info.value
+                            .clone()
+                            .expect("multi GIN scan only uses predicates with literal values"),
+                    )
+                })
+                .collect();
+
+            LogicalPlan::GinIndexScanMulti {
+                table: table.into(),
+                index: first.index.clone(),
+                column: first.column.clone(),
+                pairs,
             }
         } else {
-            // Single GIN predicate
-            let info = gin_predicates.into_iter().next()?;
-            LogicalPlan::GinIndexScan {
-                table: table.into(),
-                index: info.index,
-                column: info.column,
-                column_index: info.column_index,
-                path: info.path,
-                value: info.value,
-                query_type: info.query_type,
+            let best_idx = self.choose_best_single_gin_predicate(&gin_predicates)?;
+            used_predicates[best_idx] = true;
+            let info = &gin_predicates[best_idx];
+            if let Some(pairs) = &info.prefilter_pairs {
+                LogicalPlan::GinIndexScanMulti {
+                    table: table.into(),
+                    index: info.index.clone(),
+                    column: info.column.clone(),
+                    pairs: pairs.clone(),
+                }
+            } else {
+                LogicalPlan::GinIndexScan {
+                    table: table.into(),
+                    index: info.index.clone(),
+                    column: info.column.clone(),
+                    column_index: info.column_index,
+                    path: info.path.clone(),
+                    value: info.value.clone(),
+                    query_type: info.query_type.clone(),
+                }
             }
         };
+
+        for (idx, info) in gin_predicates.into_iter().enumerate() {
+            if !used_predicates[idx] || info.requires_post_filter {
+                remaining_predicates.push(info.original_predicate);
+            }
+        }
 
         // If there are remaining predicates, wrap the GIN plan with a Filter
         if remaining_predicates.is_empty() {
@@ -782,6 +1011,64 @@ impl IndexSelection {
         }
     }
 
+    fn choose_best_multi_gin_group(
+        &self,
+        gin_predicates: &[GinPredicateInfo],
+    ) -> Option<Vec<usize>> {
+        let mut best_group = Vec::new();
+
+        for (idx, candidate) in gin_predicates.iter().enumerate() {
+            if !candidate.supports_multi_scan {
+                continue;
+            }
+
+            let mut group = alloc::vec![idx];
+            for (other_idx, other) in gin_predicates.iter().enumerate().skip(idx + 1) {
+                if other.supports_multi_scan
+                    && other.index == candidate.index
+                    && other.column == candidate.column
+                {
+                    group.push(other_idx);
+                }
+            }
+
+            if group.len() > best_group.len() {
+                best_group = group;
+            }
+        }
+
+        if best_group.len() > 1 {
+            Some(best_group)
+        } else {
+            None
+        }
+    }
+
+    fn choose_best_single_gin_predicate(
+        &self,
+        gin_predicates: &[GinPredicateInfo],
+    ) -> Option<usize> {
+        gin_predicates
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, info)| Self::gin_single_predicate_rank(info))
+            .map(|(idx, _)| idx)
+    }
+
+    fn gin_single_predicate_rank(info: &GinPredicateInfo) -> u8 {
+        if info.query_type == "eq" && !info.requires_post_filter {
+            4
+        } else if info.prefilter_pairs.is_some() {
+            3
+        } else if info.query_type == "exists" && !info.requires_post_filter {
+            2
+        } else if info.query_type == "contains" {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Extracts GIN-indexable predicates and remaining non-GIN predicates from an expression.
     /// Returns (gin_predicates, remaining_predicates).
     fn extract_gin_and_remaining_predicates(
@@ -792,7 +1079,13 @@ impl IndexSelection {
     ) -> (Vec<GinPredicateInfo>, Vec<Expr>) {
         let mut gin_predicates = Vec::new();
         let mut remaining_predicates = Vec::new();
-        self.extract_gin_and_remaining_recursive(predicate, table, ctx, &mut gin_predicates, &mut remaining_predicates);
+        self.extract_gin_and_remaining_recursive(
+            predicate,
+            table,
+            ctx,
+            &mut gin_predicates,
+            &mut remaining_predicates,
+        );
         (gin_predicates, remaining_predicates)
     }
 
@@ -811,12 +1104,24 @@ impl IndexSelection {
                 op: BinaryOp::And,
                 right,
             } => {
-                self.extract_gin_and_remaining_recursive(left, table, ctx, gin_result, remaining_result);
-                self.extract_gin_and_remaining_recursive(right, table, ctx, gin_result, remaining_result);
+                self.extract_gin_and_remaining_recursive(
+                    left,
+                    table,
+                    ctx,
+                    gin_result,
+                    remaining_result,
+                );
+                self.extract_gin_and_remaining_recursive(
+                    right,
+                    table,
+                    ctx,
+                    gin_result,
+                    remaining_result,
+                );
             }
             // Handle JSONB function calls - these can potentially use GIN index
             Expr::Function { name, args } => {
-                if let Some(info) = self.analyze_gin_function(name, args, table, ctx) {
+                if let Some(info) = self.analyze_gin_function(predicate, name, args, table, ctx) {
                     gin_result.push(info);
                 } else {
                     // Function that doesn't match GIN pattern - keep as remaining
@@ -833,6 +1138,7 @@ impl IndexSelection {
     /// Analyzes a JSONB function call to extract GIN predicate information.
     fn analyze_gin_function(
         &self,
+        predicate: &Expr,
         name: &str,
         args: &[Expr],
         table: &str,
@@ -845,32 +1151,56 @@ impl IndexSelection {
                     let column_name = &col.column;
                     let column_index = col.index;
                     if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path = self.extract_string_literal(&args[1])?;
-                        let value = self.extract_literal(&args[2]);
+                        let path =
+                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                        let value = self.extract_literal(&args[2])?;
                         return Some(GinPredicateInfo {
                             index: index.name.clone(),
                             column: column_name.clone(),
                             column_index,
                             path,
-                            value,
+                            value: Some(value),
+                            prefilter_pairs: None,
                             query_type: "eq".into(),
+                            original_predicate: predicate.clone(),
+                            requires_post_filter: false,
+                            supports_multi_scan: true,
                         });
                     }
                 }
             }
-            "JSONB_CONTAINS" if args.len() >= 2 => {
+            "JSONB_CONTAINS" if args.len() >= 3 => {
                 if let Expr::Column(col) = &args[0] {
                     let column_name = &col.column;
                     let column_index = col.index;
                     if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path = self.extract_string_literal(&args[1])?;
+                        let path =
+                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
+                        let prefilter_pairs =
+                            self.extract_string_literal(&args[2]).and_then(|needle| {
+                                let pairs = contains_trigram_pairs(&path, &needle);
+                                if pairs.is_empty() {
+                                    None
+                                } else {
+                                    Some(
+                                        pairs
+                                            .into_iter()
+                                            .map(|(key, gram)| (key, Value::String(gram)))
+                                            .collect(),
+                                    )
+                                }
+                            });
                         return Some(GinPredicateInfo {
                             index: index.name.clone(),
                             column: column_name.clone(),
                             column_index,
                             path,
                             value: None,
+                            prefilter_pairs,
                             query_type: "contains".into(),
+                            original_predicate: predicate.clone(),
+                            requires_post_filter: true,
+                            supports_multi_scan: false,
                         });
                     }
                 }
@@ -880,14 +1210,19 @@ impl IndexSelection {
                     let column_name = &col.column;
                     let column_index = col.index;
                     if let Some(index) = ctx.find_gin_index(table, column_name) {
-                        let path = self.extract_string_literal(&args[1])?;
+                        let path =
+                            self.normalize_gin_path(&self.extract_string_literal(&args[1])?)?;
                         return Some(GinPredicateInfo {
                             index: index.name.clone(),
                             column: column_name.clone(),
                             column_index,
                             path,
                             value: None,
+                            prefilter_pairs: None,
                             query_type: "exists".into(),
+                            original_predicate: predicate.clone(),
+                            requires_post_filter: false,
+                            supports_multi_scan: false,
                         });
                     }
                 }
@@ -895,6 +1230,71 @@ impl IndexSelection {
             _ => {}
         }
         None
+    }
+
+    fn normalize_gin_path(&self, path: &str) -> Option<String> {
+        let parsed = JsonPath::parse(path).ok()?;
+        let mut segments = Vec::new();
+        if !Self::collect_gin_path_segments(&parsed, &mut segments) || segments.is_empty() {
+            return None;
+        }
+        Some(Self::encode_gin_path_segments(&segments))
+    }
+
+    fn collect_gin_path_segments(path: &JsonPath, segments: &mut Vec<String>) -> bool {
+        match path {
+            JsonPath::Root => true,
+            JsonPath::Field(parent, field) => {
+                if !Self::collect_gin_path_segments(parent, segments) {
+                    return false;
+                }
+                segments.push(field.clone());
+                true
+            }
+            JsonPath::Index(parent, index) => {
+                if !Self::collect_gin_path_segments(parent, segments) {
+                    return false;
+                }
+                segments.push(index.to_string());
+                true
+            }
+            JsonPath::Slice(_, _, _)
+            | JsonPath::RecursiveField(_, _)
+            | JsonPath::Wildcard(_)
+            | JsonPath::Filter(_, _) => false,
+        }
+    }
+
+    fn encode_gin_path_segments(segments: &[String]) -> String {
+        let mut key = String::new();
+
+        for segment in segments {
+            if !key.is_empty() {
+                key.push('.');
+            }
+
+            if segment.is_empty() {
+                key.push('\\');
+                key.push('0');
+                continue;
+            }
+
+            for ch in segment.chars() {
+                match ch {
+                    '\\' => {
+                        key.push('\\');
+                        key.push('\\');
+                    }
+                    '.' => {
+                        key.push('\\');
+                        key.push('.');
+                    }
+                    _ => key.push(ch),
+                }
+            }
+        }
+
+        key
     }
 
     /// Extracts a string literal from an expression.
@@ -1015,6 +1415,26 @@ impl IndexSelection {
 mod tests {
     use super::*;
     use crate::context::{IndexInfo, TableStats};
+    use alloc::collections::BTreeSet;
+
+    fn test_contains_trigram_key(path: &str) -> String {
+        alloc::format!("__cynos_contains3__:{path}")
+    }
+
+    fn test_contains_trigrams(value: &str) -> Vec<String> {
+        let chars: Vec<char> = value.chars().collect();
+        if chars.len() < 3 {
+            return Vec::new();
+        }
+
+        let mut grams = BTreeSet::new();
+        for window in chars.windows(3) {
+            let gram: String = window.iter().collect();
+            grams.insert(gram);
+        }
+
+        grams.into_iter().collect()
+    }
 
     #[test]
     fn test_index_selection_basic() {
@@ -1038,11 +1458,7 @@ mod tests {
             TableStats {
                 row_count: 1000,
                 is_sorted: false,
-                indexes: alloc::vec![IndexInfo::new(
-                    "idx_id",
-                    alloc::vec!["id".into()],
-                    true
-                )],
+                indexes: alloc::vec![IndexInfo::new("idx_id", alloc::vec!["id".into()], true)],
             },
         );
 
@@ -1160,11 +1576,7 @@ mod tests {
             TableStats {
                 row_count: 1000,
                 is_sorted: false,
-                indexes: alloc::vec![IndexInfo::new(
-                    "idx_id",
-                    alloc::vec!["id".into()],
-                    true
-                )],
+                indexes: alloc::vec![IndexInfo::new("idx_id", alloc::vec!["id".into()], true)],
             },
         );
 
@@ -1331,7 +1743,7 @@ mod tests {
                     input
                 );
                 // Check that the predicate is the non-GIN predicate (status = 'published')
-                if let Expr::BinaryOp { left, op, right } = predicate {
+                if let Expr::BinaryOp { left, op, right: _ } = predicate {
                     assert_eq!(*op, BinaryOp::Eq);
                     if let Expr::Column(col) = left.as_ref() {
                         assert_eq!(col.column, "status");
@@ -1348,6 +1760,232 @@ mod tests {
                     "BUG CONFIRMED: Non-GIN predicate (status = 'published') was dropped! \
                      The query will return incorrect results - all rows matching \
                      tags.primary = 'tech' regardless of status."
+                );
+            }
+            other => {
+                panic!("Unexpected plan type: {:?}", other);
+            }
+        }
+    }
+
+    /// Nested JSON paths should use the GIN index once storage can index
+    /// nested path postings.
+    #[test]
+    fn test_nested_json_path_uses_gin_index() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "profiles",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new_gin(
+                    "idx_profile",
+                    alloc::vec!["profile".into()]
+                ),],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        let predicate = Expr::Function {
+            name: "JSONB_PATH_EQ".into(),
+            args: alloc::vec![
+                Expr::column("profiles", "profile", 1),
+                Expr::literal(Value::String("$.address.city".into())),
+                Expr::literal(Value::String("Beijing".into())),
+            ],
+        };
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("profiles"), predicate);
+        let optimized = pass.optimize(plan);
+
+        match &optimized {
+            LogicalPlan::GinIndexScan {
+                index,
+                path,
+                value,
+                query_type,
+                ..
+            } => {
+                assert_eq!(index, "idx_profile");
+                assert_eq!(path, "address.city");
+                assert_eq!(value, &Some(Value::String("Beijing".into())));
+                assert_eq!(query_type, "eq");
+            }
+            other => {
+                panic!("Unexpected plan type: {:?}", other);
+            }
+        }
+    }
+
+    /// Test case for bug: a handled GIN equality predicate must not drop a second
+    /// GIN predicate that currently cannot be merged into GinIndexScanMulti.
+    #[test]
+    fn test_mixed_gin_eq_and_exists_predicates_bug() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "articles",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new_gin("idx_tags", alloc::vec!["tags".into()]),],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        let predicate = Expr::and(
+            Expr::Function {
+                name: "JSONB_PATH_EQ".into(),
+                args: alloc::vec![
+                    Expr::column("articles", "tags", 1),
+                    Expr::literal(Value::String("$.primary".into())),
+                    Expr::literal(Value::String("tech".into())),
+                ],
+            },
+            Expr::Function {
+                name: "JSONB_EXISTS".into(),
+                args: alloc::vec![
+                    Expr::column("articles", "tags", 1),
+                    Expr::literal(Value::String("$.secondary".into())),
+                ],
+            },
+        );
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("articles"), predicate);
+        let optimized = pass.optimize(plan);
+
+        match &optimized {
+            LogicalPlan::Filter { input, predicate } => {
+                assert!(
+                    matches!(input.as_ref(), LogicalPlan::GinIndexScan { .. }),
+                    "Expected GinIndexScan under Filter, got {:?}",
+                    input
+                );
+
+                let predicate_debug = format!("{:?}", predicate).to_lowercase();
+                assert!(
+                    predicate_debug.contains("jsonb_exists"),
+                    "Expected remaining JSONB_EXISTS predicate to be preserved, got {:?}",
+                    predicate
+                );
+            }
+            LogicalPlan::GinIndexScanMulti { .. } => {
+                panic!("Expected JSONB_EXISTS to remain as a post-filter");
+            }
+            other => {
+                panic!("Unexpected plan type: {:?}", other);
+            }
+        }
+    }
+
+    #[test]
+    fn test_jsonb_contains_uses_gin_prefilter_and_preserves_post_filter() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "products",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new_gin(
+                    "idx_metadata",
+                    alloc::vec!["metadata".into()]
+                ),],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        let predicate = Expr::Function {
+            name: "JSONB_CONTAINS".into(),
+            args: alloc::vec![
+                Expr::column("products", "metadata", 1),
+                Expr::literal(Value::String("$.tags".into())),
+                Expr::literal(Value::String("portable".into())),
+            ],
+        };
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("products"), predicate);
+        let optimized = pass.optimize(plan);
+        let expected_pairs: Vec<(String, Value)> = test_contains_trigrams("portable")
+            .into_iter()
+            .map(|gram| (test_contains_trigram_key("tags"), Value::String(gram)))
+            .collect();
+
+        match &optimized {
+            LogicalPlan::Filter { input, predicate } => {
+                assert!(
+                    matches!(
+                        input.as_ref(),
+                        LogicalPlan::GinIndexScanMulti { pairs, .. }
+                            if pairs == &expected_pairs
+                    ),
+                    "Expected GIN prefilter for JSONB_CONTAINS, got {:?}",
+                    input
+                );
+
+                let predicate_debug = format!("{:?}", predicate).to_lowercase();
+                assert!(
+                    predicate_debug.contains("jsonb_contains"),
+                    "Expected JSONB_CONTAINS predicate to remain as post-filter, got {:?}",
+                    predicate
+                );
+            }
+            other => {
+                panic!("Unexpected plan type: {:?}", other);
+            }
+        }
+    }
+
+    #[test]
+    fn test_jsonb_contains_short_string_falls_back_to_path_prefilter() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "products",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new_gin(
+                    "idx_metadata",
+                    alloc::vec!["metadata".into()]
+                ),],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+
+        let predicate = Expr::Function {
+            name: "JSONB_CONTAINS".into(),
+            args: alloc::vec![
+                Expr::column("products", "metadata", 1),
+                Expr::literal(Value::String("$.tags".into())),
+                Expr::literal(Value::String("tv".into())),
+            ],
+        };
+
+        let plan = LogicalPlan::filter(LogicalPlan::scan("products"), predicate);
+        let optimized = pass.optimize(plan);
+
+        match &optimized {
+            LogicalPlan::Filter { input, predicate } => {
+                assert!(
+                    matches!(
+                        input.as_ref(),
+                        LogicalPlan::GinIndexScan {
+                            query_type,
+                            path,
+                            ..
+                        } if query_type == "contains" && path == "tags"
+                    ),
+                    "Expected short JSONB_CONTAINS to keep path prefilter, got {:?}",
+                    input
+                );
+
+                let predicate_debug = format!("{:?}", predicate).to_lowercase();
+                assert!(
+                    predicate_debug.contains("jsonb_contains"),
+                    "Expected JSONB_CONTAINS predicate to remain as post-filter, got {:?}",
+                    predicate
                 );
             }
             other => {
@@ -1409,7 +2047,10 @@ mod tests {
         // because analyze_predicate returns None for AND expressions
 
         match &optimized {
-            LogicalPlan::Filter { input, predicate: _ } => {
+            LogicalPlan::Filter {
+                input,
+                predicate: _,
+            } => {
                 match input.as_ref() {
                     LogicalPlan::IndexScan { index, .. } => {
                         // Good: we're using IndexScan
@@ -1550,25 +2191,25 @@ mod tests {
 
         // Should be IndexScan with merged range (10, 150) - no Filter
         match optimized {
-            LogicalPlan::IndexScan {
-                index,
-                range_start,
-                range_end,
-                include_start,
-                include_end,
-                ..
-            } => {
+            LogicalPlan::IndexScan { index, bounds, .. } => {
                 assert_eq!(index, "idx_price");
-                assert_eq!(range_start, Some(Value::Float64(10.0)));
-                assert_eq!(range_end, Some(Value::Float64(150.0)));
-                assert!(!include_start, "Lower bound should be exclusive (>)");
-                assert!(!include_end, "Upper bound should be exclusive (<)");
+                match bounds {
+                    IndexBounds::Scalar(KeyRange::Bound {
+                        lower,
+                        upper,
+                        lower_exclusive,
+                        upper_exclusive,
+                    }) => {
+                        assert_eq!(lower, Value::Float64(10.0));
+                        assert_eq!(upper, Value::Float64(150.0));
+                        assert!(lower_exclusive, "Lower bound should be exclusive (>)");
+                        assert!(upper_exclusive, "Upper bound should be exclusive (<)");
+                    }
+                    other => panic!("Expected scalar bound range, got {:?}", other),
+                }
             }
             other => {
-                panic!(
-                    "Expected IndexScan with merged range, got: {:?}",
-                    other
-                );
+                panic!("Expected IndexScan with merged range, got: {:?}", other);
             }
         }
     }
@@ -1608,17 +2249,19 @@ mod tests {
         let optimized = pass.optimize(plan);
 
         match optimized {
-            LogicalPlan::IndexScan {
-                range_start,
-                range_end,
-                include_start,
-                include_end,
-                ..
-            } => {
-                assert_eq!(range_start, Some(Value::Int64(100)));
-                assert_eq!(range_end, Some(Value::Int64(500)));
-                assert!(include_start, "Lower bound should be inclusive (>=)");
-                assert!(include_end, "Upper bound should be inclusive (<=)");
+            LogicalPlan::IndexScan { bounds, .. } => match bounds {
+                IndexBounds::Scalar(KeyRange::Bound {
+                    lower,
+                    upper,
+                    lower_exclusive,
+                    upper_exclusive,
+                }) => {
+                    assert_eq!(lower, Value::Int64(100));
+                    assert_eq!(upper, Value::Int64(500));
+                    assert!(!lower_exclusive, "Lower bound should be inclusive (>=)");
+                    assert!(!upper_exclusive, "Upper bound should be inclusive (<=)");
+                }
+                other => panic!("Expected bound range, got {:?}", other),
             }
             other => {
                 panic!("Expected IndexScan, got: {:?}", other);
@@ -1662,14 +2305,13 @@ mod tests {
         let optimized = pass.optimize(plan);
 
         match optimized {
-            LogicalPlan::IndexScan {
-                range_start,
-                include_start,
-                ..
-            } => {
-                assert_eq!(range_start, Some(Value::Int64(10)));
-                assert!(!include_start, "Should take exclusive bound (>)");
-            }
+            LogicalPlan::IndexScan { bounds, .. } => match bounds {
+                IndexBounds::Scalar(KeyRange::LowerBound { value, exclusive }) => {
+                    assert_eq!(value, Value::Int64(10));
+                    assert!(exclusive, "Should take exclusive bound (>)");
+                }
+                other => panic!("Expected lower bound, got {:?}", other),
+            },
             other => {
                 panic!("Expected IndexScan, got: {:?}", other);
             }
@@ -1712,9 +2354,12 @@ mod tests {
         let optimized = pass.optimize(plan);
 
         match optimized {
-            LogicalPlan::IndexScan { range_start, .. } => {
-                assert_eq!(range_start, Some(Value::Int64(10)));
-            }
+            LogicalPlan::IndexScan { bounds, .. } => match bounds {
+                IndexBounds::Scalar(KeyRange::LowerBound { value, .. }) => {
+                    assert_eq!(value, Value::Int64(10));
+                }
+                other => panic!("Expected lower bound, got {:?}", other),
+            },
             other => {
                 panic!("Expected IndexScan, got: {:?}", other);
             }
@@ -1757,9 +2402,12 @@ mod tests {
         let optimized = pass.optimize(plan);
 
         match optimized {
-            LogicalPlan::IndexScan { range_end, .. } => {
-                assert_eq!(range_end, Some(Value::Int64(150)));
-            }
+            LogicalPlan::IndexScan { bounds, .. } => match bounds {
+                IndexBounds::Scalar(KeyRange::UpperBound { value, .. }) => {
+                    assert_eq!(value, Value::Int64(150));
+                }
+                other => panic!("Expected upper bound, got {:?}", other),
+            },
             other => {
                 panic!("Expected IndexScan, got: {:?}", other);
             }
@@ -1821,18 +2469,20 @@ mod tests {
 
                 // Check the input is IndexScan with merged range
                 match input.as_ref() {
-                    LogicalPlan::IndexScan {
-                        range_start,
-                        range_end,
-                        include_start,
-                        include_end,
-                        ..
-                    } => {
-                        assert_eq!(*range_start, Some(Value::Float64(10.0)));
-                        assert_eq!(*range_end, Some(Value::Float64(150.0)));
-                        assert!(!include_start);
-                        assert!(!include_end);
-                    }
+                    LogicalPlan::IndexScan { bounds, .. } => match bounds {
+                        IndexBounds::Scalar(KeyRange::Bound {
+                            lower,
+                            upper,
+                            lower_exclusive,
+                            upper_exclusive,
+                        }) => {
+                            assert_eq!(*lower, Value::Float64(10.0));
+                            assert_eq!(*upper, Value::Float64(150.0));
+                            assert!(*lower_exclusive);
+                            assert!(*upper_exclusive);
+                        }
+                        other => panic!("Expected scalar bound range, got {:?}", other),
+                    },
                     other => {
                         panic!("Expected IndexScan inside Filter, got: {:?}", other);
                     }
@@ -1842,5 +2492,97 @@ mod tests {
                 panic!("Expected Filter wrapping IndexScan, got: {:?}", other);
             }
         }
+    }
+
+    #[test]
+    fn test_composite_index_generates_tuple_bounds() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "scores",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_region_score",
+                    alloc::vec!["region".into(), "score".into()],
+                    false,
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+        let predicate = Expr::and(
+            Expr::eq(
+                Expr::column("scores", "region", 0),
+                Expr::literal(Value::String("apac".into())),
+            ),
+            Expr::and(
+                Expr::ge(
+                    Expr::column("scores", "score", 1),
+                    Expr::literal(Value::Int64(10)),
+                ),
+                Expr::le(
+                    Expr::column("scores", "score", 1),
+                    Expr::literal(Value::Int64(20)),
+                ),
+            ),
+        );
+
+        let optimized = pass.optimize(LogicalPlan::filter(LogicalPlan::scan("scores"), predicate));
+        match optimized {
+            LogicalPlan::IndexScan { index, bounds, .. } => {
+                assert_eq!(index, "idx_region_score");
+                match bounds {
+                    IndexBounds::Composite(KeyRange::Bound {
+                        lower,
+                        upper,
+                        lower_exclusive,
+                        upper_exclusive,
+                    }) => {
+                        assert_eq!(
+                            lower,
+                            alloc::vec![Value::String("apac".into()), Value::Int64(10)]
+                        );
+                        assert_eq!(
+                            upper,
+                            alloc::vec![Value::String("apac".into()), Value::Int64(20)]
+                        );
+                        assert!(!lower_exclusive);
+                        assert!(!upper_exclusive);
+                    }
+                    other => panic!("Expected composite tuple bounds, got {:?}", other),
+                }
+            }
+            other => panic!("Expected composite IndexScan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_single_column_predicate_does_not_use_composite_prefix_index() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "scores",
+            TableStats {
+                row_count: 10000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_region_score",
+                    alloc::vec!["region".into(), "score".into()],
+                    false,
+                )],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+        let predicate = Expr::eq(
+            Expr::column("scores", "region", 0),
+            Expr::literal(Value::String("apac".into())),
+        );
+
+        let optimized = pass.optimize(LogicalPlan::filter(LogicalPlan::scan("scores"), predicate));
+        assert!(
+            matches!(optimized, LogicalPlan::Filter { .. }),
+            "single-column predicates should not use a composite prefix as a scalar index lookup"
+        );
     }
 }

@@ -7,8 +7,8 @@ mod bench;
 mod report;
 mod utils;
 
-use cynos_index::Index;
 use bench::*;
+use cynos_index::Index;
 use report::Report;
 
 fn main() {

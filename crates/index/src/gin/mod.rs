@@ -8,10 +8,45 @@ mod posting;
 pub use posting::PostingList;
 
 use crate::stats::IndexStats;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use cynos_core::RowId;
+
+/// Synthetic key namespace used for JSONB_CONTAINS trigram prefilters.
+pub const CONTAINS_TRIGRAM_KEY_PREFIX: &str = "__cynos_contains3__:";
+
+/// Builds the synthetic key used for path-scoped JSONB_CONTAINS trigrams.
+pub fn contains_trigram_key(path: &str) -> String {
+    let mut key = String::from(CONTAINS_TRIGRAM_KEY_PREFIX);
+    key.push_str(path);
+    key
+}
+
+/// Extracts unique trigrams from a string for substring prefiltering.
+pub fn contains_trigrams(value: &str) -> Vec<String> {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() < 3 {
+        return Vec::new();
+    }
+
+    let mut grams = BTreeSet::new();
+    for window in chars.windows(3) {
+        let gram: String = window.iter().collect();
+        grams.insert(gram);
+    }
+
+    grams.into_iter().collect()
+}
+
+/// Builds the synthetic (key, value) pairs used to prefilter JSONB_CONTAINS.
+pub fn contains_trigram_pairs(path: &str, needle: &str) -> Vec<(String, String)> {
+    let key = contains_trigram_key(path);
+    contains_trigrams(needle)
+        .into_iter()
+        .map(|gram| (key.clone(), gram))
+        .collect()
+}
 
 /// A GIN index for JSONB and other composite types.
 ///
@@ -129,21 +164,25 @@ impl GinIndex {
             return Vec::new();
         }
 
-        let mut result: Option<PostingList> = None;
-
+        let mut postings = Vec::with_capacity(keys.len());
         for key in keys {
             match self.key_index.get(*key) {
-                Some(posting) => {
-                    result = Some(match result {
-                        Some(r) => r.intersect(posting),
-                        None => posting.clone(),
-                    });
-                }
-                None => return Vec::new(), // Key not found, no matches
+                Some(posting) => postings.push(posting),
+                None => return Vec::new(),
             }
         }
 
-        result.map(|p| p.to_vec()).unwrap_or_default()
+        postings.sort_unstable_by_key(|posting| posting.len());
+
+        let mut result = postings[0].to_vec();
+        for posting in &postings[1..] {
+            result = posting.intersect_sorted_candidates(&result);
+            if result.is_empty() {
+                break;
+            }
+        }
+
+        result
     }
 
     /// Gets all row IDs that contain ANY of the given keys (OR query).
@@ -165,22 +204,26 @@ impl GinIndex {
             return Vec::new();
         }
 
-        let mut result: Option<PostingList> = None;
-
+        let mut postings = Vec::with_capacity(pairs.len());
         for (key, value) in pairs {
             let pair = ((*key).into(), (*value).into());
             match self.key_value_index.get(&pair) {
-                Some(posting) => {
-                    result = Some(match result {
-                        Some(r) => r.intersect(posting),
-                        None => posting.clone(),
-                    });
-                }
+                Some(posting) => postings.push(posting),
                 None => return Vec::new(),
             }
         }
 
-        result.map(|p| p.to_vec()).unwrap_or_default()
+        postings.sort_unstable_by_key(|posting| posting.len());
+
+        let mut result = postings[0].to_vec();
+        for posting in &postings[1..] {
+            result = posting.intersect_sorted_candidates(&result);
+            if result.is_empty() {
+                break;
+            }
+        }
+
+        result
     }
 
     /// Returns the number of unique keys in the index.
@@ -265,7 +308,10 @@ mod tests {
 
         assert_eq!(gin.get_by_key_value("status", "active"), vec![1, 2]);
         assert_eq!(gin.get_by_key_value("status", "inactive"), vec![3]);
-        assert_eq!(gin.get_by_key_value("status", "pending"), Vec::<RowId>::new());
+        assert_eq!(
+            gin.get_by_key_value("status", "pending"),
+            Vec::<RowId>::new()
+        );
     }
 
     #[test]
@@ -355,6 +401,56 @@ mod tests {
     }
 
     #[test]
+    fn test_gin_get_by_key_values_all_order_independent() {
+        let mut gin = GinIndex::new();
+
+        for row_id in 1..=100 {
+            gin.add_key_value("scope".into(), "all".into(), row_id);
+        }
+        for row_id in 1..=50 {
+            gin.add_key_value("status".into(), "active".into(), row_id);
+        }
+        for row_id in 11..=20 {
+            gin.add_key_value("tenant".into(), "small".into(), row_id);
+        }
+
+        let worst_case_order = gin.get_by_key_values_all(&[
+            ("scope", "all"),
+            ("status", "active"),
+            ("tenant", "small"),
+        ]);
+        let best_case_order = gin.get_by_key_values_all(&[
+            ("tenant", "small"),
+            ("status", "active"),
+            ("scope", "all"),
+        ]);
+
+        assert_eq!(worst_case_order, (11..=20).collect::<Vec<_>>());
+        assert_eq!(best_case_order, worst_case_order);
+    }
+
+    #[test]
+    fn test_gin_get_by_keys_all_order_independent() {
+        let mut gin = GinIndex::new();
+
+        for row_id in 1..=100 {
+            gin.add_key("scope".into(), row_id);
+        }
+        for row_id in 1..=50 {
+            gin.add_key("status".into(), row_id);
+        }
+        for row_id in 11..=20 {
+            gin.add_key("tenant".into(), row_id);
+        }
+
+        let worst_case_order = gin.get_by_keys_all(&["scope", "status", "tenant"]);
+        let best_case_order = gin.get_by_keys_all(&["tenant", "status", "scope"]);
+
+        assert_eq!(worst_case_order, (11..=20).collect::<Vec<_>>());
+        assert_eq!(best_case_order, worst_case_order);
+    }
+
+    #[test]
     fn test_gin_clear() {
         let mut gin = GinIndex::new();
 
@@ -380,5 +476,47 @@ mod tests {
         assert_eq!(gin.cost_key("name"), 3);
         assert_eq!(gin.cost_key("age"), 1);
         assert_eq!(gin.cost_key("nonexistent"), 0);
+    }
+
+    #[test]
+    fn test_contains_trigrams_deduplicate_repeated_windows() {
+        assert_eq!(contains_trigrams("aaaa"), vec![String::from("aaa")]);
+    }
+
+    #[test]
+    fn test_contains_trigram_pairs_scope_key_by_path() {
+        let pairs = contains_trigram_pairs("tags", "portable");
+        assert!(pairs
+            .iter()
+            .all(|(key, _)| key == "__cynos_contains3__:tags"));
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    String::from("__cynos_contains3__:tags"),
+                    String::from("abl")
+                ),
+                (
+                    String::from("__cynos_contains3__:tags"),
+                    String::from("ble")
+                ),
+                (
+                    String::from("__cynos_contains3__:tags"),
+                    String::from("ort")
+                ),
+                (
+                    String::from("__cynos_contains3__:tags"),
+                    String::from("por")
+                ),
+                (
+                    String::from("__cynos_contains3__:tags"),
+                    String::from("rta")
+                ),
+                (
+                    String::from("__cynos_contains3__:tags"),
+                    String::from("tab")
+                ),
+            ]
+        );
     }
 }

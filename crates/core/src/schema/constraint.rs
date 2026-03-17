@@ -141,15 +141,9 @@ mod tests {
 
     #[test]
     fn test_foreign_key() {
-        let fk = ForeignKey::new(
-            "fk_order_user",
-            "orders",
-            "user_id",
-            "users",
-            "id",
-        )
-        .action(ConstraintAction::Cascade)
-        .timing(ConstraintTiming::Immediate);
+        let fk = ForeignKey::new("fk_order_user", "orders", "user_id", "users", "id")
+            .action(ConstraintAction::Cascade)
+            .timing(ConstraintTiming::Immediate);
 
         assert_eq!(fk.name, "fk_order_user");
         assert_eq!(fk.child_table, "orders");

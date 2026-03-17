@@ -336,6 +336,7 @@ dependencies = [
  "cynos-core",
  "cynos-incremental",
  "cynos-index",
+ "cynos-jsonb",
  "hashbrown 0.14.5",
 ]
 

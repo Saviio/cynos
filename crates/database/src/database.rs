@@ -12,6 +12,7 @@ use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 #[cfg(feature = "benchmark")]
 use alloc::vec::Vec;
+use core::cell::RefCell;
 #[cfg(feature = "benchmark")]
 use cynos_core::Row;
 #[allow(unused_imports)]
@@ -19,7 +20,6 @@ use cynos_incremental::Delta;
 use cynos_query::plan_cache::PlanCache;
 use cynos_reactive::TableId;
 use cynos_storage::TableCache;
-use core::cell::RefCell;
 use wasm_bindgen::prelude::*;
 
 /// The main database interface.
@@ -47,7 +47,9 @@ impl Database {
     pub fn new(name: &str) -> Self {
         let query_registry = Rc::new(RefCell::new(QueryRegistry::new()));
         // Set self reference for microtask scheduling
-        query_registry.borrow_mut().set_self_ref(query_registry.clone());
+        query_registry
+            .borrow_mut()
+            .set_self_ref(query_registry.clone());
 
         Self {
             name: name.to_string(),
@@ -256,14 +258,18 @@ impl Database {
                     cynos_core::DataType::String => Value::String(alloc::format!("value_{}", i)),
                     cynos_core::DataType::Boolean => Value::Boolean(i % 2 == 0),
                     cynos_core::DataType::Float64 => Value::Float64(i as f64 * 0.1),
-                    cynos_core::DataType::DateTime => Value::DateTime(1700000000000 + i as i64 * 1000),
+                    cynos_core::DataType::DateTime => {
+                        Value::DateTime(1700000000000 + i as i64 * 1000)
+                    }
                     _ => Value::Null,
                 };
                 values.push(value);
             }
 
             let row = Row::new(row_id, values);
-            store.insert(row).map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
+            store
+                .insert(row)
+                .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
 
         let end = js_sys::Date::now();
@@ -276,9 +282,21 @@ impl Database {
 
         // Return result object
         let result = js_sys::Object::new();
-        js_sys::Reflect::set(&result, &JsValue::from_str("duration_ms"), &JsValue::from_f64(duration_ms))?;
-        js_sys::Reflect::set(&result, &JsValue::from_str("rows_per_sec"), &JsValue::from_f64(rows_per_sec))?;
-        js_sys::Reflect::set(&result, &JsValue::from_str("count"), &JsValue::from_f64(count as f64))?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("duration_ms"),
+            &JsValue::from_f64(duration_ms),
+        )?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("rows_per_sec"),
+            &JsValue::from_f64(rows_per_sec),
+        )?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("count"),
+            &JsValue::from_f64(count as f64),
+        )?;
 
         Ok(result.into())
     }
@@ -308,8 +326,8 @@ impl Database {
         threshold: f64,
     ) -> Result<JsValue, JsValue> {
         use crate::query_engine::execute_plan;
+        use cynos_query::ast::{BinaryOp, Expr as AstExpr};
         use cynos_query::planner::LogicalPlan;
-        use cynos_query::ast::{Expr as AstExpr, BinaryOp};
 
         let cache = self.cache.borrow();
         let store = cache
@@ -362,11 +380,31 @@ impl Database {
 
         // Return result object
         let result = js_sys::Object::new();
-        js_sys::Reflect::set(&result, &JsValue::from_str("query_ms"), &JsValue::from_f64(query_ms))?;
-        js_sys::Reflect::set(&result, &JsValue::from_str("serialize_ms"), &JsValue::from_f64(serialize_ms))?;
-        js_sys::Reflect::set(&result, &JsValue::from_str("total_ms"), &JsValue::from_f64(total_ms))?;
-        js_sys::Reflect::set(&result, &JsValue::from_str("row_count"), &JsValue::from_f64(row_count as f64))?;
-        js_sys::Reflect::set(&result, &JsValue::from_str("serialization_overhead_pct"), &JsValue::from_f64(serialization_overhead_pct))?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("query_ms"),
+            &JsValue::from_f64(query_ms),
+        )?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("serialize_ms"),
+            &JsValue::from_f64(serialize_ms),
+        )?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("total_ms"),
+            &JsValue::from_f64(total_ms),
+        )?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("row_count"),
+            &JsValue::from_f64(row_count as f64),
+        )?;
+        js_sys::Reflect::set(
+            &result,
+            &JsValue::from_str("serialization_overhead_pct"),
+            &JsValue::from_f64(serialization_overhead_pct),
+        )?;
 
         Ok(result.into())
     }
@@ -390,7 +428,11 @@ impl Database {
     }
 
     /// Notifies the query registry of table changes.
-    pub(crate) fn notify_table_change(&self, table_id: TableId, changed_ids: &hashbrown::HashSet<u64>) {
+    pub(crate) fn notify_table_change(
+        &self,
+        table_id: TableId,
+        changed_ids: &hashbrown::HashSet<u64>,
+    ) {
         self.query_registry
             .borrow_mut()
             .on_table_change(table_id, changed_ids);
@@ -436,13 +478,11 @@ mod tests {
     fn test_database_drop_table() {
         let db = Database::new("test");
 
-        let builder = db
-            .create_table("users")
-            .column(
-                "id",
-                JsDataType::Int64,
-                Some(ColumnOptions::new().set_primary_key(true)),
-            );
+        let builder = db.create_table("users").column(
+            "id",
+            JsDataType::Int64,
+            Some(ColumnOptions::new().set_primary_key(true)),
+        );
 
         db.register_table(&builder).unwrap();
         assert!(db.has_table("users"));
@@ -455,22 +495,18 @@ mod tests {
     fn test_database_table_names() {
         let db = Database::new("test");
 
-        let builder1 = db
-            .create_table("users")
-            .column(
-                "id",
-                JsDataType::Int64,
-                Some(ColumnOptions::new().set_primary_key(true)),
-            );
+        let builder1 = db.create_table("users").column(
+            "id",
+            JsDataType::Int64,
+            Some(ColumnOptions::new().set_primary_key(true)),
+        );
         db.register_table(&builder1).unwrap();
 
-        let builder2 = db
-            .create_table("orders")
-            .column(
-                "id",
-                JsDataType::Int64,
-                Some(ColumnOptions::new().set_primary_key(true)),
-            );
+        let builder2 = db.create_table("orders").column(
+            "id",
+            JsDataType::Int64,
+            Some(ColumnOptions::new().set_primary_key(true)),
+        );
         db.register_table(&builder2).unwrap();
 
         let names = db.table_names();
@@ -501,13 +537,11 @@ mod tests {
     fn test_database_clear() {
         let db = Database::new("test");
 
-        let builder = db
-            .create_table("users")
-            .column(
-                "id",
-                JsDataType::Int64,
-                Some(ColumnOptions::new().set_primary_key(true)),
-            );
+        let builder = db.create_table("users").column(
+            "id",
+            JsDataType::Int64,
+            Some(ColumnOptions::new().set_primary_key(true)),
+        );
 
         db.register_table(&builder).unwrap();
 

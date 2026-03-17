@@ -6,9 +6,9 @@
 use crate::observable::ObservableQuery;
 use alloc::rc::{Rc, Weak};
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use cynos_core::Row;
 use cynos_incremental::{Delta, TableId};
-use core::cell::RefCell;
 use hashbrown::HashMap;
 
 /// Unique identifier for a registered query.
@@ -461,8 +461,12 @@ mod tests {
         let c1 = count1.clone();
         let c2 = count2.clone();
 
-        query1.borrow_mut().subscribe(move |_| *c1.borrow_mut() += 1);
-        query2.borrow_mut().subscribe(move |_| *c2.borrow_mut() += 1);
+        query1
+            .borrow_mut()
+            .subscribe(move |_| *c1.borrow_mut() += 1);
+        query2
+            .borrow_mut()
+            .subscribe(move |_| *c2.borrow_mut() += 1);
 
         registry.register(query1.clone());
         registry.register(query2.clone());

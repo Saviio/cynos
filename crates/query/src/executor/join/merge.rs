@@ -2,8 +2,8 @@
 
 use crate::executor::{Relation, RelationEntry};
 use alloc::vec::Vec;
-use cynos_core::Value;
 use core::cmp::Ordering;
+use cynos_core::Value;
 
 /// Sort-Merge Join executor.
 ///
@@ -44,11 +44,7 @@ impl SortMergeJoin {
         let mut result_entries = Vec::new();
         let left_tables = left.tables().to_vec();
         let right_tables = right.tables().to_vec();
-        let right_col_count = right
-            .entries
-            .first()
-            .map(|e| e.row.len())
-            .unwrap_or(0);
+        let right_col_count = right.entries.first().map(|e| e.row.len()).unwrap_or(0);
 
         let left_entries: Vec<_> = left.entries.iter().collect();
         let right_entries: Vec<_> = right.entries.iter().collect();
@@ -233,8 +229,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cynos_core::Row;
     use alloc::vec;
+    use cynos_core::Row;
 
     #[test]
     fn test_sort_merge_join_inner() {
@@ -289,9 +285,7 @@ mod tests {
             Row::new(1, vec![Value::Int64(2)]),
             Row::new(2, vec![Value::Int64(3)]),
         ];
-        let right_rows = vec![
-            Row::new(10, vec![Value::Int64(1)]),
-        ];
+        let right_rows = vec![Row::new(10, vec![Value::Int64(1)])];
 
         let left = Relation::from_rows_owned(left_rows, vec!["left".into()]);
         let right = Relation::from_rows_owned(right_rows, vec!["right".into()]);
@@ -308,13 +302,7 @@ mod tests {
         let mut left = vec![(3, "C"), (1, "A"), (2, "B")];
         let mut right = vec![(2, "Y"), (1, "X"), (4, "Z")];
 
-        let result = sort_merge_join(
-            &mut left,
-            &mut right,
-            |l| l.0,
-            |r| r.0,
-            |l, r| (l.1, r.1),
-        );
+        let result = sort_merge_join(&mut left, &mut right, |l| l.0, |r| r.0, |l, r| (l.1, r.1));
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&("A", "X")));

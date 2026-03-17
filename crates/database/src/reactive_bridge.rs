@@ -11,20 +11,20 @@
 //! The IVM path is used when the query is incrementalizable (no Sort/Limit/TopN).
 //! Otherwise, falls back to re-query.
 
-use crate::convert::{row_to_js, value_to_js};
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
+use crate::convert::{row_to_js, value_to_js};
 use crate::query_engine::execute_physical_plan;
-use cynos_storage::TableCache;
-use alloc::string::String;
 use alloc::boxed::Box;
 use alloc::rc::Rc;
+use alloc::string::String;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use cynos_core::schema::Table;
 use cynos_core::Row;
 use cynos_incremental::{Delta, TableId};
 use cynos_query::planner::PhysicalPlan;
 use cynos_reactive::ObservableQuery;
-use core::cell::RefCell;
+use cynos_storage::TableCache;
 use hashbrown::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
 
@@ -54,7 +54,10 @@ impl ReQueryObservable {
         initial_result: Vec<Rc<Row>>,
     ) -> Self {
         // Detect JOIN query by checking if first row has dummy ID
-        let is_join_query = initial_result.first().map(|r| r.is_dummy()).unwrap_or(false);
+        let is_join_query = initial_result
+            .first()
+            .map(|r| r.is_dummy())
+            .unwrap_or(false);
         Self {
             physical_plan,
             cache,
@@ -118,7 +121,8 @@ impl ReQueryObservable {
         match execute_physical_plan(&cache, &self.physical_plan) {
             Ok(new_result) => {
                 // Only notify if result changed
-                if !Self::results_equal(&self.result, &new_result, changed_ids, self.is_join_query) {
+                if !Self::results_equal(&self.result, &new_result, changed_ids, self.is_join_query)
+                {
                     self.result = new_result;
                     // Notify all subscribers
                     for (_, callback) in &self.subscriptions {
@@ -135,7 +139,12 @@ impl ReQueryObservable {
     /// Compares two result sets for equality using row versions.
     /// This is O(n) where n is the number of rows, comparing only version numbers.
     /// For single-table queries, can further optimize by only checking changed_ids.
-    fn results_equal(old: &[Rc<Row>], new: &[Rc<Row>], changed_ids: &HashSet<u64>, is_join_query: bool) -> bool {
+    fn results_equal(
+        old: &[Rc<Row>],
+        new: &[Rc<Row>],
+        changed_ids: &HashSet<u64>,
+        is_join_query: bool,
+    ) -> bool {
         use cynos_core::DUMMY_ROW_ID;
 
         // Different lengths means definitely changed
@@ -320,7 +329,9 @@ impl QueryRegistry {
                             for (table_id, deltas) in &ivm_changes {
                                 if let Some(queries) = registry.ivm_queries.get(table_id) {
                                     for query in queries {
-                                        query.borrow_mut().on_table_change(*table_id, deltas.clone());
+                                        query
+                                            .borrow_mut()
+                                            .on_table_change(*table_id, deltas.clone());
                                     }
                                 }
                             }
@@ -373,7 +384,9 @@ impl QueryRegistry {
         for (table_id, deltas) in &ivm_changes {
             if let Some(queries) = self.ivm_queries.get(table_id) {
                 for query in queries {
-                    query.borrow_mut().on_table_change(*table_id, deltas.clone());
+                    query
+                        .borrow_mut()
+                        .on_table_change(*table_id, deltas.clone());
                 }
             }
         }
@@ -403,7 +416,9 @@ impl QueryRegistry {
         for (table_id, deltas) in &ivm_changes {
             if let Some(queries) = self.ivm_queries.get(table_id) {
                 for query in queries {
-                    query.borrow_mut().on_table_change(*table_id, deltas.clone());
+                    query
+                        .borrow_mut()
+                        .on_table_change(*table_id, deltas.clone());
                 }
             }
         }
@@ -475,7 +490,13 @@ impl JsObservableQuery {
         schema: Table,
         binary_layout: SchemaLayout,
     ) -> Self {
-        Self { inner, schema, projected_columns: None, binary_layout, aggregate_columns: None }
+        Self {
+            inner,
+            schema,
+            projected_columns: None,
+            binary_layout,
+            aggregate_columns: None,
+        }
     }
 
     pub(crate) fn new_with_projection(
@@ -484,7 +505,13 @@ impl JsObservableQuery {
         projected_columns: Vec<String>,
         binary_layout: SchemaLayout,
     ) -> Self {
-        Self { inner, schema, projected_columns: Some(projected_columns), binary_layout, aggregate_columns: None }
+        Self {
+            inner,
+            schema,
+            projected_columns: Some(projected_columns),
+            binary_layout,
+            aggregate_columns: None,
+        }
     }
 
     pub(crate) fn new_with_aggregates(
@@ -493,7 +520,13 @@ impl JsObservableQuery {
         aggregate_columns: Vec<String>,
         binary_layout: SchemaLayout,
     ) -> Self {
-        Self { inner, schema, projected_columns: None, binary_layout, aggregate_columns: Some(aggregate_columns) }
+        Self {
+            inner,
+            schema,
+            projected_columns: None,
+            binary_layout,
+            aggregate_columns: Some(aggregate_columns),
+        }
     }
 
     /// Get the inner observable for creating JsChangesStream.
@@ -547,9 +580,15 @@ impl JsObservableQuery {
         let called_c = called.clone();
         let unsubscribe = Closure::wrap(Box::new(move || {
             let mut c = called_c.borrow_mut();
-            if !*c { *c = true; inner_unsub.borrow_mut().unsubscribe(sub_id); }
+            if !*c {
+                *c = true;
+                inner_unsub.borrow_mut().unsubscribe(sub_id);
+            }
         }) as Box<dyn FnMut()>);
-        let js_fn: js_sys::Function = unsubscribe.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        let js_fn: js_sys::Function = unsubscribe
+            .as_ref()
+            .unchecked_ref::<js_sys::Function>()
+            .clone();
         unsubscribe.forget();
         js_fn
     }
@@ -622,7 +661,13 @@ impl JsIvmObservableQuery {
         schema: Table,
         binary_layout: SchemaLayout,
     ) -> Self {
-        Self { inner, schema, projected_columns: None, binary_layout, aggregate_columns: None }
+        Self {
+            inner,
+            schema,
+            projected_columns: None,
+            binary_layout,
+            aggregate_columns: None,
+        }
     }
 
     pub(crate) fn new_with_projection(
@@ -631,7 +676,13 @@ impl JsIvmObservableQuery {
         projected_columns: Vec<String>,
         binary_layout: SchemaLayout,
     ) -> Self {
-        Self { inner, schema, projected_columns: Some(projected_columns), binary_layout, aggregate_columns: None }
+        Self {
+            inner,
+            schema,
+            projected_columns: Some(projected_columns),
+            binary_layout,
+            aggregate_columns: None,
+        }
     }
 
     pub(crate) fn new_with_aggregates(
@@ -640,7 +691,13 @@ impl JsIvmObservableQuery {
         aggregate_columns: Vec<String>,
         binary_layout: SchemaLayout,
     ) -> Self {
-        Self { inner, schema, projected_columns: None, binary_layout, aggregate_columns: Some(aggregate_columns) }
+        Self {
+            inner,
+            schema,
+            projected_columns: None,
+            binary_layout,
+            aggregate_columns: Some(aggregate_columns),
+        }
     }
 }
 
@@ -691,9 +748,15 @@ impl JsIvmObservableQuery {
         let called_c = called.clone();
         let unsubscribe = Closure::wrap(Box::new(move || {
             let mut c = called_c.borrow_mut();
-            if !*c { *c = true; inner_unsub.borrow_mut().unsubscribe(sub_id); }
+            if !*c {
+                *c = true;
+                inner_unsub.borrow_mut().unsubscribe(sub_id);
+            }
         }) as Box<dyn FnMut()>);
-        let js_fn: js_sys::Function = unsubscribe.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        let js_fn: js_sys::Function = unsubscribe
+            .as_ref()
+            .unchecked_ref::<js_sys::Function>()
+            .clone();
         unsubscribe.forget();
         js_fn
     }
@@ -845,9 +908,15 @@ impl JsChangesStream {
         let called_c = called.clone();
         let unsubscribe = Closure::wrap(Box::new(move || {
             let mut c = called_c.borrow_mut();
-            if !*c { *c = true; inner.borrow_mut().unsubscribe(sub_id); }
+            if !*c {
+                *c = true;
+                inner.borrow_mut().unsubscribe(sub_id);
+            }
         }) as Box<dyn FnMut()>);
-        let js_fn: js_sys::Function = unsubscribe.as_ref().unchecked_ref::<js_sys::Function>().clone();
+        let js_fn: js_sys::Function = unsubscribe
+            .as_ref()
+            .unchecked_ref::<js_sys::Function>()
+            .clone();
         unsubscribe.forget();
         js_fn
     }
@@ -911,6 +980,8 @@ mod tests {
     use super::*;
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Value};
+    use cynos_query::ast::Expr;
+    use cynos_query::executor::{InMemoryDataSource, PhysicalPlanRunner};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -958,5 +1029,72 @@ mod tests {
         let js = rows_to_js_array(&rows, &schema);
         let arr = js_sys::Array::from(&js);
         assert_eq!(arr.length(), 2);
+    }
+
+    #[test]
+    fn test_projection_query_preserves_version_and_live_query_detects_update() {
+        let plan = PhysicalPlan::project(
+            PhysicalPlan::table_scan("users"),
+            alloc::vec![Expr::column("users", "name", 1)],
+        );
+
+        let mut old_ds = InMemoryDataSource::new();
+        old_ds.add_table(
+            "users",
+            alloc::vec![Row::new_with_version(
+                1,
+                5,
+                alloc::vec![
+                    Value::Int64(1),
+                    Value::String("Alice".into()),
+                    Value::Int32(25),
+                ],
+            )],
+            3,
+        );
+        let old_result = PhysicalPlanRunner::new(&old_ds).execute(&plan).unwrap();
+        let old_rows: Vec<Rc<Row>> = old_result
+            .entries
+            .iter()
+            .map(|entry| entry.row.clone())
+            .collect();
+
+        let mut new_ds = InMemoryDataSource::new();
+        new_ds.add_table(
+            "users",
+            alloc::vec![Row::new_with_version(
+                1,
+                6,
+                alloc::vec![
+                    Value::Int64(1),
+                    Value::String("Alicia".into()),
+                    Value::Int32(25),
+                ],
+            )],
+            3,
+        );
+        let new_result = PhysicalPlanRunner::new(&new_ds).execute(&plan).unwrap();
+        let new_rows: Vec<Rc<Row>> = new_result
+            .entries
+            .iter()
+            .map(|entry| entry.row.clone())
+            .collect();
+
+        assert_eq!(
+            old_rows[0].version(),
+            5,
+            "Projection should preserve the source row version for reactive diffing",
+        );
+        assert_eq!(
+            new_rows[0].version(),
+            6,
+            "Projection should preserve the source row version for reactive diffing",
+        );
+
+        let changed_ids: HashSet<u64> = core::iter::once(1u64).collect();
+        assert!(
+            !ReQueryObservable::results_equal(&old_rows, &new_rows, &changed_ids, false),
+            "Projected value changed from Alice to Alicia, so live query comparison should detect a change",
+        );
     }
 }

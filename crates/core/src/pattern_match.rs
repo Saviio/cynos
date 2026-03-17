@@ -205,10 +205,7 @@ fn parse_token(pat: &[char], pi: usize) -> Option<(usize, Box<dyn Fn(char) -> bo
 }
 
 /// Parse a bracket character class: `[abc]`, `[a-z]`, `[^abc]`.
-fn parse_bracket_class(
-    pat: &[char],
-    pi: usize,
-) -> Option<(usize, Box<dyn Fn(char) -> bool>)> {
+fn parse_bracket_class(pat: &[char], pi: usize) -> Option<(usize, Box<dyn Fn(char) -> bool>)> {
     let negate = pi + 1 < pat.len() && pat[pi + 1] == '^';
     let start = if negate { pi + 2 } else { pi + 1 };
     let mut end = start;
@@ -240,7 +237,11 @@ fn parse_bracket_class(
                     i += 1;
                 }
             }
-            if negate { !matched } else { matched }
+            if negate {
+                !matched
+            } else {
+                matched
+            }
         }),
     ))
 }

@@ -6,10 +6,10 @@
 
 use crate::ast::{AggregateFunc, BinaryOp, ColumnRef, Expr, SortOrder, UnaryOp};
 use crate::executor::{
-    AggregateExecutor, HashJoin, LimitExecutor, Relation, RelationEntry,
-    SharedTables, SortExecutor, SortMergeJoin,
+    AggregateExecutor, HashJoin, LimitExecutor, Relation, RelationEntry, SharedTables,
+    SortExecutor, SortMergeJoin,
 };
-use crate::planner::PhysicalPlan;
+use crate::planner::{IndexBounds, PhysicalPlan};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
@@ -18,7 +18,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 use cynos_core::{Row, Value};
-use cynos_jsonb::{JsonbObject, JsonbValue, JsonPath};
+use cynos_index::KeyRange;
+use cynos_jsonb::{JsonPath, JsonbObject, JsonbValue};
 
 // ========== TopN Heap Entry ==========
 
@@ -87,7 +88,10 @@ impl<'a> EvalContext<'a> {
     /// Creates a new evaluation context.
     #[inline]
     pub fn new(tables: &'a [String], table_column_counts: &'a [usize]) -> Self {
-        Self { tables, table_column_counts }
+        Self {
+            tables,
+            table_column_counts,
+        }
     }
 
     /// Computes the actual column index in the combined row based on table name and table-relative index.
@@ -205,6 +209,16 @@ pub trait DataSource {
         )
     }
 
+    /// Returns rows from a composite index scan with tuple bounds.
+    fn get_index_range_composite(
+        &self,
+        table: &str,
+        index: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        self.get_index_range_composite_with_limit(table, index, range, None, 0, false)
+    }
+
     /// Returns rows from an index scan with a key range, limit, offset, and reverse option.
     /// This enables true pushdown of LIMIT to the storage layer.
     fn get_index_range_with_limit(
@@ -220,8 +234,24 @@ pub trait DataSource {
         reverse: bool,
     ) -> ExecutionResult<Vec<Rc<Row>>>;
 
+    /// Returns rows from a composite index scan with tuple bounds, limit, offset, and order.
+    fn get_index_range_composite_with_limit(
+        &self,
+        table: &str,
+        index: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> ExecutionResult<Vec<Rc<Row>>>;
+
     /// Returns rows from an index point lookup.
-    fn get_index_point(&self, table: &str, index: &str, key: &Value) -> ExecutionResult<Vec<Rc<Row>>>;
+    fn get_index_point(
+        &self,
+        table: &str,
+        index: &str,
+        key: &Value,
+    ) -> ExecutionResult<Vec<Rc<Row>>>;
 
     /// Returns rows from an index point lookup with limit.
     fn get_index_point_with_limit(
@@ -306,28 +336,25 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             PhysicalPlan::IndexScan {
                 table,
                 index,
-                range_start,
-                range_end,
-                include_start,
-                include_end,
+                bounds,
                 limit,
                 offset,
                 reverse,
             } => self.execute_index_scan(
                 table,
                 index,
-                range_start.as_ref(),
-                range_end.as_ref(),
-                *include_start,
-                *include_end,
+                bounds,
                 *limit,
                 *offset,
                 *reverse,
             ),
 
-            PhysicalPlan::IndexGet { table, index, key, limit } => {
-                self.execute_index_get(table, index, key, *limit)
-            }
+            PhysicalPlan::IndexGet {
+                table,
+                index,
+                key,
+                limit,
+            } => self.execute_index_get(table, index, key, *limit),
 
             PhysicalPlan::IndexInGet { table, index, keys } => {
                 self.execute_index_in_get(table, index, keys)
@@ -457,35 +484,112 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
     fn execute_table_scan(&self, table: &str) -> ExecutionResult<Relation> {
         let rows = self.data_source.get_table_rows(table)?;
         let column_count = self.data_source.get_column_count(table)?;
-        Ok(Relation::from_rows_with_column_count(rows, alloc::vec![table.into()], column_count))
+        Ok(Relation::from_rows_with_column_count(
+            rows,
+            alloc::vec![table.into()],
+            column_count,
+        ))
     }
 
     fn execute_index_scan(
         &self,
         table: &str,
         index: &str,
-        range_start: Option<&Value>,
-        range_end: Option<&Value>,
-        include_start: bool,
-        include_end: bool,
+        bounds: &IndexBounds,
         limit: Option<usize>,
         offset: Option<usize>,
         reverse: bool,
     ) -> ExecutionResult<Relation> {
         // Push limit, offset, and reverse down to storage layer for early termination
-        let rows = self.data_source.get_index_range_with_limit(
-            table,
-            index,
-            range_start,
-            range_end,
-            include_start,
-            include_end,
-            limit,
-            offset.unwrap_or(0),
-            reverse,
-        )?;
+        let rows = match bounds {
+            IndexBounds::Unbounded => self.data_source.get_index_range_with_limit(
+                table,
+                index,
+                None,
+                None,
+                true,
+                true,
+                limit,
+                offset.unwrap_or(0),
+                reverse,
+            )?,
+            IndexBounds::Scalar(range) => match range {
+                KeyRange::All => self.data_source.get_index_range_with_limit(
+                    table,
+                    index,
+                    None,
+                    None,
+                    true,
+                    true,
+                    limit,
+                    offset.unwrap_or(0),
+                    reverse,
+                )?,
+                KeyRange::Only(value) => self.data_source.get_index_range_with_limit(
+                    table,
+                    index,
+                    Some(value),
+                    Some(value),
+                    true,
+                    true,
+                    limit,
+                    offset.unwrap_or(0),
+                    reverse,
+                )?,
+                KeyRange::LowerBound { value, exclusive } => self.data_source.get_index_range_with_limit(
+                    table,
+                    index,
+                    Some(value),
+                    None,
+                    !exclusive,
+                    true,
+                    limit,
+                    offset.unwrap_or(0),
+                    reverse,
+                )?,
+                KeyRange::UpperBound { value, exclusive } => self.data_source.get_index_range_with_limit(
+                    table,
+                    index,
+                    None,
+                    Some(value),
+                    true,
+                    !exclusive,
+                    limit,
+                    offset.unwrap_or(0),
+                    reverse,
+                )?,
+                KeyRange::Bound {
+                    lower,
+                    upper,
+                    lower_exclusive,
+                    upper_exclusive,
+                } => self.data_source.get_index_range_with_limit(
+                    table,
+                    index,
+                    Some(lower),
+                    Some(upper),
+                    !lower_exclusive,
+                    !upper_exclusive,
+                    limit,
+                    offset.unwrap_or(0),
+                    reverse,
+                )?,
+            },
+            IndexBounds::Composite(range) => self.data_source.get_index_range_composite_with_limit(
+                table,
+                index,
+                Some(range),
+                limit,
+                offset.unwrap_or(0),
+                reverse,
+            )?,
+        };
         let column_count = self.data_source.get_column_count(table)?;
-        Ok(Relation::from_rows_with_column_count(rows, alloc::vec![table.into()], column_count))
+        Ok(Relation::from_rows_with_column_count(
+            rows,
+            alloc::vec![table.into()],
+            column_count,
+        ))
     }
 
     fn execute_index_get(
@@ -495,9 +599,15 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         key: &Value,
         limit: Option<usize>,
     ) -> ExecutionResult<Relation> {
-        let rows = self.data_source.get_index_point_with_limit(table, index, key, limit)?;
+        let rows = self
+            .data_source
+            .get_index_point_with_limit(table, index, key, limit)?;
         let column_count = self.data_source.get_column_count(table)?;
-        Ok(Relation::from_rows_with_column_count(rows, alloc::vec![table.into()], column_count))
+        Ok(Relation::from_rows_with_column_count(
+            rows,
+            alloc::vec![table.into()],
+            column_count,
+        ))
     }
 
     /// Executes an index multi-point lookup (for IN queries).
@@ -523,7 +633,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         }
 
         let column_count = self.data_source.get_column_count(table)?;
-        Ok(Relation::from_rows_with_column_count(all_rows, alloc::vec![table.into()], column_count))
+        Ok(Relation::from_rows_with_column_count(
+            all_rows,
+            alloc::vec![table.into()],
+            column_count,
+        ))
     }
 
     fn execute_gin_index_scan(
@@ -536,13 +650,17 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
     ) -> ExecutionResult<Relation> {
         let rows = match (query_type, value) {
             ("eq", Some(v)) => self.data_source.get_gin_index_rows(table, index, key, v)?,
-            ("contains", _) | ("exists", _) => {
-                self.data_source.get_gin_index_rows_by_key(table, index, key)?
-            }
+            ("contains", _) | ("exists", _) => self
+                .data_source
+                .get_gin_index_rows_by_key(table, index, key)?,
             _ => self.data_source.get_table_rows(table)?,
         };
         let column_count = self.data_source.get_column_count(table)?;
-        Ok(Relation::from_rows_with_column_count(rows, alloc::vec![table.into()], column_count))
+        Ok(Relation::from_rows_with_column_count(
+            rows,
+            alloc::vec![table.into()],
+            column_count,
+        ))
     }
 
     fn execute_gin_index_scan_multi(
@@ -556,9 +674,15 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        let rows = self.data_source.get_gin_index_rows_multi(table, index, &pair_refs)?;
+        let rows = self
+            .data_source
+            .get_gin_index_rows_multi(table, index, &pair_refs)?;
         let column_count = self.data_source.get_column_count(table)?;
-        Ok(Relation::from_rows_with_column_count(rows, alloc::vec![table.into()], column_count))
+        Ok(Relation::from_rows_with_column_count(
+            rows,
+            alloc::vec![table.into()],
+            column_count,
+        ))
     }
 
     // ========== Filter Operation ==========
@@ -573,7 +697,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             .filter(|entry| self.eval_predicate_ctx(predicate, entry, &ctx))
             .collect();
 
-        Ok(Relation { entries, tables, table_column_counts })
+        Ok(Relation {
+            entries,
+            tables,
+            table_column_counts,
+        })
     }
 
     // ========== Project Operation ==========
@@ -591,7 +719,14 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     .iter()
                     .map(|col| self.eval_expr_ctx(col, &entry, Some(&ctx)))
                     .collect();
-                RelationEntry::new_combined(Rc::new(Row::new(entry.id(), values)), shared_tables.clone())
+                RelationEntry::new_combined(
+                    Rc::new(Row::new_with_version(
+                        entry.id(),
+                        entry.row.version(),
+                        values,
+                    )),
+                    shared_tables.clone(),
+                )
             })
             .collect();
 
@@ -661,32 +796,25 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         let right_column_counts = right.table_column_counts().to_vec();
 
         // Get left column count for adjusting right table column indices
-        let left_col_count = left
-            .entries
-            .first()
-            .map(|e| e.row.len())
-            .unwrap_or(0);
-        let right_col_count = right
-            .entries
-            .first()
-            .map(|e| e.row.len())
-            .unwrap_or(0);
+        let left_col_count = left.entries.first().map(|e| e.row.len()).unwrap_or(0);
+        let right_col_count = right.entries.first().map(|e| e.row.len()).unwrap_or(0);
 
         // Adjust condition to use combined row indices
         // Right table columns need to be offset by left table column count
-        let adjusted_condition = self.adjust_join_condition_indices(condition, &left_tables, &right_tables, left_col_count);
+        let adjusted_condition = self.adjust_join_condition_indices(
+            condition,
+            &left_tables,
+            &right_tables,
+            left_col_count,
+        );
 
         for left_entry in left.iter() {
             let mut matched = false;
 
             for right_entry in right.iter() {
                 // Create a combined entry for predicate evaluation
-                let combined = RelationEntry::combine(
-                    left_entry,
-                    &left_tables,
-                    right_entry,
-                    &right_tables,
-                );
+                let combined =
+                    RelationEntry::combine(left_entry, &left_tables, right_entry, &right_tables);
 
                 if self.eval_predicate(&adjusted_condition, &combined) {
                     matched = true;
@@ -802,12 +930,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
 
         for left_entry in left.iter() {
             for right_entry in right.iter() {
-                let combined = RelationEntry::combine(
-                    left_entry,
-                    &left_tables,
-                    right_entry,
-                    &right_tables,
-                );
+                let combined =
+                    RelationEntry::combine(left_entry, &left_tables, right_entry, &right_tables);
                 result_entries.push(combined);
             }
         }
@@ -834,12 +958,16 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         group_by: &[Expr],
         aggregates: &[(AggregateFunc, Expr)],
     ) -> ExecutionResult<Relation> {
+        let tables = input.tables().to_vec();
+        let table_column_counts = input.table_column_counts().to_vec();
+        let ctx = EvalContext::new(&tables, &table_column_counts);
+
         // Convert Expr group_by to column indices
         let group_by_indices: Vec<usize> = group_by
             .iter()
             .filter_map(|expr| {
                 if let Expr::Column(col) = expr {
-                    Some(col.index)
+                    Some(ctx.resolve_column_index(&col.table, col.index))
                 } else {
                     None
                 }
@@ -850,10 +978,18 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         let agg_specs: Vec<(AggregateFunc, Option<usize>)> = aggregates
             .iter()
             .map(|(func, expr)| {
-                let col_idx = if let Expr::Column(col) = expr {
-                    Some(col.index)
-                } else {
-                    None
+                let col_idx = match expr {
+                    Expr::Column(col) => Some(ctx.resolve_column_index(&col.table, col.index)),
+                    Expr::Aggregate {
+                        expr: Some(inner), ..
+                    } => {
+                        if let Expr::Column(col) = inner.as_ref() {
+                            Some(ctx.resolve_column_index(&col.table, col.index))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
                 };
                 (*func, col_idx)
             })
@@ -992,9 +1128,14 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         });
 
         // Apply offset and limit
-        let final_result: Vec<RelationEntry> = result.into_iter().skip(offset).take(limit).collect();
+        let final_result: Vec<RelationEntry> =
+            result.into_iter().skip(offset).take(limit).collect();
 
-        Ok(Relation::from_entries(final_result, tables, table_column_counts))
+        Ok(Relation::from_entries(
+            final_result,
+            tables,
+            table_column_counts,
+        ))
     }
 
     // ========== Expression Evaluation ==========
@@ -1002,7 +1143,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
     /// Evaluates an expression against a relation entry.
     /// If `ctx` is provided, column indices are dynamically computed based on table metadata.
     /// This is needed for JOIN queries where the optimizer may have reordered tables.
-    fn eval_expr_ctx(&self, expr: &Expr, entry: &RelationEntry, ctx: Option<&EvalContext<'_>>) -> Value {
+    fn eval_expr_ctx(
+        &self,
+        expr: &Expr,
+        entry: &RelationEntry,
+        ctx: Option<&EvalContext<'_>>,
+    ) -> Value {
         match expr {
             Expr::Column(col) => {
                 let index = if let Some(c) = ctx {
@@ -1050,13 +1196,17 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
 
             Expr::In { expr, list } => {
                 let val = self.eval_expr_ctx(expr, entry, ctx);
-                let in_list = list.iter().any(|item| self.eval_expr_ctx(item, entry, ctx) == val);
+                let in_list = list
+                    .iter()
+                    .any(|item| self.eval_expr_ctx(item, entry, ctx) == val);
                 Value::Boolean(in_list)
             }
 
             Expr::NotIn { expr, list } => {
                 let val = self.eval_expr_ctx(expr, entry, ctx);
-                let in_list = list.iter().any(|item| self.eval_expr_ctx(item, entry, ctx) == val);
+                let in_list = list
+                    .iter()
+                    .any(|item| self.eval_expr_ctx(item, entry, ctx) == val);
                 Value::Boolean(!in_list)
             }
 
@@ -1097,7 +1247,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }
 
             Expr::Function { name, args } => {
-                let arg_values: Vec<Value> = args.iter().map(|a| self.eval_expr_ctx(a, entry, ctx)).collect();
+                let arg_values: Vec<Value> = args
+                    .iter()
+                    .map(|a| self.eval_expr_ctx(a, entry, ctx))
+                    .collect();
                 self.eval_function(name, &arg_values)
             }
         }
@@ -1121,7 +1274,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
 
     /// Evaluates a predicate expression with context for JOIN queries.
     #[inline]
-    fn eval_predicate_ctx(&self, expr: &Expr, entry: &RelationEntry, ctx: &EvalContext<'_>) -> bool {
+    fn eval_predicate_ctx(
+        &self,
+        expr: &Expr,
+        entry: &RelationEntry,
+        ctx: &EvalContext<'_>,
+    ) -> bool {
         match self.eval_expr_ctx(expr, entry, Some(ctx)) {
             Value::Boolean(b) => b,
             Value::Null => false,
@@ -1182,16 +1340,16 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 match right {
                     Value::Int32(0) | Value::Int64(0) => Value::Null,
                     Value::Float64(f) if *f == 0.0 => Value::Null,
-                    _ => self.eval_arithmetic(left, right, |a, b| if b != 0.0 { a / b } else { 0.0 }),
+                    _ => {
+                        self.eval_arithmetic(left, right, |a, b| if b != 0.0 { a / b } else { 0.0 })
+                    }
                 }
             }
-            BinaryOp::Mod => {
-                match (left, right) {
-                    (Value::Int64(a), Value::Int64(b)) if *b != 0 => Value::Int64(a % b),
-                    (Value::Int32(a), Value::Int32(b)) if *b != 0 => Value::Int32(a % b),
-                    _ => Value::Null,
-                }
-            }
+            BinaryOp::Mod => match (left, right) {
+                (Value::Int64(a), Value::Int64(b)) if *b != 0 => Value::Int64(a % b),
+                (Value::Int32(a), Value::Int32(b)) if *b != 0 => Value::Int32(a % b),
+                _ => Value::Null,
+            },
             BinaryOp::Like | BinaryOp::In | BinaryOp::Between => {
                 // These are handled specially in eval_expr
                 Value::Null
@@ -1297,11 +1455,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 }
                 Value::Boolean(false)
             }
-            // JSONB contains: jsonb_contains(jsonb_value, path)
+            // JSONB contains: jsonb_contains(jsonb_value, path, expected_value)
             "JSONB_CONTAINS" => {
-                if args.len() >= 2 {
+                if args.len() >= 3 {
                     if let (Value::Jsonb(jsonb), Value::String(path)) = (&args[0], &args[1]) {
-                        return self.jsonb_path_exists(jsonb, path);
+                        return self.jsonb_contains(jsonb, path, &args[2]);
                     }
                 }
                 Value::Boolean(false)
@@ -1507,7 +1665,9 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         // Handle alternation by splitting into alternatives
         let alternatives = self.split_alternatives(ops);
         if alternatives.len() > 1 {
-            return alternatives.iter().any(|alt| self.regex_match_ops(&chars, alt, 0, 0));
+            return alternatives
+                .iter()
+                .any(|alt| self.regex_match_ops(&chars, alt, 0, 0));
         }
 
         // Check if pattern requires start anchor
@@ -1689,13 +1849,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         })
     }
 
-    fn match_like_recursive(
-        &self,
-        value: &[char],
-        pattern: &[char],
-        vi: usize,
-        pi: usize,
-    ) -> bool {
+    fn match_like_recursive(&self, value: &[char], pattern: &[char], vi: usize, pi: usize) -> bool {
         if pi >= pattern.len() {
             return vi >= value.len();
         }
@@ -1953,6 +2107,39 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         Value::Boolean(!results.is_empty())
     }
 
+    /// Evaluates a JSONB contains expression using the extracted path value.
+    fn jsonb_contains(
+        &self,
+        jsonb: &cynos_core::JsonbValue,
+        path: &str,
+        expected: &Value,
+    ) -> Value {
+        let json_value = match self.parse_json_bytes(&jsonb.0) {
+            Some(v) => v,
+            None => return Value::Boolean(false),
+        };
+
+        let json_path = match JsonPath::parse(path) {
+            Ok(p) => p,
+            Err(_) => return Value::Boolean(false),
+        };
+
+        let results = json_value.query(&json_path);
+        if results.is_empty() {
+            return Value::Boolean(false);
+        }
+
+        let actual = results[0];
+        let contains = match expected {
+            Value::String(expected_str) => self
+                .jsonb_value_to_string(actual)
+                .contains(expected_str.as_str()),
+            _ => self.compare_jsonb_value(actual, expected),
+        };
+
+        Value::Boolean(contains)
+    }
+
     /// Compares a JsonbValue with a Value.
     fn compare_jsonb_value(&self, jsonb: &JsonbValue, value: &Value) -> bool {
         match (jsonb, value) {
@@ -1964,6 +2151,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             (JsonbValue::String(a), Value::String(b)) => a == b,
             _ => false,
         }
+    }
+
+    fn jsonb_value_to_string(&self, value: &JsonbValue) -> String {
+        value.stringify_for_contains()
     }
 
     // ========== Helper Methods ==========
@@ -2082,8 +2273,18 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 }
             }
             Expr::BinaryOp { left, op, right } => {
-                let adjusted_left = self.adjust_join_condition_indices(left, left_tables, right_tables, left_col_count);
-                let adjusted_right = self.adjust_join_condition_indices(right, left_tables, right_tables, left_col_count);
+                let adjusted_left = self.adjust_join_condition_indices(
+                    left,
+                    left_tables,
+                    right_tables,
+                    left_col_count,
+                );
+                let adjusted_right = self.adjust_join_condition_indices(
+                    right,
+                    left_tables,
+                    right_tables,
+                    left_col_count,
+                );
                 Expr::BinaryOp {
                     left: Box::new(adjusted_left),
                     op: *op,
@@ -2091,7 +2292,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 }
             }
             Expr::UnaryOp { op, expr } => {
-                let adjusted_expr = self.adjust_join_condition_indices(expr, left_tables, right_tables, left_col_count);
+                let adjusted_expr = self.adjust_join_condition_indices(
+                    expr,
+                    left_tables,
+                    right_tables,
+                    left_col_count,
+                );
                 Expr::UnaryOp {
                     op: *op,
                     expr: Box::new(adjusted_expr),
@@ -2117,10 +2323,83 @@ struct TableData {
     column_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum InMemoryIndexKey {
+    Scalar(Value),
+    Composite(Vec<Value>),
+}
+
 /// Data for a single index.
 struct IndexData {
     /// Maps key values to row indices.
-    key_to_rows: BTreeMap<Value, Vec<usize>>,
+    key_to_rows: BTreeMap<InMemoryIndexKey, Vec<usize>>,
+}
+
+impl InMemoryIndexKey {
+    fn scalar(value: Value) -> Self {
+        Self::Scalar(value)
+    }
+
+    fn composite(values: Vec<Value>) -> Self {
+        if values.len() == 1 {
+            Self::Scalar(values.into_iter().next().unwrap_or(Value::Null))
+        } else {
+            Self::Composite(values)
+        }
+    }
+}
+
+fn in_memory_scalar_range(
+    range_start: Option<&Value>,
+    range_end: Option<&Value>,
+    include_start: bool,
+    include_end: bool,
+) -> Option<KeyRange<InMemoryIndexKey>> {
+    match (range_start, range_end) {
+        (Some(start), Some(end)) => Some(KeyRange::bound(
+            InMemoryIndexKey::scalar(start.clone()),
+            InMemoryIndexKey::scalar(end.clone()),
+            !include_start,
+            !include_end,
+        )),
+        (Some(start), None) => Some(KeyRange::lower_bound(
+            InMemoryIndexKey::scalar(start.clone()),
+            !include_start,
+        )),
+        (None, Some(end)) => Some(KeyRange::upper_bound(
+            InMemoryIndexKey::scalar(end.clone()),
+            !include_end,
+        )),
+        (None, None) => None,
+    }
+}
+
+fn in_memory_composite_range(
+    range: Option<&KeyRange<Vec<Value>>>,
+) -> Option<KeyRange<InMemoryIndexKey>> {
+    range.cloned().map(|range| match range {
+        KeyRange::All => KeyRange::All,
+        KeyRange::Only(values) => KeyRange::Only(InMemoryIndexKey::composite(values)),
+        KeyRange::LowerBound { value, exclusive } => KeyRange::LowerBound {
+            value: InMemoryIndexKey::composite(value),
+            exclusive,
+        },
+        KeyRange::UpperBound { value, exclusive } => KeyRange::UpperBound {
+            value: InMemoryIndexKey::composite(value),
+            exclusive,
+        },
+        KeyRange::Bound {
+            lower,
+            upper,
+            lower_exclusive,
+            upper_exclusive,
+        } => KeyRange::Bound {
+            lower: InMemoryIndexKey::composite(lower),
+            upper: InMemoryIndexKey::composite(upper),
+            lower_exclusive,
+            upper_exclusive,
+        },
+    })
 }
 
 impl InMemoryDataSource {
@@ -2153,12 +2432,47 @@ impl InMemoryDataSource {
             .get_mut(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        let mut key_to_rows: BTreeMap<Value, Vec<usize>> = BTreeMap::new();
+        let mut key_to_rows: BTreeMap<InMemoryIndexKey, Vec<usize>> = BTreeMap::new();
 
         for (row_idx, row) in table_data.rows.iter().enumerate() {
             if let Some(key) = row.get(column_index) {
-                key_to_rows.entry(key.clone()).or_default().push(row_idx);
+                key_to_rows
+                    .entry(InMemoryIndexKey::scalar(key.clone()))
+                    .or_default()
+                    .push(row_idx);
             }
+        }
+
+        table_data
+            .indexes
+            .insert(index_name.into(), IndexData { key_to_rows });
+
+        Ok(())
+    }
+
+    /// Creates a composite index on multiple table columns.
+    pub fn create_composite_index(
+        &mut self,
+        table: &str,
+        index_name: impl Into<String>,
+        column_indices: &[usize],
+    ) -> ExecutionResult<()> {
+        let table_data = self
+            .tables
+            .get_mut(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        let mut key_to_rows: BTreeMap<InMemoryIndexKey, Vec<usize>> = BTreeMap::new();
+
+        for (row_idx, row) in table_data.rows.iter().enumerate() {
+            let key = column_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
+                .collect();
+            key_to_rows
+                .entry(InMemoryIndexKey::composite(key))
+                .or_default()
+                .push(row_idx);
         }
 
         table_data
@@ -2191,44 +2505,20 @@ impl DataSource for InMemoryDataSource {
             .get(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        let index_data = table_data.indexes.get(index).ok_or_else(|| {
-            ExecutionError::IndexNotFound {
-                table: table.into(),
-                index: index.into(),
-            }
-        })?;
+        let index_data =
+            table_data
+                .indexes
+                .get(index)
+                .ok_or_else(|| ExecutionError::IndexNotFound {
+                    table: table.into(),
+                    index: index.into(),
+                })?;
 
         let mut result = Vec::new();
+        let range = in_memory_scalar_range(range_start, range_end, include_start, include_end);
 
         for (key, row_indices) in &index_data.key_to_rows {
-            let in_range = match (range_start, range_end) {
-                (Some(start), Some(end)) => {
-                    let start_ok = if include_start {
-                        key >= start
-                    } else {
-                        key > start
-                    };
-                    let end_ok = if include_end { key <= end } else { key < end };
-                    start_ok && end_ok
-                }
-                (Some(start), None) => {
-                    if include_start {
-                        key >= start
-                    } else {
-                        key > start
-                    }
-                }
-                (None, Some(end)) => {
-                    if include_end {
-                        key <= end
-                    } else {
-                        key < end
-                    }
-                }
-                (None, None) => true,
-            };
-
-            if in_range {
+            if range.as_ref().map(|range| range.contains(key)).unwrap_or(true) {
                 for &idx in row_indices {
                     result.push(Rc::clone(&table_data.rows[idx]));
                 }
@@ -2255,45 +2545,21 @@ impl DataSource for InMemoryDataSource {
             .get(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        let index_data = table_data.indexes.get(index).ok_or_else(|| {
-            ExecutionError::IndexNotFound {
-                table: table.into(),
-                index: index.into(),
-            }
-        })?;
+        let index_data =
+            table_data
+                .indexes
+                .get(index)
+                .ok_or_else(|| ExecutionError::IndexNotFound {
+                    table: table.into(),
+                    index: index.into(),
+                })?;
 
         // Collect keys in range first
-        let keys_in_range: Vec<&Value> = index_data
+        let range = in_memory_scalar_range(range_start, range_end, include_start, include_end);
+        let keys_in_range: Vec<&InMemoryIndexKey> = index_data
             .key_to_rows
             .keys()
-            .filter(|key| {
-                match (range_start, range_end) {
-                    (Some(start), Some(end)) => {
-                        let start_ok = if include_start {
-                            *key >= start
-                        } else {
-                            *key > start
-                        };
-                        let end_ok = if include_end { *key <= end } else { *key < end };
-                        start_ok && end_ok
-                    }
-                    (Some(start), None) => {
-                        if include_start {
-                            *key >= start
-                        } else {
-                            *key > start
-                        }
-                    }
-                    (None, Some(end)) => {
-                        if include_end {
-                            *key <= end
-                        } else {
-                            *key < end
-                        }
-                    }
-                    (None, None) => true,
-                }
-            })
+            .filter(|key| range.as_ref().map(|range| range.contains(key)).unwrap_or(true))
             .collect();
 
         let mut result = Vec::new();
@@ -2301,7 +2567,7 @@ impl DataSource for InMemoryDataSource {
         let mut collected = 0;
 
         // Iterate in forward or reverse order based on the reverse flag
-        let iter: Box<dyn Iterator<Item = &&Value>> = if reverse {
+        let iter: Box<dyn Iterator<Item = &&InMemoryIndexKey>> = if reverse {
             Box::new(keys_in_range.iter().rev())
         } else {
             Box::new(keys_in_range.iter())
@@ -2330,24 +2596,97 @@ impl DataSource for InMemoryDataSource {
         Ok(result)
     }
 
-    fn get_index_point(&self, table: &str, index: &str, key: &Value) -> ExecutionResult<Vec<Rc<Row>>> {
+    fn get_index_point(
+        &self,
+        table: &str,
+        index: &str,
+        key: &Value,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
         let table_data = self
             .tables
             .get(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        let index_data = table_data.indexes.get(index).ok_or_else(|| {
-            ExecutionError::IndexNotFound {
-                table: table.into(),
-                index: index.into(),
-            }
-        })?;
+        let index_data =
+            table_data
+                .indexes
+                .get(index)
+                .ok_or_else(|| ExecutionError::IndexNotFound {
+                    table: table.into(),
+                    index: index.into(),
+                })?;
 
         let result = index_data
             .key_to_rows
-            .get(key)
-            .map(|indices| indices.iter().map(|&i| Rc::clone(&table_data.rows[i])).collect())
+            .get(&InMemoryIndexKey::scalar(key.clone()))
+            .map(|indices| {
+                indices
+                    .iter()
+                    .map(|&i| Rc::clone(&table_data.rows[i]))
+                    .collect()
+            })
             .unwrap_or_default();
+
+        Ok(result)
+    }
+
+    fn get_index_range_composite_with_limit(
+        &self,
+        table: &str,
+        index: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> ExecutionResult<Vec<Rc<Row>>> {
+        let table_data = self
+            .tables
+            .get(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        let index_data =
+            table_data
+                .indexes
+                .get(index)
+                .ok_or_else(|| ExecutionError::IndexNotFound {
+                    table: table.into(),
+                    index: index.into(),
+                })?;
+
+        let range = in_memory_composite_range(range);
+        let keys_in_range: Vec<&InMemoryIndexKey> = index_data
+            .key_to_rows
+            .keys()
+            .filter(|key| range.as_ref().map(|range| range.contains(key)).unwrap_or(true))
+            .collect();
+
+        let mut result = Vec::new();
+        let mut skipped = 0;
+        let mut collected = 0;
+
+        let iter: Box<dyn Iterator<Item = &&InMemoryIndexKey>> = if reverse {
+            Box::new(keys_in_range.iter().rev())
+        } else {
+            Box::new(keys_in_range.iter())
+        };
+
+        for key in iter {
+            if let Some(row_indices) = index_data.key_to_rows.get(*key) {
+                for &idx in row_indices {
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    if let Some(lim) = limit {
+                        if collected >= lim {
+                            return Ok(result);
+                        }
+                    }
+                    result.push(Rc::clone(&table_data.rows[idx]));
+                    collected += 1;
+                }
+            }
+        }
 
         Ok(result)
     }
@@ -2372,9 +2711,30 @@ mod tests {
 
         // Users table: id, name, dept_id
         let users = vec![
-            Row::new(1, vec![Value::Int64(1), Value::String("Alice".into()), Value::Int64(10)]),
-            Row::new(2, vec![Value::Int64(2), Value::String("Bob".into()), Value::Int64(20)]),
-            Row::new(3, vec![Value::Int64(3), Value::String("Charlie".into()), Value::Int64(10)]),
+            Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    Value::String("Alice".into()),
+                    Value::Int64(10),
+                ],
+            ),
+            Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    Value::String("Bob".into()),
+                    Value::Int64(20),
+                ],
+            ),
+            Row::new(
+                3,
+                vec![
+                    Value::Int64(3),
+                    Value::String("Charlie".into()),
+                    Value::Int64(10),
+                ],
+            ),
         ];
         ds.add_table("users", users, 3);
         ds.create_index("users", "idx_id", 0).unwrap();
@@ -2382,9 +2742,15 @@ mod tests {
 
         // Departments table: id, name
         let depts = vec![
-            Row::new(10, vec![Value::Int64(10), Value::String("Engineering".into())]),
+            Row::new(
+                10,
+                vec![Value::Int64(10), Value::String("Engineering".into())],
+            ),
             Row::new(20, vec![Value::Int64(20), Value::String("Sales".into())]),
-            Row::new(30, vec![Value::Int64(30), Value::String("Marketing".into())]),
+            Row::new(
+                30,
+                vec![Value::Int64(30), Value::String("Marketing".into())],
+            ),
         ];
         ds.add_table("departments", depts, 2);
         ds.create_index("departments", "idx_id", 0).unwrap();
@@ -2412,10 +2778,12 @@ mod tests {
         let plan = PhysicalPlan::IndexScan {
             table: "users".into(),
             index: "idx_id".into(),
-            range_start: Some(Value::Int64(1)),
-            range_end: Some(Value::Int64(2)),
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::Scalar(KeyRange::bound(
+                Value::Int64(1),
+                Value::Int64(2),
+                false,
+                false,
+            )),
             limit: None,
             offset: None,
             reverse: false,
@@ -2423,6 +2791,59 @@ mod tests {
         let result = runner.execute(&plan).unwrap();
 
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_composite_index_scan_with_tuple_bounds() {
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "scores",
+            vec![
+                Row::new(
+                    1,
+                    vec![Value::String("apac".into()), Value::Int64(5)],
+                ),
+                Row::new(
+                    2,
+                    vec![Value::String("apac".into()), Value::Int64(10)],
+                ),
+                Row::new(
+                    3,
+                    vec![Value::String("apac".into()), Value::Int64(20)],
+                ),
+                Row::new(
+                    4,
+                    vec![Value::String("emea".into()), Value::Int64(10)],
+                ),
+            ],
+            2,
+        );
+        ds.create_composite_index("scores", "idx_region_score", &[0, 1])
+            .unwrap();
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let plan = PhysicalPlan::IndexScan {
+            table: "scores".into(),
+            index: "idx_region_score".into(),
+            bounds: IndexBounds::Composite(KeyRange::bound(
+                alloc::vec![Value::String("apac".into()), Value::Int64(10)],
+                alloc::vec![Value::String("apac".into()), Value::Int64(20)],
+                false,
+                false,
+            )),
+            limit: None,
+            offset: None,
+            reverse: false,
+        };
+
+        let result = runner.execute(&plan).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.entries[0].get_field(0),
+            Some(&Value::String("apac".into()))
+        );
+        assert_eq!(result.entries[0].get_field(1), Some(&Value::Int64(10)));
+        assert_eq!(result.entries[1].get_field(1), Some(&Value::Int64(20)));
     }
 
     #[test]
@@ -2475,6 +2896,39 @@ mod tests {
 
         assert_eq!(result.len(), 3);
         assert_eq!(result.entries[0].row.len(), 2);
+    }
+
+    #[test]
+    fn test_project_preserves_row_version() {
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "users",
+            vec![Row::new_with_version(
+                1,
+                7,
+                vec![
+                    Value::Int64(1),
+                    Value::String("Alice".into()),
+                    Value::Int64(10),
+                ],
+            )],
+            3,
+        );
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let plan = PhysicalPlan::project(
+            PhysicalPlan::table_scan("users"),
+            vec![Expr::column("users", "name", 1)],
+        );
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.entries[0].row.version(), 7);
+        assert_eq!(result.entries[0].row.id(), 1);
+        assert_eq!(
+            result.entries[0].get_field(0),
+            Some(&Value::String("Alice".into()))
+        );
     }
 
     #[test]
@@ -2663,6 +3117,80 @@ mod tests {
 
         // Two groups: dept_id=10 (2 users), dept_id=20 (1 user)
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_aggregate_after_join_group_by_right_table_column() {
+        let ds = create_test_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let join_plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("users"),
+            PhysicalPlan::table_scan("departments"),
+            Expr::eq(
+                Expr::column("users", "dept_id", 2),
+                Expr::column("departments", "id", 0),
+            ),
+            JoinType::Inner,
+        );
+
+        let plan = PhysicalPlan::hash_aggregate(
+            join_plan,
+            vec![Expr::column("departments", "name", 1)],
+            vec![(AggregateFunc::Count, Expr::column("users", "id", 0))],
+        );
+        let result = runner.execute(&plan).unwrap();
+
+        let groups: Vec<(String, i64)> = result
+            .entries
+            .iter()
+            .map(|entry| {
+                let group_name = match entry.get_field(0) {
+                    Some(Value::String(name)) => name.clone(),
+                    other => panic!("Expected group name string, got {:?}", other),
+                };
+                let count = match entry.get_field(1) {
+                    Some(Value::Int64(count)) => *count,
+                    other => panic!("Expected count int64, got {:?}", other),
+                };
+                (group_name, count)
+            })
+            .collect();
+
+        assert_eq!(
+            groups,
+            vec![(String::from("Engineering"), 2), (String::from("Sales"), 1),]
+        );
+    }
+
+    #[test]
+    fn test_aggregate_after_join_sum_right_table_column() {
+        let ds = create_test_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let join_plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("users"),
+            PhysicalPlan::table_scan("departments"),
+            Expr::eq(
+                Expr::column("users", "dept_id", 2),
+                Expr::column("departments", "id", 0),
+            ),
+            JoinType::Inner,
+        );
+
+        let plan = PhysicalPlan::hash_aggregate(
+            join_plan,
+            vec![],
+            vec![(AggregateFunc::Sum, Expr::column("departments", "id", 0))],
+        );
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.entries[0].get_field(0),
+            Some(&Value::Int64(40)),
+            "SUM over right-table join column should use the joined-row offset, not the left-table column with the same relative index",
+        );
     }
 
     #[test]
@@ -2981,37 +3509,49 @@ mod tests {
         let plan_forward = PhysicalPlan::IndexScan {
             table: "scores".into(),
             index: "idx_score".into(),
-            range_start: None,
-            range_end: None,
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::all(),
             limit: Some(3),
             offset: None,
             reverse: false,
         };
         let result_forward = runner.execute(&plan_forward).unwrap();
         assert_eq!(result_forward.len(), 3);
-        assert_eq!(result_forward.entries[0].get_field(0), Some(&Value::Int64(10)));
-        assert_eq!(result_forward.entries[1].get_field(0), Some(&Value::Int64(20)));
-        assert_eq!(result_forward.entries[2].get_field(0), Some(&Value::Int64(30)));
+        assert_eq!(
+            result_forward.entries[0].get_field(0),
+            Some(&Value::Int64(10))
+        );
+        assert_eq!(
+            result_forward.entries[1].get_field(0),
+            Some(&Value::Int64(20))
+        );
+        assert_eq!(
+            result_forward.entries[2].get_field(0),
+            Some(&Value::Int64(30))
+        );
 
         // Reverse scan with limit 3: should get 50, 40, 30
         let plan_reverse = PhysicalPlan::IndexScan {
             table: "scores".into(),
             index: "idx_score".into(),
-            range_start: None,
-            range_end: None,
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::all(),
             limit: Some(3),
             offset: None,
             reverse: true,
         };
         let result_reverse = runner.execute(&plan_reverse).unwrap();
         assert_eq!(result_reverse.len(), 3);
-        assert_eq!(result_reverse.entries[0].get_field(0), Some(&Value::Int64(50)));
-        assert_eq!(result_reverse.entries[1].get_field(0), Some(&Value::Int64(40)));
-        assert_eq!(result_reverse.entries[2].get_field(0), Some(&Value::Int64(30)));
+        assert_eq!(
+            result_reverse.entries[0].get_field(0),
+            Some(&Value::Int64(50))
+        );
+        assert_eq!(
+            result_reverse.entries[1].get_field(0),
+            Some(&Value::Int64(40))
+        );
+        assert_eq!(
+            result_reverse.entries[2].get_field(0),
+            Some(&Value::Int64(30))
+        );
     }
 
     #[test]
@@ -3035,10 +3575,7 @@ mod tests {
         let plan = PhysicalPlan::IndexScan {
             table: "scores".into(),
             index: "idx_score".into(),
-            range_start: None,
-            range_end: None,
-            include_start: true,
-            include_end: true,
+            bounds: IndexBounds::all(),
             limit: Some(2),
             offset: Some(1),
             reverse: true,
@@ -3276,9 +3813,18 @@ mod tests {
         let result = runner.execute(&plan).unwrap();
 
         assert_eq!(result.len(), 3);
-        assert_eq!(result.entries[0].get_field(0), Some(&Value::String("Alice".into())));
-        assert_eq!(result.entries[1].get_field(0), Some(&Value::String("Bob".into())));
-        assert_eq!(result.entries[2].get_field(0), Some(&Value::String("Charlie".into())));
+        assert_eq!(
+            result.entries[0].get_field(0),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(
+            result.entries[1].get_field(0),
+            Some(&Value::String("Bob".into()))
+        );
+        assert_eq!(
+            result.entries[2].get_field(0),
+            Some(&Value::String("Charlie".into()))
+        );
     }
 
     #[test]
@@ -3307,5 +3853,72 @@ mod tests {
         assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(10)));
         assert_eq!(result.entries[1].get_field(0), Some(&Value::Int64(20)));
         assert_eq!(result.entries[2].get_field(0), Some(&Value::Int64(30)));
+    }
+
+    #[test]
+    fn test_jsonb_contains_uses_provided_value() {
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "products",
+            vec![
+                Row::new(
+                    1,
+                    vec![
+                        Value::Int64(1),
+                        Value::String("Laptop".into()),
+                        Value::Jsonb(cynos_core::JsonbValue(
+                            br#"{"tags":["computer","portable"]}"#.to_vec(),
+                        )),
+                    ],
+                ),
+                Row::new(
+                    2,
+                    vec![
+                        Value::Int64(2),
+                        Value::String("Phone".into()),
+                        Value::Jsonb(cynos_core::JsonbValue(br#"{"tags":["mobile"]}"#.to_vec())),
+                    ],
+                ),
+                Row::new(
+                    3,
+                    vec![
+                        Value::Int64(3),
+                        Value::String("Tablet".into()),
+                        Value::Jsonb(cynos_core::JsonbValue(
+                            br#"{"tags":["portable","touch"]}"#.to_vec(),
+                        )),
+                    ],
+                ),
+            ],
+            3,
+        );
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let plan = PhysicalPlan::filter(
+            PhysicalPlan::table_scan("products"),
+            Expr::Function {
+                name: "JSONB_CONTAINS".into(),
+                args: vec![
+                    Expr::column("products", "metadata", 2),
+                    Expr::literal(Value::String("$.tags".into())),
+                    Expr::literal(Value::String("portable".into())),
+                ],
+            },
+        );
+
+        let result = runner.execute(&plan).unwrap();
+        let matched_names: Vec<String> = result
+            .entries
+            .iter()
+            .filter_map(|entry| match entry.get_field(1) {
+                Some(Value::String(name)) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            matched_names,
+            vec![String::from("Laptop"), String::from("Tablet")]
+        );
     }
 }

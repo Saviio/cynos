@@ -2,12 +2,12 @@
 //!
 //! Target: single row incremental update < 100μs
 
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use cynos_core::{Row, Value};
 use cynos_incremental::{
-    filter_incremental, map_incremental, Delta, IncrementalAvg, IncrementalCount,
-    IncrementalHashJoin, IncrementalSum, MaterializedView, DataflowNode,
+    filter_incremental, map_incremental, DataflowNode, Delta, IncrementalAvg, IncrementalCount,
+    IncrementalHashJoin, IncrementalSum, MaterializedView,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 
 fn make_row(id: u64, age: i64) -> Row {
     Row::new(id, vec![Value::Int64(id as i64), Value::Int64(age)])
@@ -38,9 +38,7 @@ fn bench_filter_incremental(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("filter_gt_50", size),
             &deltas,
-            |b, deltas| {
-                b.iter(|| filter_incremental(black_box(deltas), |&x| x > 50))
-            },
+            |b, deltas| b.iter(|| filter_incremental(black_box(deltas), |&x| x > 50)),
         );
     }
 
@@ -56,9 +54,7 @@ fn bench_map_incremental(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("map_double", size),
             &deltas,
-            |b, deltas| {
-                b.iter(|| map_incremental(black_box(deltas), |&x| x * 2))
-            },
+            |b, deltas| b.iter(|| map_incremental(black_box(deltas), |&x| x * 2)),
         );
     }
 
@@ -107,7 +103,9 @@ fn bench_incremental_sum(c: &mut Criterion) {
 
     // Batch insert
     for size in [10, 100, 1000] {
-        let deltas: Vec<Delta<Row>> = (0..size).map(|i| Delta::insert(make_row(i, i as i64 * 10))).collect();
+        let deltas: Vec<Delta<Row>> = (0..size)
+            .map(|i| Delta::insert(make_row(i, i as i64 * 10)))
+            .collect();
         group.bench_with_input(
             BenchmarkId::new("batch_insert", size),
             &deltas,
@@ -147,7 +145,10 @@ fn bench_incremental_join(c: &mut Criterion) {
         );
         // Add 10 departments
         for i in 0..10 {
-            let dept = Row::new(i as u64, vec![Value::Int64(i), Value::String(format!("Dept{}", i).into())]);
+            let dept = Row::new(
+                i as u64,
+                vec![Value::Int64(i), Value::String(format!("Dept{}", i).into())],
+            );
             join.on_right_insert(dept);
         }
         join
@@ -157,15 +158,18 @@ fn bench_incremental_join(c: &mut Criterion) {
     group.bench_function("single_left_insert", |b| {
         let mut join = setup_join();
         let emp = Row::new(100, vec![Value::Int64(100), Value::Int64(5)]); // emp with dept_id=5
-        b.iter(|| {
-            join.on_left_insert(black_box(emp.clone()))
-        })
+        b.iter(|| join.on_left_insert(black_box(emp.clone())))
     });
 
     // Batch left inserts
     for size in [10, 100] {
         let employees: Vec<Row> = (0..size)
-            .map(|i| Row::new(i as u64, vec![Value::Int64(i as i64), Value::Int64(i as i64 % 10)]))
+            .map(|i| {
+                Row::new(
+                    i as u64,
+                    vec![Value::Int64(i as i64), Value::Int64(i as i64 % 10)],
+                )
+            })
             .collect();
 
         group.bench_with_input(
@@ -194,23 +198,21 @@ fn bench_materialized_view(c: &mut Criterion) {
         let mut view = MaterializedView::new(dataflow);
         let deltas = vec![Delta::insert(make_row(1, 25))];
 
-        b.iter(|| {
-            view.on_table_change(1, black_box(deltas.clone()))
-        })
+        b.iter(|| view.on_table_change(1, black_box(deltas.clone())))
     });
 
     // Filter view - single insert propagation
     group.bench_function("filter_single_insert", |b| {
-        let dataflow = DataflowNode::filter(
-            DataflowNode::source(1),
-            |row| row.get(1).and_then(|v| v.as_i64()).map(|age| age > 18).unwrap_or(false)
-        );
+        let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
+            row.get(1)
+                .and_then(|v| v.as_i64())
+                .map(|age| age > 18)
+                .unwrap_or(false)
+        });
         let mut view = MaterializedView::new(dataflow);
         let deltas = vec![Delta::insert(make_row(1, 25))];
 
-        b.iter(|| {
-            view.on_table_change(1, black_box(deltas.clone()))
-        })
+        b.iter(|| view.on_table_change(1, black_box(deltas.clone())))
     });
 
     // Batch propagation through filter
@@ -223,10 +225,12 @@ fn bench_materialized_view(c: &mut Criterion) {
             BenchmarkId::new("filter_batch", size),
             &deltas,
             |b, deltas| {
-                let dataflow = DataflowNode::filter(
-                    DataflowNode::source(1),
-                    |row| row.get(1).and_then(|v| v.as_i64()).map(|age| age > 25).unwrap_or(false)
-                );
+                let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
+                    row.get(1)
+                        .and_then(|v| v.as_i64())
+                        .map(|age| age > 25)
+                        .unwrap_or(false)
+                });
                 let mut view = MaterializedView::new(dataflow);
                 b.iter(|| view.on_table_change(1, black_box(deltas.clone())))
             },

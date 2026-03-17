@@ -26,3 +26,7 @@ criterion = "0.5"
 [[bench]]
 name = "query_bench"
 harness = false
+
+[[bench]]
+name = "optimizer_bench"
+harness = false

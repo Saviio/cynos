@@ -151,8 +151,8 @@ mod tests {
     use super::*;
     use alloc::rc::Rc;
     use alloc::vec;
-    use cynos_core::{Row, Value};
     use core::cell::RefCell;
+    use cynos_core::{Row, Value};
 
     fn make_row(id: u64, value: i64) -> Row {
         Row::new(id, vec![Value::Int64(id as i64), Value::Int64(value)])

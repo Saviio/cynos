@@ -11,7 +11,10 @@ use alloc::vec::Vec;
 use cynos_core::schema::Table;
 use cynos_core::{Error, Result, Row, RowId, Value};
 use cynos_incremental::Delta;
-use cynos_index::{BTreeIndex, GinIndex, HashIndex, Index, KeyRange, RangeIndex};
+use cynos_index::{
+    contains_trigram_pairs, BTreeIndex, GinIndex, HashIndex, Index, KeyRange, RangeIndex,
+};
+use cynos_jsonb::{JsonbObject, JsonbValue as ParsedJsonbValue};
 
 /// Row storage backend: HashMap (O(1) lookup) or BTreeMap (O(log n) lookup).
 #[cfg(feature = "hash-store")]
@@ -19,10 +22,104 @@ type RowMap = hashbrown::HashMap<RowId, Rc<Row>>;
 #[cfg(not(feature = "hash-store"))]
 type RowMap = BTreeMap<RowId, Rc<Row>>;
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum IndexKey {
+    Scalar(Value),
+    Composite(Vec<Value>),
+}
+
+impl IndexKey {
+    #[inline]
+    fn scalar(value: Value) -> Self {
+        Self::Scalar(value)
+    }
+
+    #[inline]
+    fn from_values(mut values: Vec<Value>) -> Self {
+        if values.len() == 1 {
+            Self::Scalar(values.pop().unwrap_or(Value::Null))
+        } else {
+            Self::Composite(values)
+        }
+    }
+
+    #[inline]
+    fn from_row(row: &Row, col_indices: &[usize]) -> Self {
+        let values = col_indices
+            .iter()
+            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
+            .collect();
+        Self::from_values(values)
+    }
+
+    fn from_scalar_range(range: Option<&KeyRange<Value>>) -> Option<KeyRange<IndexKey>> {
+        range.cloned().map(|range| match range {
+            KeyRange::All => KeyRange::All,
+            KeyRange::Only(value) => KeyRange::Only(IndexKey::scalar(value)),
+            KeyRange::LowerBound { value, exclusive } => KeyRange::LowerBound {
+                value: IndexKey::scalar(value),
+                exclusive,
+            },
+            KeyRange::UpperBound { value, exclusive } => KeyRange::UpperBound {
+                value: IndexKey::scalar(value),
+                exclusive,
+            },
+            KeyRange::Bound {
+                lower,
+                upper,
+                lower_exclusive,
+                upper_exclusive,
+            } => KeyRange::Bound {
+                lower: IndexKey::scalar(lower),
+                upper: IndexKey::scalar(upper),
+                lower_exclusive,
+                upper_exclusive,
+            },
+        })
+    }
+
+    fn from_composite_range(range: Option<&KeyRange<Vec<Value>>>) -> Option<KeyRange<IndexKey>> {
+        range.cloned().map(|range| match range {
+            KeyRange::All => KeyRange::All,
+            KeyRange::Only(values) => KeyRange::Only(IndexKey::from_values(values)),
+            KeyRange::LowerBound { value, exclusive } => KeyRange::LowerBound {
+                value: IndexKey::from_values(value),
+                exclusive,
+            },
+            KeyRange::UpperBound { value, exclusive } => KeyRange::UpperBound {
+                value: IndexKey::from_values(value),
+                exclusive,
+            },
+            KeyRange::Bound {
+                lower,
+                upper,
+                lower_exclusive,
+                upper_exclusive,
+            } => KeyRange::Bound {
+                lower: IndexKey::from_values(lower),
+                upper: IndexKey::from_values(upper),
+                lower_exclusive,
+                upper_exclusive,
+            },
+        })
+    }
+
+    fn to_error_value(&self) -> Value {
+        match self {
+            Self::Scalar(value) => value.clone(),
+            Self::Composite(values) => Value::String(format!("{:?}", values)),
+        }
+    }
+}
+
 /// Trait for index storage that supports both point and range queries.
 pub trait IndexStore {
     /// Adds a key-value pair to the index.
-    fn add(&mut self, key: Value, row_id: RowId) -> core::result::Result<(), cynos_index::IndexError>;
+    fn add(
+        &mut self,
+        key: Value,
+        row_id: RowId,
+    ) -> core::result::Result<(), cynos_index::IndexError>;
     /// Sets a key-value pair, replacing any existing values.
     fn set(&mut self, key: Value, row_id: RowId);
     /// Gets all row IDs for a key.
@@ -44,14 +141,20 @@ pub trait IndexStore {
     /// Clears all entries.
     fn clear(&mut self);
     /// Gets range of row IDs.
-    fn get_range(&self, range: Option<&KeyRange<Value>>, reverse: bool, limit: Option<usize>, skip: usize) -> Vec<RowId>;
+    fn get_range(
+        &self,
+        range: Option<&KeyRange<Value>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+    ) -> Vec<RowId>;
     /// Returns all row IDs in the index.
     fn get_all(&self) -> Vec<RowId>;
 }
 
 /// Wrapper for BTreeIndex that implements IndexStore.
 pub struct BTreeIndexStore {
-    inner: BTreeIndex<Value>,
+    inner: BTreeIndex<IndexKey>,
 }
 
 impl BTreeIndexStore {
@@ -61,31 +164,77 @@ impl BTreeIndexStore {
             inner: BTreeIndex::new(64, unique),
         }
     }
-}
 
-impl IndexStore for BTreeIndexStore {
-    fn add(&mut self, key: Value, row_id: RowId) -> core::result::Result<(), cynos_index::IndexError> {
+    fn add_index_key(
+        &mut self,
+        key: IndexKey,
+        row_id: RowId,
+    ) -> core::result::Result<(), cynos_index::IndexError> {
         self.inner.add(key, row_id)
     }
 
-    fn set(&mut self, key: Value, row_id: RowId) {
+    fn set_index_key(&mut self, key: IndexKey, row_id: RowId) {
         self.inner.set(key, row_id);
     }
 
-    fn get(&self, key: &Value) -> Vec<RowId> {
+    fn get_index_key(&self, key: &IndexKey) -> Vec<RowId> {
         self.inner.get(key)
     }
 
-    fn remove(&mut self, key: &Value, row_id: Option<RowId>) {
+    fn remove_index_key(&mut self, key: &IndexKey, row_id: Option<RowId>) {
         self.inner.remove(key, row_id);
     }
 
-    fn remove_batch(&mut self, entries: &[(Value, RowId)]) {
+    fn remove_batch_index_keys(&mut self, entries: &[(IndexKey, RowId)]) {
         self.inner.remove_batch(entries);
     }
 
-    fn contains_key(&self, key: &Value) -> bool {
+    fn contains_index_key(&self, key: &IndexKey) -> bool {
         self.inner.contains_key(key)
+    }
+
+    fn get_range_index_keys(
+        &self,
+        range: Option<&KeyRange<IndexKey>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+    ) -> Vec<RowId> {
+        self.inner.get_range(range, reverse, limit, skip)
+    }
+}
+
+impl IndexStore for BTreeIndexStore {
+    fn add(
+        &mut self,
+        key: Value,
+        row_id: RowId,
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        self.add_index_key(IndexKey::scalar(key), row_id)
+    }
+
+    fn set(&mut self, key: Value, row_id: RowId) {
+        self.set_index_key(IndexKey::scalar(key), row_id);
+    }
+
+    fn get(&self, key: &Value) -> Vec<RowId> {
+        self.get_index_key(&IndexKey::scalar(key.clone()))
+    }
+
+    fn remove(&mut self, key: &Value, row_id: Option<RowId>) {
+        self.remove_index_key(&IndexKey::scalar(key.clone()), row_id);
+    }
+
+    fn remove_batch(&mut self, entries: &[(Value, RowId)]) {
+        let entries: Vec<(IndexKey, RowId)> = entries
+            .iter()
+            .map(|(key, row_id)| (IndexKey::scalar(key.clone()), *row_id))
+            .collect();
+        self.remove_batch_index_keys(&entries);
+    }
+
+    fn contains_key(&self, key: &Value) -> bool {
+        self.contains_index_key(&IndexKey::scalar(key.clone()))
     }
 
     fn len(&self) -> usize {
@@ -100,18 +249,25 @@ impl IndexStore for BTreeIndexStore {
         self.inner.clear();
     }
 
-    fn get_range(&self, range: Option<&KeyRange<Value>>, reverse: bool, limit: Option<usize>, skip: usize) -> Vec<RowId> {
-        self.inner.get_range(range, reverse, limit, skip)
+    fn get_range(
+        &self,
+        range: Option<&KeyRange<Value>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+    ) -> Vec<RowId> {
+        let range = IndexKey::from_scalar_range(range);
+        self.get_range_index_keys(range.as_ref(), reverse, limit, skip)
     }
 
     fn get_all(&self) -> Vec<RowId> {
-        self.inner.get_range(None, false, None, 0)
+        self.get_range_index_keys(None, false, None, 0)
     }
 }
 
 /// Wrapper for HashIndex that implements IndexStore.
 pub struct HashIndexStore {
-    inner: HashIndex<Value>,
+    inner: HashIndex<IndexKey>,
 }
 
 impl HashIndexStore {
@@ -121,34 +277,62 @@ impl HashIndexStore {
             inner: HashIndex::new(unique),
         }
     }
-}
 
-impl IndexStore for HashIndexStore {
-    fn add(&mut self, key: Value, row_id: RowId) -> core::result::Result<(), cynos_index::IndexError> {
+    fn add_index_key(
+        &mut self,
+        key: IndexKey,
+        row_id: RowId,
+    ) -> core::result::Result<(), cynos_index::IndexError> {
         self.inner.add(key, row_id)
     }
 
-    fn set(&mut self, key: Value, row_id: RowId) {
+    fn set_index_key(&mut self, key: IndexKey, row_id: RowId) {
         self.inner.set(key, row_id);
     }
 
-    fn get(&self, key: &Value) -> Vec<RowId> {
+    fn get_index_key(&self, key: &IndexKey) -> Vec<RowId> {
         self.inner.get(key)
     }
 
-    fn remove(&mut self, key: &Value, row_id: Option<RowId>) {
+    fn remove_index_key(&mut self, key: &IndexKey, row_id: Option<RowId>) {
         self.inner.remove(key, row_id);
+    }
+
+    fn contains_index_key(&self, key: &IndexKey) -> bool {
+        self.inner.contains_key(key)
+    }
+}
+
+impl IndexStore for HashIndexStore {
+    fn add(
+        &mut self,
+        key: Value,
+        row_id: RowId,
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        self.add_index_key(IndexKey::scalar(key), row_id)
+    }
+
+    fn set(&mut self, key: Value, row_id: RowId) {
+        self.set_index_key(IndexKey::scalar(key), row_id);
+    }
+
+    fn get(&self, key: &Value) -> Vec<RowId> {
+        self.get_index_key(&IndexKey::scalar(key.clone()))
+    }
+
+    fn remove(&mut self, key: &Value, row_id: Option<RowId>) {
+        self.remove_index_key(&IndexKey::scalar(key.clone()), row_id);
     }
 
     fn remove_batch(&mut self, entries: &[(Value, RowId)]) {
         // HashIndex doesn't have optimized batch remove, fall back to individual removes
         for (key, row_id) in entries {
-            self.inner.remove(key, Some(*row_id));
+            self.remove_index_key(&IndexKey::scalar(key.clone()), Some(*row_id));
         }
     }
 
     fn contains_key(&self, key: &Value) -> bool {
-        self.inner.contains_key(key)
+        self.contains_index_key(&IndexKey::scalar(key.clone()))
     }
 
     fn len(&self) -> usize {
@@ -163,7 +347,13 @@ impl IndexStore for HashIndexStore {
         self.inner.clear();
     }
 
-    fn get_range(&self, _range: Option<&KeyRange<Value>>, _reverse: bool, _limit: Option<usize>, _skip: usize) -> Vec<RowId> {
+    fn get_range(
+        &self,
+        _range: Option<&KeyRange<Value>>,
+        _reverse: bool,
+        _limit: Option<usize>,
+        _skip: usize,
+    ) -> Vec<RowId> {
         self.get_all()
     }
 
@@ -173,20 +363,21 @@ impl IndexStore for HashIndexStore {
 }
 
 /// Extracts the key value from a row for the given column indices.
-fn extract_key(row: &Row, col_indices: &[usize]) -> Value {
-    if col_indices.len() == 1 {
-        row.get(col_indices[0]).cloned().unwrap_or(Value::Null)
-    } else {
-        let values: Vec<Value> = col_indices
-            .iter()
-            .map(|&i| row.get(i).cloned().unwrap_or(Value::Null))
-            .collect();
-        let key_str: String = values
-            .iter()
-            .map(|v| format!("{:?}", v))
-            .collect::<Vec<_>>()
-            .join("|");
-        Value::String(key_str)
+fn extract_key(row: &Row, col_indices: &[usize]) -> IndexKey {
+    IndexKey::from_row(row, col_indices)
+}
+
+fn extract_key_from_values(values: &[Value]) -> IndexKey {
+    IndexKey::from_values(values.to_vec())
+}
+
+fn composite_range_has_expected_arity(range: &KeyRange<Vec<Value>>, expected: usize) -> bool {
+    match range {
+        KeyRange::All => true,
+        KeyRange::Only(values)
+        | KeyRange::LowerBound { value: values, .. }
+        | KeyRange::UpperBound { value: values, .. } => values.len() == expected,
+        KeyRange::Bound { lower, upper, .. } => lower.len() == expected && upper.len() == expected,
     }
 }
 
@@ -239,8 +430,12 @@ impl RowStore {
             // Check if this is a GIN index (for JSONB columns)
             if idx.get_index_type() == cynos_core::schema::IndexType::Gin {
                 if let Some(&col_idx) = cols.first() {
-                    store.gin_indices.insert(idx.name().to_string(), GinIndex::new());
-                    store.gin_index_columns.insert(idx.name().to_string(), col_idx);
+                    store
+                        .gin_indices
+                        .insert(idx.name().to_string(), GinIndex::new());
+                    store
+                        .gin_index_columns
+                        .insert(idx.name().to_string(), col_idx);
                 }
             } else {
                 store.secondary_indices.insert(
@@ -281,10 +476,10 @@ impl RowStore {
         let pk_value = if !self.pk_columns.is_empty() {
             let pk = extract_key(&row, &self.pk_columns);
             if let Some(ref pk_index) = self.primary_index {
-                if pk_index.contains_key(&pk) {
+                if pk_index.contains_index_key(&pk) {
                     return Err(Error::UniqueConstraint {
                         column: "primary_key".into(),
-                        value: pk,
+                        value: pk.to_error_value(),
                     });
                 }
             }
@@ -300,11 +495,12 @@ impl RowStore {
 
         // Add to primary key index
         if let (Some(ref mut pk_index), Some(pk)) = (&mut self.primary_index, pk_value.clone()) {
-            if pk_index.add(pk.clone(), row_id).is_err() {
-                self.row_id_index.remove(&Value::Int64(row_id as i64), Some(row_id));
+            if pk_index.add_index_key(pk.clone(), row_id).is_err() {
+                self.row_id_index
+                    .remove(&Value::Int64(row_id as i64), Some(row_id));
                 return Err(Error::UniqueConstraint {
                     column: "primary_key".into(),
-                    value: pk,
+                    value: pk.to_error_value(),
                 });
             }
         }
@@ -316,11 +512,11 @@ impl RowStore {
             let cols = &self.index_columns[idx_name];
             let key = extract_key(&row, cols);
             if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                if idx.add(key.clone(), row_id).is_err() {
+                if idx.add_index_key(key.clone(), row_id).is_err() {
                     self.rollback_insert(row_id, &row);
                     return Err(Error::UniqueConstraint {
                         column: idx_name.clone(),
-                        value: key,
+                        value: key.to_error_value(),
                     });
                 }
             }
@@ -342,11 +538,12 @@ impl RowStore {
     }
 
     fn rollback_insert(&mut self, row_id: RowId, row: &Row) {
-        self.row_id_index.remove(&Value::Int64(row_id as i64), Some(row_id));
+        self.row_id_index
+            .remove(&Value::Int64(row_id as i64), Some(row_id));
 
         if let Some(ref mut pk_index) = self.primary_index {
             let pk_value = extract_key(row, &self.pk_columns);
-            pk_index.remove(&pk_value, Some(row_id));
+            pk_index.remove_index_key(&pk_value, Some(row_id));
         }
 
         let index_names: Vec<String> = self.index_columns.keys().cloned().collect();
@@ -354,7 +551,7 @@ impl RowStore {
             let cols = &self.index_columns[idx_name];
             let key = extract_key(row, cols);
             if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                idx.remove(&key, Some(row_id));
+                idx.remove_index_key(&key, Some(row_id));
             }
         }
 
@@ -372,19 +569,21 @@ impl RowStore {
 
     /// Updates a row in the store.
     pub fn update(&mut self, row_id: RowId, new_row: Row) -> Result<()> {
-        let old_row = self.rows.get(&row_id).ok_or_else(|| {
-            Error::not_found(self.schema.name(), Value::Int64(row_id as i64))
-        })?.clone();
+        let old_row = self
+            .rows
+            .get(&row_id)
+            .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?
+            .clone();
 
         // Check primary key uniqueness if PK changed
         if !self.pk_columns.is_empty() {
             let old_pk = extract_key(&old_row, &self.pk_columns);
             let new_pk = extract_key(&new_row, &self.pk_columns);
             if let Some(ref pk_index) = self.primary_index {
-                if old_pk != new_pk && pk_index.contains_key(&new_pk) {
+                if old_pk != new_pk && pk_index.contains_index_key(&new_pk) {
                     return Err(Error::UniqueConstraint {
                         column: "primary_key".into(),
-                        value: new_pk,
+                        value: new_pk.to_error_value(),
                     });
                 }
             }
@@ -395,10 +594,10 @@ impl RowStore {
             let old_key = extract_key(&old_row, cols);
             let new_key = extract_key(&new_row, cols);
             if let Some(idx) = self.secondary_indices.get(idx_name) {
-                if idx.is_unique() && old_key != new_key && idx.contains_key(&new_key) {
+                if idx.is_unique() && old_key != new_key && idx.contains_index_key(&new_key) {
                     return Err(Error::UniqueConstraint {
                         column: idx_name.clone(),
-                        value: new_key,
+                        value: new_key.to_error_value(),
                     });
                 }
             }
@@ -410,8 +609,8 @@ impl RowStore {
             let new_pk = extract_key(&new_row, &self.pk_columns);
             if let Some(ref mut pk_index) = self.primary_index {
                 if old_pk != new_pk {
-                    pk_index.remove(&old_pk, Some(row_id));
-                    let _ = pk_index.add(new_pk, row_id);
+                    pk_index.remove_index_key(&old_pk, Some(row_id));
+                    let _ = pk_index.add_index_key(new_pk, row_id);
                 }
             }
         }
@@ -424,8 +623,8 @@ impl RowStore {
             let new_key = extract_key(&new_row, cols);
             if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
                 if old_key != new_key {
-                    idx.remove(&old_key, Some(row_id));
-                    let _ = idx.add(new_key, row_id);
+                    idx.remove_index_key(&old_key, Some(row_id));
+                    let _ = idx.add_index_key(new_key, row_id);
                 }
             }
         }
@@ -455,16 +654,18 @@ impl RowStore {
 
     /// Deletes a row from the store.
     pub fn delete(&mut self, row_id: RowId) -> Result<Rc<Row>> {
-        let row = self.rows.remove(&row_id).ok_or_else(|| {
-            Error::not_found(self.schema.name(), Value::Int64(row_id as i64))
-        })?;
+        let row = self
+            .rows
+            .remove(&row_id)
+            .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?;
 
-        self.row_id_index.remove(&Value::Int64(row_id as i64), Some(row_id));
+        self.row_id_index
+            .remove(&Value::Int64(row_id as i64), Some(row_id));
 
         if !self.pk_columns.is_empty() {
             let pk_value = extract_key(&row, &self.pk_columns);
             if let Some(ref mut pk_index) = self.primary_index {
-                pk_index.remove(&pk_value, Some(row_id));
+                pk_index.remove_index_key(&pk_value, Some(row_id));
             }
         }
 
@@ -473,7 +674,7 @@ impl RowStore {
             let cols = &self.index_columns[idx_name];
             let key = extract_key(&row, cols);
             if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                idx.remove(&key, Some(row_id));
+                idx.remove_index_key(&key, Some(row_id));
             }
         }
 
@@ -523,22 +724,22 @@ impl RowStore {
         // Prepare batch entries for primary key index
         if !self.pk_columns.is_empty() {
             if let Some(ref mut pk_index) = self.primary_index {
-                let pk_entries: Vec<(Value, RowId)> = deleted_rows
+                let pk_entries: Vec<(IndexKey, RowId)> = deleted_rows
                     .iter()
                     .map(|row| (extract_key(row, &self.pk_columns), row.id()))
                     .collect();
-                pk_index.remove_batch(&pk_entries);
+                pk_index.remove_batch_index_keys(&pk_entries);
             }
         }
 
         // Prepare batch entries for each secondary index
         for (idx_name, cols) in &self.index_columns {
             if let Some(idx) = self.secondary_indices.get_mut(idx_name) {
-                let entries: Vec<(Value, RowId)> = deleted_rows
+                let entries: Vec<(IndexKey, RowId)> = deleted_rows
                     .iter()
                     .map(|row| (extract_key(row, cols), row.id()))
                     .collect();
-                idx.remove_batch(&entries);
+                idx.remove_batch_index_keys(&entries);
             }
         }
 
@@ -581,9 +782,19 @@ impl RowStore {
 
     /// Gets rows by primary key value.
     pub fn get_by_pk(&self, pk_value: &Value) -> Vec<Rc<Row>> {
+        self.get_by_pk_values(core::slice::from_ref(pk_value))
+    }
+
+    /// Gets rows by primary key components.
+    pub fn get_by_pk_values(&self, pk_values: &[Value]) -> Vec<Rc<Row>> {
+        if pk_values.len() != self.pk_columns.len() {
+            return Vec::new();
+        }
+
         if let Some(ref pk_index) = self.primary_index {
+            let pk_key = extract_key_from_values(pk_values);
             pk_index
-                .get(pk_value)
+                .get_index_key(&pk_key)
                 .iter()
                 .filter_map(|&id| self.rows.get(&id).cloned())
                 .collect()
@@ -596,7 +807,7 @@ impl RowStore {
     pub fn find_row_id_by_pk(&self, row: &Row) -> Option<RowId> {
         if let Some(ref pk_index) = self.primary_index {
             let pk_value = extract_key(row, &self.pk_columns);
-            pk_index.get(&pk_value).first().copied()
+            pk_index.get_index_key(&pk_value).first().copied()
         } else {
             None
         }
@@ -604,8 +815,18 @@ impl RowStore {
 
     /// Checks if a primary key value exists.
     pub fn pk_exists(&self, pk_value: &Value) -> bool {
+        self.pk_exists_values(core::slice::from_ref(pk_value))
+    }
+
+    /// Checks if primary key components exist.
+    pub fn pk_exists_values(&self, pk_values: &[Value]) -> bool {
+        if pk_values.len() != self.pk_columns.len() {
+            return false;
+        }
+
         if let Some(ref pk_index) = self.primary_index {
-            pk_index.contains_key(pk_value)
+            let pk_key = extract_key_from_values(pk_values);
+            pk_index.contains_index_key(&pk_key)
         } else {
             false
         }
@@ -655,14 +876,89 @@ impl RowStore {
         offset: usize,
         reverse: bool,
     ) -> Vec<Rc<Row>> {
-        if let Some(idx) = self.secondary_indices.get(index_name) {
+        let Some(idx) = self.secondary_indices.get(index_name) else {
+            return Vec::new();
+        };
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return Vec::new();
+        };
+
+        let row_ids = if columns.len() == 1 {
             idx.get_range(range, reverse, limit, offset)
-                .iter()
-                .filter_map(|&id| self.rows.get(&id).cloned())
-                .collect()
+        } else if range.is_none() {
+            idx.get_range_index_keys(None, reverse, limit, offset)
         } else {
             Vec::new()
+        };
+
+        row_ids
+            .iter()
+            .filter_map(|&id| self.rows.get(&id).cloned())
+            .collect()
+    }
+
+    /// Gets rows by composite index scan.
+    /// Use this for multi-column indexes where the bounds are real tuple keys.
+    pub fn index_scan_composite(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+    ) -> Vec<Rc<Row>> {
+        self.index_scan_composite_with_options(index_name, range, None, 0, false)
+    }
+
+    /// Gets rows by composite index scan with limit.
+    pub fn index_scan_composite_with_limit(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+    ) -> Vec<Rc<Row>> {
+        self.index_scan_composite_with_limit_offset(index_name, range, limit, 0)
+    }
+
+    /// Gets rows by composite index scan with limit and offset.
+    pub fn index_scan_composite_with_limit_offset(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Vec<Rc<Row>> {
+        self.index_scan_composite_with_options(index_name, range, limit, offset, false)
+    }
+
+    /// Gets rows by composite index scan with tuple bounds, limit, offset, and reverse option.
+    pub fn index_scan_composite_with_options(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+    ) -> Vec<Rc<Row>> {
+        let Some(idx) = self.secondary_indices.get(index_name) else {
+            return Vec::new();
+        };
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return Vec::new();
+        };
+        if columns.len() <= 1 {
+            return Vec::new();
         }
+
+        let normalized_range = match range {
+            Some(range) if !composite_range_has_expected_arity(range, columns.len()) => {
+                return Vec::new()
+            }
+            Some(range) => IndexKey::from_composite_range(Some(range)),
+            None => None,
+        };
+
+        idx.get_range_index_keys(normalized_range.as_ref(), reverse, limit, offset)
+            .iter()
+            .filter_map(|&id| self.rows.get(&id).cloned())
+            .collect()
     }
 
     /// Clears all rows and indices.
@@ -675,11 +971,17 @@ impl RowStore {
         for idx in self.secondary_indices.values_mut() {
             idx.clear();
         }
+        for gin_idx in self.gin_indices.values_mut() {
+            gin_idx.clear();
+        }
     }
 
     /// Gets multiple rows by IDs.
     pub fn get_many(&self, row_ids: &[RowId]) -> Vec<Option<Rc<Row>>> {
-        row_ids.iter().map(|&id| self.rows.get(&id).cloned()).collect()
+        row_ids
+            .iter()
+            .map(|&id| self.rows.get(&id).cloned())
+            .collect()
     }
 
     /// Inserts a row or replaces an existing row with the same primary key.
@@ -700,8 +1002,21 @@ impl RowStore {
 
     /// Checks if a secondary index contains a key (for unique constraint checking).
     pub fn secondary_index_contains(&self, index_name: &str, key: &Value) -> bool {
+        self.secondary_index_contains_values(index_name, core::slice::from_ref(key))
+    }
+
+    /// Checks if a secondary index contains key components.
+    pub fn secondary_index_contains_values(&self, index_name: &str, key_values: &[Value]) -> bool {
+        let Some(columns) = self.index_columns.get(index_name) else {
+            return false;
+        };
+        if key_values.len() != columns.len() {
+            return false;
+        }
+
         if let Some(idx) = self.secondary_indices.get(index_name) {
-            idx.contains_key(key)
+            let key = extract_key_from_values(key_values);
+            idx.contains_index_key(&key)
         } else {
             false
         }
@@ -714,10 +1029,26 @@ impl RowStore {
 
     /// Extracts the primary key value from a row.
     pub fn extract_pk(&self, row: &Row) -> Option<Value> {
+        self.extract_pk_values(row).map(|pk_values| {
+            if pk_values.len() == 1 {
+                pk_values.into_iter().next().unwrap_or(Value::Null)
+            } else {
+                Value::String(format!("{:?}", pk_values))
+            }
+        })
+    }
+
+    /// Extracts the primary key components from a row.
+    pub fn extract_pk_values(&self, row: &Row) -> Option<Vec<Value>> {
         if self.pk_columns.is_empty() {
             None
         } else {
-            Some(extract_key(row, &self.pk_columns))
+            Some(
+                self.pk_columns
+                    .iter()
+                    .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
+                    .collect(),
+            )
         }
     }
 
@@ -735,151 +1066,215 @@ impl RowStore {
     }
 
     /// Updates a row and returns Deltas for IVM propagation (delete old + insert new).
-    pub fn update_with_delta(&mut self, row_id: RowId, new_row: Row) -> Result<(Delta<Row>, Delta<Row>)> {
-        let old_row = self.rows.get(&row_id).ok_or_else(|| {
-            Error::not_found(self.schema.name(), Value::Int64(row_id as i64))
-        })?.clone();
+    pub fn update_with_delta(
+        &mut self,
+        row_id: RowId,
+        new_row: Row,
+    ) -> Result<(Delta<Row>, Delta<Row>)> {
+        let old_row = self
+            .rows
+            .get(&row_id)
+            .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?
+            .clone();
         let new_row_clone = new_row.clone();
         self.update(row_id, new_row)?;
-        Ok((Delta::delete((*old_row).clone()), Delta::insert(new_row_clone)))
+        Ok((
+            Delta::delete((*old_row).clone()),
+            Delta::insert(new_row_clone),
+        ))
     }
 
     // ========== GIN Index Methods ==========
 
     /// Indexes a JSONB value into the GIN index.
     fn index_jsonb_value(gin_idx: &mut GinIndex, value: &Value, row_id: RowId) {
-        if let Value::Jsonb(jsonb) = value {
-            // Parse JSON and extract key-value pairs
-            if let Ok(json_str) = core::str::from_utf8(&jsonb.0) {
-                Self::extract_and_index_json(gin_idx, json_str, row_id);
-            }
-        }
-    }
-
-    /// Extracts key-value pairs from JSON and adds them to the GIN index.
-    fn extract_and_index_json(gin_idx: &mut GinIndex, json_str: &str, row_id: RowId) {
-        // Simple JSON parsing for top-level key-value pairs
-        let trimmed = json_str.trim();
-        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+        let Some(parsed) = Self::parse_jsonb_value(value) else {
             return;
-        }
+        };
 
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let mut depth = 0;
-        let mut in_string = false;
-        let mut escape = false;
-        let mut start = 0;
+        let mut current_path = String::new();
+        Self::index_jsonb_node(gin_idx, &parsed, row_id, &mut current_path);
+    }
 
-        for (i, c) in inner.char_indices() {
-            if escape {
-                escape = false;
-                continue;
-            }
-            match c {
-                '\\' if in_string => escape = true,
-                '"' => in_string = !in_string,
-                '{' | '[' if !in_string => depth += 1,
-                '}' | ']' if !in_string => depth -= 1,
-                ',' if !in_string && depth == 0 => {
-                    Self::parse_and_index_pair(gin_idx, &inner[start..i], row_id);
-                    start = i + 1;
+    fn index_jsonb_node(
+        gin_idx: &mut GinIndex,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        current_path: &mut String,
+    ) {
+        match value {
+            ParsedJsonbValue::Object(obj) => {
+                for (key, child) in obj.iter() {
+                    let saved_len = current_path.len();
+                    Self::append_gin_path_segment(current_path, key);
+                    gin_idx.add_key(current_path.clone(), row_id);
+                    Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
+                    Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    Self::index_jsonb_node(gin_idx, child, row_id, current_path);
+                    current_path.truncate(saved_len);
                 }
-                _ => {}
             }
-        }
-        // Parse last pair
-        if start < inner.len() {
-            Self::parse_and_index_pair(gin_idx, &inner[start..], row_id);
+            ParsedJsonbValue::Array(items) => {
+                for (idx, child) in items.iter().enumerate() {
+                    let saved_len = current_path.len();
+                    let segment = idx.to_string();
+                    Self::append_gin_path_segment(current_path, &segment);
+                    gin_idx.add_key(current_path.clone(), row_id);
+                    Self::index_jsonb_scalar(gin_idx, current_path, child, row_id);
+                    Self::index_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    Self::index_jsonb_node(gin_idx, child, row_id, current_path);
+                    current_path.truncate(saved_len);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Parses a key-value pair and adds it to the GIN index.
-    fn parse_and_index_pair(gin_idx: &mut GinIndex, pair: &str, row_id: RowId) {
-        let pair = pair.trim();
-        if let Some(colon_pos) = pair.find(':') {
-            let key = pair[..colon_pos].trim().trim_matches('"');
-            let value = pair[colon_pos + 1..].trim();
-
-            // Add key to index
-            gin_idx.add_key(key.into(), row_id);
-
-            // Add key-value pair to index (for string values)
-            let value_str = if value.starts_with('"') && value.ends_with('"') {
-                &value[1..value.len() - 1]
-            } else {
-                value
-            };
-            gin_idx.add_key_value(key.into(), value_str.into(), row_id);
+    fn index_jsonb_scalar(
+        gin_idx: &mut GinIndex,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        if let Some(value_str) = Self::jsonb_scalar_to_index_value(value) {
+            gin_idx.add_key_value(current_path.into(), value_str, row_id);
         }
+    }
+
+    fn index_jsonb_contains_prefilter(
+        gin_idx: &mut GinIndex,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        gin_idx.add_key_values(contains_trigram_pairs(current_path, &value_str), row_id);
     }
 
     /// Removes JSONB value from the GIN index.
     fn remove_jsonb_from_gin(gin_idx: &mut GinIndex, value: &Value, row_id: RowId) {
-        if let Value::Jsonb(jsonb) = value {
-            if let Ok(json_str) = core::str::from_utf8(&jsonb.0) {
-                Self::extract_and_remove_json(gin_idx, json_str, row_id);
+        let Some(parsed) = Self::parse_jsonb_value(value) else {
+            return;
+        };
+
+        let mut current_path = String::new();
+        Self::remove_jsonb_node(gin_idx, &parsed, row_id, &mut current_path);
+    }
+
+    fn remove_jsonb_node(
+        gin_idx: &mut GinIndex,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+        current_path: &mut String,
+    ) {
+        match value {
+            ParsedJsonbValue::Object(obj) => {
+                for (key, child) in obj.iter() {
+                    let saved_len = current_path.len();
+                    Self::append_gin_path_segment(current_path, key);
+                    gin_idx.remove_key(current_path, row_id);
+                    Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
+                    Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    Self::remove_jsonb_node(gin_idx, child, row_id, current_path);
+                    current_path.truncate(saved_len);
+                }
             }
+            ParsedJsonbValue::Array(items) => {
+                for (idx, child) in items.iter().enumerate() {
+                    let saved_len = current_path.len();
+                    let segment = idx.to_string();
+                    Self::append_gin_path_segment(current_path, &segment);
+                    gin_idx.remove_key(current_path, row_id);
+                    Self::remove_jsonb_scalar(gin_idx, current_path, child, row_id);
+                    Self::remove_jsonb_contains_prefilter(gin_idx, current_path, child, row_id);
+                    Self::remove_jsonb_node(gin_idx, child, row_id, current_path);
+                    current_path.truncate(saved_len);
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Extracts key-value pairs from JSON and removes them from the GIN index.
-    fn extract_and_remove_json(gin_idx: &mut GinIndex, json_str: &str, row_id: RowId) {
-        let trimmed = json_str.trim();
-        if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
+    fn remove_jsonb_scalar(
+        gin_idx: &mut GinIndex,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        if let Some(value_str) = Self::jsonb_scalar_to_index_value(value) {
+            gin_idx.remove_key_value(current_path, &value_str, row_id);
+        }
+    }
+
+    fn remove_jsonb_contains_prefilter(
+        gin_idx: &mut GinIndex,
+        current_path: &str,
+        value: &ParsedJsonbValue,
+        row_id: RowId,
+    ) {
+        let value_str = value.stringify_for_contains();
+        for (key, gram) in contains_trigram_pairs(current_path, &value_str) {
+            gin_idx.remove_key_value(&key, &gram, row_id);
+        }
+    }
+
+    fn parse_jsonb_value(value: &Value) -> Option<ParsedJsonbValue> {
+        let Value::Jsonb(jsonb) = value else {
+            return None;
+        };
+        let json_str = core::str::from_utf8(&jsonb.0).ok()?;
+        parse_json_text(json_str)
+    }
+
+    fn jsonb_scalar_to_index_value(value: &ParsedJsonbValue) -> Option<String> {
+        match value {
+            ParsedJsonbValue::Null => Some("null".into()),
+            ParsedJsonbValue::Bool(b) => Some(if *b { "true" } else { "false" }.into()),
+            ParsedJsonbValue::Number(n) => Some(format!("{}", n)),
+            ParsedJsonbValue::String(s) => Some(s.clone()),
+            ParsedJsonbValue::Object(_) | ParsedJsonbValue::Array(_) => None,
+        }
+    }
+
+    fn append_gin_path_segment(path: &mut String, segment: &str) {
+        if !path.is_empty() {
+            path.push('.');
+        }
+
+        if segment.is_empty() {
+            path.push('\\');
+            path.push('0');
             return;
         }
 
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let mut depth = 0;
-        let mut in_string = false;
-        let mut escape = false;
-        let mut start = 0;
-
-        for (i, c) in inner.char_indices() {
-            if escape {
-                escape = false;
-                continue;
-            }
-            match c {
-                '\\' if in_string => escape = true,
-                '"' => in_string = !in_string,
-                '{' | '[' if !in_string => depth += 1,
-                '}' | ']' if !in_string => depth -= 1,
-                ',' if !in_string && depth == 0 => {
-                    Self::parse_and_remove_pair(gin_idx, &inner[start..i], row_id);
-                    start = i + 1;
+        for ch in segment.chars() {
+            match ch {
+                '\\' => {
+                    path.push('\\');
+                    path.push('\\');
                 }
-                _ => {}
+                '.' => {
+                    path.push('\\');
+                    path.push('.');
+                }
+                _ => path.push(ch),
             }
-        }
-        if start < inner.len() {
-            Self::parse_and_remove_pair(gin_idx, &inner[start..], row_id);
-        }
-    }
-
-    /// Parses a key-value pair and removes it from the GIN index.
-    fn parse_and_remove_pair(gin_idx: &mut GinIndex, pair: &str, row_id: RowId) {
-        let pair = pair.trim();
-        if let Some(colon_pos) = pair.find(':') {
-            let key = pair[..colon_pos].trim().trim_matches('"');
-            let value = pair[colon_pos + 1..].trim();
-
-            gin_idx.remove_key(key, row_id);
-
-            let value_str = if value.starts_with('"') && value.ends_with('"') {
-                &value[1..value.len() - 1]
-            } else {
-                value
-            };
-            gin_idx.remove_key_value(key, value_str, row_id);
         }
     }
 
     /// Queries the GIN index by key-value pair.
-    pub fn gin_index_get_by_key_value(&self, index_name: &str, key: &str, value: &str) -> Vec<Rc<Row>> {
+    pub fn gin_index_get_by_key_value(
+        &self,
+        index_name: &str,
+        key: &str,
+        value: &str,
+    ) -> Vec<Rc<Row>> {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
             let row_ids = gin_idx.get_by_key_value(key, value);
-            row_ids.iter().filter_map(|&id| self.rows.get(&id).cloned()).collect()
+            row_ids
+                .iter()
+                .filter_map(|&id| self.rows.get(&id).cloned())
+                .collect()
         } else {
             Vec::new()
         }
@@ -889,7 +1284,10 @@ impl RowStore {
     pub fn gin_index_get_by_key(&self, index_name: &str, key: &str) -> Vec<Rc<Row>> {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
             let row_ids = gin_idx.get_by_key(key);
-            row_ids.iter().filter_map(|&id| self.rows.get(&id).cloned()).collect()
+            row_ids
+                .iter()
+                .filter_map(|&id| self.rows.get(&id).cloned())
+                .collect()
         } else {
             Vec::new()
         }
@@ -897,10 +1295,17 @@ impl RowStore {
 
     /// Queries the GIN index by multiple key-value pairs (AND query).
     /// Returns rows that match ALL of the given key-value pairs.
-    pub fn gin_index_get_by_key_values_all(&self, index_name: &str, pairs: &[(&str, &str)]) -> Vec<Rc<Row>> {
+    pub fn gin_index_get_by_key_values_all(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+    ) -> Vec<Rc<Row>> {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
             let row_ids = gin_idx.get_by_key_values_all(pairs);
-            row_ids.iter().filter_map(|&id| self.rows.get(&id).cloned()).collect()
+            row_ids
+                .iter()
+                .filter_map(|&id| self.rows.get(&id).cloned())
+                .collect()
         } else {
             Vec::new()
         }
@@ -920,7 +1325,12 @@ impl RowStore {
     /// Returns the raw row IDs from the GIN index for a given key-value pair.
     /// This is useful for testing to detect ghost entries.
     #[cfg(test)]
-    pub fn gin_index_get_raw_row_ids_by_kv(&self, index_name: &str, key: &str, value: &str) -> Vec<RowId> {
+    pub fn gin_index_get_raw_row_ids_by_kv(
+        &self,
+        index_name: &str,
+        key: &str,
+        value: &str,
+    ) -> Vec<RowId> {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
             gin_idx.get_by_key_value(key, value)
         } else {
@@ -929,12 +1339,177 @@ impl RowStore {
     }
 }
 
+fn parse_json_text(s: &str) -> Option<ParsedJsonbValue> {
+    let s = s.trim();
+    if s == "null" {
+        return Some(ParsedJsonbValue::Null);
+    }
+    if s == "true" {
+        return Some(ParsedJsonbValue::Bool(true));
+    }
+    if s == "false" {
+        return Some(ParsedJsonbValue::Bool(false));
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return Some(ParsedJsonbValue::Number(n));
+    }
+    if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        return Some(ParsedJsonbValue::String(unescape_json(&s[1..s.len() - 1])));
+    }
+    if s.starts_with('{') {
+        return parse_json_object(s);
+    }
+    if s.starts_with('[') {
+        return parse_json_array(s);
+    }
+    None
+}
+
+fn unescape_json(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('t') => result.push('\t'),
+                Some('r') => result.push('\r'),
+                Some('"') => result.push('"'),
+                Some('\\') => result.push('\\'),
+                Some('/') => result.push('/'),
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+fn parse_json_object(s: &str) -> Option<ParsedJsonbValue> {
+    let s = s.trim();
+    if !s.starts_with('{') || !s.ends_with('}') {
+        return None;
+    }
+
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(ParsedJsonbValue::Object(JsonbObject::new()));
+    }
+
+    let mut obj = JsonbObject::new();
+    for pair in split_json_top_level(inner, ',') {
+        let pair = pair.trim();
+        let colon_pos = find_json_colon(pair)?;
+        let key_str = pair[..colon_pos].trim();
+        let value_str = pair[colon_pos + 1..].trim();
+
+        if !(key_str.starts_with('"') && key_str.ends_with('"') && key_str.len() >= 2) {
+            return None;
+        }
+
+        let key = unescape_json(&key_str[1..key_str.len() - 1]);
+        obj.insert(key, parse_json_text(value_str)?);
+    }
+
+    Some(ParsedJsonbValue::Object(obj))
+}
+
+fn parse_json_array(s: &str) -> Option<ParsedJsonbValue> {
+    let s = s.trim();
+    if !s.starts_with('[') || !s.ends_with(']') {
+        return None;
+    }
+
+    let inner = s[1..s.len() - 1].trim();
+    if inner.is_empty() {
+        return Some(ParsedJsonbValue::Array(Vec::new()));
+    }
+
+    let mut values = Vec::new();
+    for value in split_json_top_level(inner, ',') {
+        values.push(parse_json_text(value.trim())?);
+    }
+
+    Some(ParsedJsonbValue::Array(values))
+}
+
+fn split_json_top_level(s: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut start = 0usize;
+
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '{' || c == '[' {
+            depth += 1;
+        } else if c == '}' || c == ']' {
+            depth -= 1;
+        } else if c == separator && depth == 0 {
+            parts.push(&s[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+
+    if start <= s.len() {
+        parts.push(&s[start..]);
+    }
+
+    parts
+}
+
+fn find_json_colon(s: &str) -> Option<usize> {
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' && in_string {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if !in_string && c == ':' {
+            return Some(i);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::collections::BTreeSet;
+    use alloc::vec;
     use cynos_core::schema::TableBuilder;
     use cynos_core::DataType;
-    use alloc::vec;
 
     fn test_schema() -> Table {
         TableBuilder::new("test")
@@ -979,7 +1554,10 @@ mod tests {
         store.insert(row).unwrap();
         let retrieved = store.get(1);
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().get(1), Some(&Value::String("Alice".into())));
+        assert_eq!(
+            retrieved.unwrap().get(1),
+            Some(&Value::String("Alice".into()))
+        );
     }
 
     #[test]
@@ -990,7 +1568,10 @@ mod tests {
         let new_row = Row::new(1, vec![Value::Int64(1), Value::String("Bob".into())]);
         assert!(store.update(1, new_row).is_ok());
         let retrieved = store.get(1);
-        assert_eq!(retrieved.unwrap().get(1), Some(&Value::String("Bob".into())));
+        assert_eq!(
+            retrieved.unwrap().get(1),
+            Some(&Value::String("Bob".into()))
+        );
     }
 
     #[test]
@@ -1015,8 +1596,18 @@ mod tests {
     #[test]
     fn test_row_store_scan() {
         let mut store = RowStore::new(test_schema());
-        store.insert(Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())])).unwrap();
-        store.insert(Row::new(2, vec![Value::Int64(2), Value::String("Bob".into())])).unwrap();
+        store
+            .insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                2,
+                vec![Value::Int64(2), Value::String("Bob".into())],
+            ))
+            .unwrap();
         let rows: Vec<_> = store.scan().collect();
         assert_eq!(rows.len(), 2);
     }
@@ -1036,8 +1627,18 @@ mod tests {
     #[test]
     fn test_row_store_clear() {
         let mut store = RowStore::new(test_schema());
-        store.insert(Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())])).unwrap();
-        store.insert(Row::new(2, vec![Value::Int64(2), Value::String("Bob".into())])).unwrap();
+        store
+            .insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                2,
+                vec![Value::Int64(2), Value::String("Bob".into())],
+            ))
+            .unwrap();
         store.clear();
         assert!(store.is_empty());
     }
@@ -1054,6 +1655,23 @@ mod tests {
             .add_column("name", DataType::String)
             .unwrap()
             .add_primary_key(&["id1", "id2"], false)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
+    fn test_schema_with_composite_index() -> Table {
+        TableBuilder::new("test_composite_index")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("a", DataType::Int64)
+            .unwrap()
+            .add_column("b", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_a_b", &["a", "b"], false)
             .unwrap()
             .build()
             .unwrap()
@@ -1078,28 +1696,241 @@ mod tests {
     fn test_composite_primary_key() {
         let mut store = RowStore::new(test_schema_composite_pk());
 
-        let row1 = Row::new(1, vec![
-            Value::String("pk1".into()),
-            Value::Int64(100),
-            Value::String("Name1".into())
-        ]);
+        let row1 = Row::new(
+            1,
+            vec![
+                Value::String("pk1".into()),
+                Value::Int64(100),
+                Value::String("Name1".into()),
+            ],
+        );
         assert!(store.insert(row1).is_ok());
 
         // Same id1, different id2 - should succeed
-        let row2 = Row::new(2, vec![
-            Value::String("pk1".into()),
-            Value::Int64(200),
-            Value::String("Name2".into())
-        ]);
+        let row2 = Row::new(
+            2,
+            vec![
+                Value::String("pk1".into()),
+                Value::Int64(200),
+                Value::String("Name2".into()),
+            ],
+        );
         assert!(store.insert(row2).is_ok());
 
         // Same composite key - should fail
-        let row3 = Row::new(3, vec![
-            Value::String("pk1".into()),
-            Value::Int64(100),
-            Value::String("Name3".into())
-        ]);
+        let row3 = Row::new(
+            3,
+            vec![
+                Value::String("pk1".into()),
+                Value::Int64(100),
+                Value::String("Name3".into()),
+            ],
+        );
         assert!(store.insert(row3).is_err());
+    }
+
+    #[test]
+    fn test_composite_primary_key_lookup_by_values() {
+        let mut store = RowStore::new(test_schema_composite_pk());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::String("pk1".into()),
+                    Value::Int64(100),
+                    Value::String("Name1".into()),
+                ],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                2,
+                vec![
+                    Value::String("pk1".into()),
+                    Value::Int64(200),
+                    Value::String("Name2".into()),
+                ],
+            ))
+            .unwrap();
+
+        let key = alloc::vec![Value::String("pk1".into()), Value::Int64(200)];
+        let rows = store.get_by_pk_values(&key);
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "Composite PK lookup should find exactly one row"
+        );
+        assert_eq!(rows[0].id(), 2);
+        assert!(
+            store.pk_exists_values(&key),
+            "Composite PK existence check should use the same tuple semantics",
+        );
+    }
+
+    #[test]
+    fn test_insert_or_replace_existing_composite_pk() {
+        let mut store = RowStore::new(test_schema_composite_pk());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::String("pk1".into()),
+                    Value::Int64(100),
+                    Value::String("Name1".into()),
+                ],
+            ))
+            .unwrap();
+
+        let replacement = Row::new(
+            99,
+            vec![
+                Value::String("pk1".into()),
+                Value::Int64(100),
+                Value::String("Updated".into()),
+            ],
+        );
+
+        let (row_id, replaced) = store.insert_or_replace(replacement).unwrap();
+        assert_eq!(
+            row_id, 1,
+            "Composite PK replace should preserve the existing row id"
+        );
+        assert!(replaced);
+        assert_eq!(store.len(), 1);
+
+        let stored = store.get(1).unwrap();
+        assert_eq!(stored.get(2), Some(&Value::String("Updated".into())));
+    }
+
+    #[test]
+    fn test_composite_secondary_index_scan_preserves_tuple_order_and_pagination() {
+        let mut store = RowStore::new(test_schema_with_composite_index());
+
+        for (id, a, b) in [(1_u64, 1_i64, 2_i64), (2, 1, 10), (3, 2, 1)] {
+            store
+                .insert(Row::new(
+                    id,
+                    vec![Value::Int64(id as i64), Value::Int64(a), Value::Int64(b)],
+                ))
+                .unwrap();
+        }
+
+        let ordered_ids: Vec<RowId> = store
+            .index_scan_with_options("idx_a_b", None, None, 0, false)
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        assert_eq!(
+            ordered_ids,
+            vec![1, 2, 3],
+            "Composite secondary index should follow true tuple order `(a, b)`",
+        );
+
+        let paged_ids: Vec<RowId> = store
+            .index_scan_with_options("idx_a_b", None, Some(1), 1, false)
+            .iter()
+            .map(|row| row.id())
+            .collect();
+        assert_eq!(
+            paged_ids,
+            vec![2],
+            "Pagination over a composite index should use tuple order, not string order",
+        );
+    }
+
+    #[test]
+    fn test_composite_secondary_index_range_scan_uses_tuple_bounds() {
+        let mut store = RowStore::new(test_schema_with_composite_index());
+
+        for (id, a, b) in [
+            (1_u64, 1_i64, 1_i64),
+            (2, 1, 2),
+            (3, 1, 10),
+            (4, 2, 1),
+            (5, 2, 5),
+        ] {
+            store
+                .insert(Row::new(
+                    id,
+                    vec![Value::Int64(id as i64), Value::Int64(a), Value::Int64(b)],
+                ))
+                .unwrap();
+        }
+
+        let range = KeyRange::bound(
+            alloc::vec![Value::Int64(1), Value::Int64(2)],
+            alloc::vec![Value::Int64(2), Value::Int64(1)],
+            false,
+            false,
+        );
+
+        let ids: Vec<RowId> = store
+            .index_scan_composite("idx_a_b", Some(&range))
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![2, 3, 4],
+            "Composite range scan should honor inclusive tuple bounds",
+        );
+    }
+
+    #[test]
+    fn test_composite_secondary_index_range_scan_reverse_limit_offset() {
+        let mut store = RowStore::new(test_schema_with_composite_index());
+
+        for (id, a, b) in [
+            (1_u64, 1_i64, 1_i64),
+            (2, 1, 2),
+            (3, 1, 10),
+            (4, 2, 1),
+            (5, 2, 5),
+        ] {
+            store
+                .insert(Row::new(
+                    id,
+                    vec![Value::Int64(id as i64), Value::Int64(a), Value::Int64(b)],
+                ))
+                .unwrap();
+        }
+
+        let range = KeyRange::lower_bound(alloc::vec![Value::Int64(1), Value::Int64(2)], false);
+
+        let ids: Vec<RowId> = store
+            .index_scan_composite_with_options("idx_a_b", Some(&range), Some(2), 1, true)
+            .iter()
+            .map(|row| row.id())
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec![4, 3],
+            "Reverse composite range scans should still honor LIMIT/OFFSET in tuple order",
+        );
+    }
+
+    #[test]
+    fn test_composite_secondary_index_range_scan_rejects_wrong_arity() {
+        let mut store = RowStore::new(test_schema_with_composite_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::Int64(1), Value::Int64(1)],
+            ))
+            .unwrap();
+
+        let wrong_arity = KeyRange::only(alloc::vec![Value::Int64(1)]);
+        let rows = store.index_scan_composite("idx_a_b", Some(&wrong_arity));
+        assert!(
+            rows.is_empty(),
+            "Composite range scan API should reject bounds whose arity does not match the index",
+        );
     }
 
     #[test]
@@ -1144,7 +1975,10 @@ mod tests {
         store.insert(row2).unwrap();
 
         // Try to update row2 to have the same PK as row1
-        let row2_updated = Row::new(2, vec![Value::Int64(1), Value::String("Bob Updated".into())]);
+        let row2_updated = Row::new(
+            2,
+            vec![Value::Int64(1), Value::String("Bob Updated".into())],
+        );
         let result = store.update(2, row2_updated);
         assert!(result.is_err());
     }
@@ -1153,11 +1987,17 @@ mod tests {
     fn test_unique_index_violation() {
         let mut store = RowStore::new(test_schema_with_unique_index());
 
-        let row1 = Row::new(1, vec![Value::Int64(1), Value::String("alice@test.com".into())]);
+        let row1 = Row::new(
+            1,
+            vec![Value::Int64(1), Value::String("alice@test.com".into())],
+        );
         store.insert(row1).unwrap();
 
         // Try to insert with same email (unique index violation)
-        let row2 = Row::new(2, vec![Value::Int64(2), Value::String("alice@test.com".into())]);
+        let row2 = Row::new(
+            2,
+            vec![Value::Int64(2), Value::String("alice@test.com".into())],
+        );
         let result = store.insert(row2);
         assert!(result.is_err());
     }
@@ -1166,13 +2006,22 @@ mod tests {
     fn test_unique_index_update_violation() {
         let mut store = RowStore::new(test_schema_with_unique_index());
 
-        let row1 = Row::new(1, vec![Value::Int64(1), Value::String("alice@test.com".into())]);
-        let row2 = Row::new(2, vec![Value::Int64(2), Value::String("bob@test.com".into())]);
+        let row1 = Row::new(
+            1,
+            vec![Value::Int64(1), Value::String("alice@test.com".into())],
+        );
+        let row2 = Row::new(
+            2,
+            vec![Value::Int64(2), Value::String("bob@test.com".into())],
+        );
         store.insert(row1).unwrap();
         store.insert(row2).unwrap();
 
         // Try to update row2 to have the same email as row1
-        let row2_updated = Row::new(2, vec![Value::Int64(2), Value::String("alice@test.com".into())]);
+        let row2_updated = Row::new(
+            2,
+            vec![Value::Int64(2), Value::String("alice@test.com".into())],
+        );
         let result = store.update(2, row2_updated);
         assert!(result.is_err());
     }
@@ -1266,7 +2115,10 @@ mod tests {
 
         // Insert 10 rows
         for i in 1..=10 {
-            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            let row = Row::new(
+                i,
+                vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))],
+            );
             store.insert(row).unwrap();
         }
         assert_eq!(store.len(), 10);
@@ -1295,7 +2147,10 @@ mod tests {
 
         // Insert rows with indexed values
         for i in 1..=5 {
-            let row = Row::new(i, vec![Value::Int64(i as i64), Value::Int64((i * 100) as i64)]);
+            let row = Row::new(
+                i,
+                vec![Value::Int64(i as i64), Value::Int64((i * 100) as i64)],
+            );
             store.insert(row).unwrap();
         }
 
@@ -1315,7 +2170,10 @@ mod tests {
         let mut store = RowStore::new(test_schema());
 
         for i in 1..=5 {
-            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            let row = Row::new(
+                i,
+                vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))],
+            );
             store.insert(row).unwrap();
         }
 
@@ -1330,7 +2188,10 @@ mod tests {
         let mut store = RowStore::new(test_schema());
 
         for i in 1..=5 {
-            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            let row = Row::new(
+                i,
+                vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))],
+            );
             store.insert(row).unwrap();
         }
 
@@ -1345,7 +2206,10 @@ mod tests {
         let mut store = RowStore::new(test_schema());
 
         for i in 1..=10 {
-            let row = Row::new(i, vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))]);
+            let row = Row::new(
+                i,
+                vec![Value::Int64(i as i64), Value::String(format!("Name{}", i))],
+            );
             store.insert(row).unwrap();
         }
 
@@ -1394,15 +2258,37 @@ mod tests {
         Value::Jsonb(cynos_core::JsonbValue(json_str.as_bytes().to_vec()))
     }
 
+    fn test_contains_trigram_key(path: &str) -> String {
+        alloc::format!("__cynos_contains3__:{path}")
+    }
+
+    fn test_contains_trigrams(value: &str) -> Vec<String> {
+        let chars: Vec<char> = value.chars().collect();
+        if chars.len() < 3 {
+            return Vec::new();
+        }
+
+        let mut grams = BTreeSet::new();
+        for window in chars.windows(3) {
+            let gram: String = window.iter().collect();
+            grams.insert(gram);
+        }
+
+        grams.into_iter().collect()
+    }
+
     #[test]
     fn test_gin_index_insert_and_query() {
         let mut store = RowStore::new(test_schema_with_gin_index());
 
         // Insert a row with JSONB data
-        let row = Row::new(1, vec![
-            Value::Int64(1),
-            make_jsonb(r#"{"name": "Alice", "status": "active"}"#)
-        ]);
+        let row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                make_jsonb(r#"{"name": "Alice", "status": "active"}"#),
+            ],
+        );
         store.insert(row).unwrap();
 
         // Query by key should find the row
@@ -1411,7 +2297,128 @@ mod tests {
 
         // Query by key-value should find the row
         let results = store.gin_index_get_by_key_value("idx_data_gin", "status", "active");
-        assert_eq!(results.len(), 1, "GIN index should find row by key-value 'status=active'");
+        assert_eq!(
+            results.len(),
+            1,
+            "GIN index should find row by key-value 'status=active'"
+        );
+    }
+
+    #[test]
+    fn test_gin_index_nested_paths_and_scalars() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(
+                        r#"{"name":"Alice","address":{"city":"Beijing","zip":"100000"},"tags":["vip","premium"]}"#,
+                    ),
+                ],
+            ))
+            .unwrap();
+
+        let nested_key_rows = store.gin_index_get_by_key("idx_data_gin", "address.city");
+        assert_eq!(
+            nested_key_rows.len(),
+            1,
+            "GIN index should expose nested key postings",
+        );
+
+        let nested_value_rows =
+            store.gin_index_get_by_key_value("idx_data_gin", "address.city", "Beijing");
+        assert_eq!(
+            nested_value_rows.len(),
+            1,
+            "GIN index should expose nested key/value postings",
+        );
+
+        let array_value_rows =
+            store.gin_index_get_by_key_value("idx_data_gin", "tags.1", "premium");
+        assert_eq!(
+            array_value_rows.len(),
+            1,
+            "GIN index should expose indexed array element postings",
+        );
+    }
+
+    #[test]
+    fn test_gin_contains_prefilter_indexes_array_value_trigrams() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"tags":["portable","travel"],"status":"active"}"#),
+                ],
+            ))
+            .unwrap();
+
+        let contains_key = test_contains_trigram_key("tags");
+
+        for gram in test_contains_trigrams("portable") {
+            let raw_ids =
+                store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", &contains_key, &gram);
+            assert_eq!(
+                raw_ids,
+                vec![1],
+                "GIN contains prefilter should index trigram {gram:?} for $.tags",
+            );
+        }
+    }
+
+    #[test]
+    fn test_gin_contains_prefilter_updates_trigram_postings() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"tags":["portable","travel"],"status":"active"}"#),
+                ],
+            ))
+            .unwrap();
+
+        let contains_key = test_contains_trigram_key("tags");
+        let old_gram = "ort";
+        let new_gram = "esk";
+
+        assert_eq!(
+            store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", &contains_key, old_gram),
+            vec![1],
+            "Before update: old trigram posting should exist",
+        );
+
+        store
+            .update(
+                1,
+                Row::new(
+                    1,
+                    vec![
+                        Value::Int64(1),
+                        make_jsonb(r#"{"tags":["desktop","office"],"status":"active"}"#),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .gin_index_get_raw_row_ids_by_kv("idx_data_gin", &contains_key, old_gram)
+                .is_empty(),
+            "After update: old trigram posting should be removed",
+        );
+        assert_eq!(
+            store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", &contains_key, new_gram),
+            vec![1],
+            "After update: new trigram posting should be added",
+        );
     }
 
     #[test]
@@ -1420,15 +2427,22 @@ mod tests {
         let mut store = RowStore::new(test_schema_with_gin_index());
 
         // Insert a row with JSONB data
-        let row = Row::new(1, vec![
-            Value::Int64(1),
-            make_jsonb(r#"{"name": "Alice", "status": "active"}"#)
-        ]);
+        let row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                make_jsonb(r#"{"name": "Alice", "status": "active"}"#),
+            ],
+        );
         store.insert(row).unwrap();
 
         // Verify GIN index has the entry (using raw row IDs to detect ghost entries)
         let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "name");
-        assert_eq!(raw_ids.len(), 1, "Before delete: GIN index should have entry");
+        assert_eq!(
+            raw_ids.len(),
+            1,
+            "Before delete: GIN index should have entry"
+        );
 
         // Delete the row
         store.delete(1).unwrap();
@@ -1437,7 +2451,11 @@ mod tests {
         // The public API filters out deleted rows, but the index itself still has the entry
         let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "name");
         // This assertion will FAIL before the fix, demonstrating the bug
-        assert_eq!(raw_ids.len(), 0, "After delete: GIN index should NOT have ghost entries");
+        assert_eq!(
+            raw_ids.len(),
+            0,
+            "After delete: GIN index should NOT have ghost entries"
+        );
     }
 
     #[test]
@@ -1446,30 +2464,48 @@ mod tests {
         let mut store = RowStore::new(test_schema_with_gin_index());
 
         // Insert a row with JSONB data
-        let row = Row::new(1, vec![
-            Value::Int64(1),
-            make_jsonb(r#"{"name": "Alice", "status": "active"}"#)
-        ]);
+        let row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                make_jsonb(r#"{"name": "Alice", "status": "active"}"#),
+            ],
+        );
         store.insert(row).unwrap();
 
         // Verify initial state (using raw row IDs)
         let raw_ids = store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", "status", "active");
-        assert_eq!(raw_ids.len(), 1, "Before update: should find 'status=active'");
+        assert_eq!(
+            raw_ids.len(),
+            1,
+            "Before update: should find 'status=active'"
+        );
 
         // Update the row with different JSONB data
-        let new_row = Row::new(1, vec![
-            Value::Int64(1),
-            make_jsonb(r#"{"name": "Alice", "status": "inactive"}"#)
-        ]);
+        let new_row = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                make_jsonb(r#"{"name": "Alice", "status": "inactive"}"#),
+            ],
+        );
         store.update(1, new_row).unwrap();
 
         // BUG: Old value still in GIN index (ghost entry)
         let raw_ids = store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", "status", "active");
-        assert_eq!(raw_ids.len(), 0, "After update: old value 'status=active' should NOT be in GIN index");
+        assert_eq!(
+            raw_ids.len(),
+            0,
+            "After update: old value 'status=active' should NOT be in GIN index"
+        );
 
         // BUG: New value not in GIN index
         let raw_ids = store.gin_index_get_raw_row_ids_by_kv("idx_data_gin", "status", "inactive");
-        assert_eq!(raw_ids.len(), 1, "After update: new value 'status=inactive' should be in GIN index");
+        assert_eq!(
+            raw_ids.len(),
+            1,
+            "After update: new value 'status=inactive' should be in GIN index"
+        );
     }
 
     #[test]
@@ -1479,23 +2515,34 @@ mod tests {
 
         // Insert multiple rows
         for i in 1..=3 {
-            let row = Row::new(i, vec![
-                Value::Int64(i as i64),
-                make_jsonb(&format!(r#"{{"user": "user{}"}}"#, i))
-            ]);
+            let row = Row::new(
+                i,
+                vec![
+                    Value::Int64(i as i64),
+                    make_jsonb(&format!(r#"{{"user": "user{}"}}"#, i)),
+                ],
+            );
             store.insert(row).unwrap();
         }
 
         // Verify all entries exist (using raw row IDs)
         let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "user");
-        assert_eq!(raw_ids.len(), 3, "Before delete_batch: should have 3 entries");
+        assert_eq!(
+            raw_ids.len(),
+            3,
+            "Before delete_batch: should have 3 entries"
+        );
 
         // Delete rows 1 and 2
         store.delete_batch(&[1, 2]);
 
         // BUG: GIN index still has ghost entries
         let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "user");
-        assert_eq!(raw_ids.len(), 1, "After delete_batch: should only have 1 entry (row 3)");
+        assert_eq!(
+            raw_ids.len(),
+            1,
+            "After delete_batch: should only have 1 entry (row 3)"
+        );
     }
 
     #[test]
@@ -1522,11 +2569,14 @@ mod tests {
         let mut store = RowStore::new(schema);
 
         // Insert first row
-        let row1 = Row::new(1, vec![
-            Value::Int64(1),
-            Value::String("alice@test.com".into()),
-            make_jsonb(r#"{"role": "admin"}"#)
-        ]);
+        let row1 = Row::new(
+            1,
+            vec![
+                Value::Int64(1),
+                Value::String("alice@test.com".into()),
+                make_jsonb(r#"{"role": "admin"}"#),
+            ],
+        );
         store.insert(row1).unwrap();
 
         // Verify initial state
@@ -1534,18 +2584,74 @@ mod tests {
         assert_eq!(raw_ids.len(), 1, "After first insert: should have 1 entry");
 
         // Try to insert second row with same email (will fail due to unique constraint)
-        let row2 = Row::new(2, vec![
-            Value::Int64(2),
-            Value::String("alice@test.com".into()), // duplicate email
-            make_jsonb(r#"{"role": "user"}"#)
-        ]);
+        let row2 = Row::new(
+            2,
+            vec![
+                Value::Int64(2),
+                Value::String("alice@test.com".into()), // duplicate email
+                make_jsonb(r#"{"role": "user"}"#),
+            ],
+        );
         let result = store.insert(row2);
-        assert!(result.is_err(), "Insert should fail due to unique constraint");
+        assert!(
+            result.is_err(),
+            "Insert should fail due to unique constraint"
+        );
 
         // BUG: The GIN index may have been partially updated before rollback
         // After rollback, only row 1's data should be in the GIN index
         let raw_ids = store.gin_index_get_raw_row_ids("idx_data_gin", "role");
-        assert_eq!(raw_ids.len(), 1, "After failed insert: GIN index should only have row 1's entry");
+        assert_eq!(
+            raw_ids.len(),
+            1,
+            "After failed insert: GIN index should only have row 1's entry"
+        );
+    }
+
+    #[test]
+    fn test_clear_clears_gin_index_bug() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+
+        store
+            .insert(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    make_jsonb(r#"{"name": "Alice", "status": "active"}"#),
+                ],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    make_jsonb(r#"{"name": "Bob", "status": "inactive"}"#),
+                ],
+            ))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .gin_index_get_raw_row_ids("idx_data_gin", "status")
+                .len(),
+            2,
+            "Before clear: GIN index should contain both rows",
+        );
+
+        store.clear();
+
+        assert!(
+            store.is_empty(),
+            "After clear: row store should not keep any rows",
+        );
+        assert_eq!(
+            store
+                .gin_index_get_raw_row_ids("idx_data_gin", "status")
+                .len(),
+            0,
+            "After clear: GIN index should not retain stale postings",
+        );
     }
 
     // ==================== Defect 1 Test: Composite PK serialization collision ====================
@@ -1586,18 +2692,24 @@ mod tests {
         // Test that different composite keys don't collide
         let mut store = RowStore::new(test_schema_composite_pk_string_string());
 
-        let row1 = Row::new(1, vec![
-            Value::String("a\")|String(\"b".into()),
-            Value::String("c".into()),
-            Value::String("Name1".into())
-        ]);
+        let row1 = Row::new(
+            1,
+            vec![
+                Value::String("a\")|String(\"b".into()),
+                Value::String("c".into()),
+                Value::String("Name1".into()),
+            ],
+        );
         assert!(store.insert(row1).is_ok(), "First insert should succeed");
 
-        let row2 = Row::new(2, vec![
-            Value::String("a".into()),
-            Value::String("b\")|String(\"c".into()),
-            Value::String("Name2".into())
-        ]);
+        let row2 = Row::new(
+            2,
+            vec![
+                Value::String("a".into()),
+                Value::String("b\")|String(\"c".into()),
+                Value::String("Name2".into()),
+            ],
+        );
         assert!(
             store.insert(row2).is_ok(),
             "Defect 1: Different composite keys should NOT collide"
@@ -1611,30 +2723,39 @@ mod tests {
         let mut store = RowStore::new(test_schema_composite_pk_int_int());
 
         // Row with (Int32(42), Int64(100))
-        let row1 = Row::new(1, vec![
-            Value::Int32(42),
-            Value::Int64(100),
-            Value::String("Name1".into())
-        ]);
+        let row1 = Row::new(
+            1,
+            vec![
+                Value::Int32(42),
+                Value::Int64(100),
+                Value::String("Name1".into()),
+            ],
+        );
         assert!(store.insert(row1).is_ok(), "First insert should succeed");
 
         // Row with (Int32(42), Int64(100)) - same composite key, should fail
-        let row2 = Row::new(2, vec![
-            Value::Int32(42),
-            Value::Int64(100),
-            Value::String("Name2".into())
-        ]);
+        let row2 = Row::new(
+            2,
+            vec![
+                Value::Int32(42),
+                Value::Int64(100),
+                Value::String("Name2".into()),
+            ],
+        );
         assert!(
             store.insert(row2).is_err(),
             "Same composite key should fail"
         );
 
         // Row with (Int32(100), Int64(42)) - different composite key, should succeed
-        let row3 = Row::new(3, vec![
-            Value::Int32(100),
-            Value::Int64(42),
-            Value::String("Name3".into())
-        ]);
+        let row3 = Row::new(
+            3,
+            vec![
+                Value::Int32(100),
+                Value::Int64(42),
+                Value::String("Name3".into()),
+            ],
+        );
         assert!(
             store.insert(row3).is_ok(),
             "Different composite key should succeed"

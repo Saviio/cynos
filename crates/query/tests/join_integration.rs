@@ -46,11 +46,11 @@ fn create_employee_rows(count: usize, job_count: usize, dept_count: usize) -> Ve
             Row::new(
                 i as u64,
                 vec![
-                    Value::Int64(i as i64),                          // id
-                    Value::String(format!("Employee{}", i)),         // name
-                    Value::Int64((i % job_count) as i64),            // job_id
-                    Value::Int64((i % dept_count) as i64),           // department_id
-                    Value::Int64(100000),                            // salary
+                    Value::Int64(i as i64),                  // id
+                    Value::String(format!("Employee{}", i)), // name
+                    Value::Int64((i % job_count) as i64),    // job_id
+                    Value::Int64((i % dept_count) as i64),   // department_id
+                    Value::Int64(100000),                    // salary
                 ],
             )
         })
@@ -64,9 +64,9 @@ fn create_job_rows(count: usize) -> Vec<Row> {
             Row::new(
                 i as u64,
                 vec![
-                    Value::Int64(i as i64),                  // id
-                    Value::String(format!("Job{}", i)),      // title
-                    Value::Int64(100000),                    // min_salary
+                    Value::Int64(i as i64),             // id
+                    Value::String(format!("Job{}", i)), // title
+                    Value::Int64(100000),               // min_salary
                 ],
             )
         })
@@ -80,8 +80,8 @@ fn create_department_rows(count: usize) -> Vec<Row> {
             Row::new(
                 i as u64,
                 vec![
-                    Value::Int64(i as i64),                      // id
-                    Value::String(format!("Department{}", i)),   // name
+                    Value::Int64(i as i64),                    // id
+                    Value::String(format!("Department{}", i)), // name
                 ],
             )
         })
@@ -172,29 +172,54 @@ fn test_join_predicate_reverse() {
     let right_col = ColumnRef::new("Job", "id", 0);
 
     // Test Lt -> Gt
-    let pred_lt = JoinPredicate::new(left_col.clone(), right_col.clone(), EvalType::Lt, JoinType::Inner);
+    let pred_lt = JoinPredicate::new(
+        left_col.clone(),
+        right_col.clone(),
+        EvalType::Lt,
+        JoinType::Inner,
+    );
     let reversed = pred_lt.reverse();
     assert_eq!(reversed.eval_type, EvalType::Gt);
     assert_eq!(reversed.left_column.table, "Job");
     assert_eq!(reversed.right_column.table, "Employee");
 
     // Test Gt -> Lt
-    let pred_gt = JoinPredicate::new(left_col.clone(), right_col.clone(), EvalType::Gt, JoinType::Inner);
+    let pred_gt = JoinPredicate::new(
+        left_col.clone(),
+        right_col.clone(),
+        EvalType::Gt,
+        JoinType::Inner,
+    );
     let reversed = pred_gt.reverse();
     assert_eq!(reversed.eval_type, EvalType::Lt);
 
     // Test Le -> Ge
-    let pred_le = JoinPredicate::new(left_col.clone(), right_col.clone(), EvalType::Le, JoinType::Inner);
+    let pred_le = JoinPredicate::new(
+        left_col.clone(),
+        right_col.clone(),
+        EvalType::Le,
+        JoinType::Inner,
+    );
     let reversed = pred_le.reverse();
     assert_eq!(reversed.eval_type, EvalType::Ge);
 
     // Test Ge -> Le
-    let pred_ge = JoinPredicate::new(left_col.clone(), right_col.clone(), EvalType::Ge, JoinType::Inner);
+    let pred_ge = JoinPredicate::new(
+        left_col.clone(),
+        right_col.clone(),
+        EvalType::Ge,
+        JoinType::Inner,
+    );
     let reversed = pred_ge.reverse();
     assert_eq!(reversed.eval_type, EvalType::Le);
 
     // Test Eq -> Eq (symmetric)
-    let pred_eq = JoinPredicate::new(left_col.clone(), right_col.clone(), EvalType::Eq, JoinType::Inner);
+    let pred_eq = JoinPredicate::new(
+        left_col.clone(),
+        right_col.clone(),
+        EvalType::Eq,
+        JoinType::Inner,
+    );
     let reversed = pred_eq.reverse();
     assert_eq!(reversed.eval_type, EvalType::Eq);
 
@@ -343,7 +368,7 @@ fn test_join_nullable_keys() {
     let table_a_rows = vec![
         Row::new(0, vec![Value::Int64(1)]),
         Row::new(1, vec![Value::Int64(2)]),
-        Row::new(2, vec![Value::Null]),  // Null key
+        Row::new(2, vec![Value::Null]), // Null key
         Row::new(3, vec![Value::Int64(3)]),
     ];
 

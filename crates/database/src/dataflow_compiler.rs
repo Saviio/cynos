@@ -18,8 +18,8 @@ use cynos_core::{Row, Value};
 use cynos_incremental::{
     AggregateType, DataflowNode, JoinType as IvmJoinType, KeyExtractorFn, TableId,
 };
-use cynos_query::ast::{AggregateFunc, BinaryOp, Expr, UnaryOp};
 use cynos_query::ast::JoinType as QueryJoinType;
+use cynos_query::ast::{AggregateFunc, BinaryOp, Expr, UnaryOp};
 use cynos_query::planner::PhysicalPlan;
 use hashbrown::HashMap;
 
@@ -45,7 +45,10 @@ pub fn compile_to_dataflow(
 
     let mut table_ids = table_id_map.clone();
     let dataflow = compile_node(plan, &mut table_ids)?;
-    Some(CompileResult { dataflow, table_ids })
+    Some(CompileResult {
+        dataflow,
+        table_ids,
+    })
 }
 
 fn compile_node(
@@ -90,10 +93,8 @@ fn compile_node(
                 Some(DataflowNode::Map {
                     input: Box::new(input_node),
                     mapper: Box::new(move |row: &Row| {
-                        let values: Vec<Value> = exprs
-                            .iter()
-                            .map(|expr| eval_expr(expr, row))
-                            .collect();
+                        let values: Vec<Value> =
+                            exprs.iter().map(|expr| eval_expr(expr, row)).collect();
                         Row::dummy(values)
                     }),
                 })
@@ -101,9 +102,24 @@ fn compile_node(
         }
 
         // All join types compile to Join node with appropriate JoinType
-        PhysicalPlan::HashJoin { left, right, condition, join_type }
-        | PhysicalPlan::SortMergeJoin { left, right, condition, join_type }
-        | PhysicalPlan::NestedLoopJoin { left, right, condition, join_type } => {
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            condition,
+            join_type,
+        }
+        | PhysicalPlan::SortMergeJoin {
+            left,
+            right,
+            condition,
+            join_type,
+        }
+        | PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            condition,
+            join_type,
+        } => {
             let left_node = compile_node(left, table_ids)?;
             let right_node = compile_node(right, table_ids)?;
             let ivm_join_type = convert_join_type(join_type);
@@ -120,7 +136,11 @@ fn compile_node(
         }
 
         PhysicalPlan::IndexNestedLoopJoin {
-            outer, inner_table, condition, join_type, ..
+            outer,
+            inner_table,
+            condition,
+            join_type,
+            ..
         } => {
             let outer_node = compile_node(outer, table_ids)?;
             let inner_table_id = get_or_assign_table_id(inner_table, table_ids);
@@ -150,7 +170,11 @@ fn compile_node(
             })
         }
 
-        PhysicalPlan::HashAggregate { input, group_by, aggregates } => {
+        PhysicalPlan::HashAggregate {
+            input,
+            group_by,
+            aggregates,
+        } => {
             let input_node = compile_node(input, table_ids)?;
 
             let group_by_indices: Vec<usize> = group_by
@@ -162,7 +186,9 @@ fn compile_node(
                 .iter()
                 .filter_map(|(func, expr)| {
                     let col_idx = match expr {
-                        Expr::Aggregate { expr: Some(inner), .. } => extract_column_index(inner),
+                        Expr::Aggregate {
+                            expr: Some(inner), ..
+                        } => extract_column_index(inner),
                         Expr::Column(col_ref) => Some(col_ref.index),
                         _ => Some(0), // COUNT(*) uses column 0
                     };
@@ -181,9 +207,7 @@ fn compile_node(
         PhysicalPlan::Empty => Some(DataflowNode::source(u32::MAX)), // sentinel
 
         // Non-incrementalizable — should have been caught by is_incrementalizable()
-        PhysicalPlan::Sort { .. }
-        | PhysicalPlan::Limit { .. }
-        | PhysicalPlan::TopN { .. } => None,
+        PhysicalPlan::Sort { .. } | PhysicalPlan::Limit { .. } | PhysicalPlan::TopN { .. } => None,
     }
 }
 
@@ -194,20 +218,16 @@ fn compile_node(
 /// Compiles an Expr predicate into a closure for DataflowNode::Filter.
 fn compile_predicate(expr: &Expr) -> Box<dyn Fn(&Row) -> bool + Send + Sync> {
     let expr = expr.clone();
-    Box::new(move |row: &Row| {
-        match eval_expr(&expr, row) {
-            Value::Boolean(b) => b,
-            _ => false,
-        }
+    Box::new(move |row: &Row| match eval_expr(&expr, row) {
+        Value::Boolean(b) => b,
+        _ => false,
     })
 }
 
 /// Evaluates an expression against a row.
 fn eval_expr(expr: &Expr, row: &Row) -> Value {
     match expr {
-        Expr::Column(col_ref) => {
-            row.get(col_ref.index).cloned().unwrap_or(Value::Null)
-        }
+        Expr::Column(col_ref) => row.get(col_ref.index).cloned().unwrap_or(Value::Null),
         Expr::Literal(val) => val.clone(),
         Expr::BinaryOp { left, op, right } => {
             let lval = eval_expr(left, row);
@@ -347,19 +367,21 @@ fn as_f64(val: &Value) -> Option<f64> {
 /// Handles equi-join conditions like `left.col = right.col`.
 fn extract_join_keys(condition: &Expr) -> (KeyExtractorFn, KeyExtractorFn) {
     match condition {
-        Expr::BinaryOp { left, op: BinaryOp::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => {
             let left_idx = extract_column_index(left).unwrap_or(0);
             let right_idx = extract_column_index(right).unwrap_or(0);
             (
-                Box::new(move |row: &Row| {
-                    vec![row.get(left_idx).cloned().unwrap_or(Value::Null)]
-                }),
-                Box::new(move |row: &Row| {
-                    vec![row.get(right_idx).cloned().unwrap_or(Value::Null)]
-                }),
+                Box::new(move |row: &Row| vec![row.get(left_idx).cloned().unwrap_or(Value::Null)]),
+                Box::new(move |row: &Row| vec![row.get(right_idx).cloned().unwrap_or(Value::Null)]),
             )
         }
-        Expr::BinaryOp { op: BinaryOp::And, .. } => {
+        Expr::BinaryOp {
+            op: BinaryOp::And, ..
+        } => {
             // Compound join key: a.x = b.x AND a.y = b.y
             let mut left_indices = Vec::new();
             let mut right_indices = Vec::new();
@@ -367,12 +389,14 @@ fn extract_join_keys(condition: &Expr) -> (KeyExtractorFn, KeyExtractorFn) {
 
             (
                 Box::new(move |row: &Row| {
-                    left_indices.iter()
+                    left_indices
+                        .iter()
                         .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
                         .collect()
                 }),
                 Box::new(move |row: &Row| {
-                    right_indices.iter()
+                    right_indices
+                        .iter()
                         .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
                         .collect()
                 }),
@@ -388,9 +412,17 @@ fn extract_join_keys(condition: &Expr) -> (KeyExtractorFn, KeyExtractorFn) {
     }
 }
 
-fn collect_equi_join_keys(expr: &Expr, left_indices: &mut Vec<usize>, right_indices: &mut Vec<usize>) {
+fn collect_equi_join_keys(
+    expr: &Expr,
+    left_indices: &mut Vec<usize>,
+    right_indices: &mut Vec<usize>,
+) {
     match expr {
-        Expr::BinaryOp { left, op: BinaryOp::Eq, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::Eq,
+            right,
+        } => {
             if let Some(li) = extract_column_index(left) {
                 left_indices.push(li);
             }
@@ -398,7 +430,11 @@ fn collect_equi_join_keys(expr: &Expr, left_indices: &mut Vec<usize>, right_indi
                 right_indices.push(ri);
             }
         }
-        Expr::BinaryOp { left, op: BinaryOp::And, right } => {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => {
             collect_equi_join_keys(left, left_indices, right_indices);
             collect_equi_join_keys(right, left_indices, right_indices);
         }
@@ -455,7 +491,10 @@ mod tests {
         table_ids.insert("users".into(), 1u32);
 
         let result = compile_to_dataflow(&plan, &table_ids).unwrap();
-        assert!(matches!(result.dataflow, DataflowNode::Source { table_id: 1 }));
+        assert!(matches!(
+            result.dataflow,
+            DataflowNode::Source { table_id: 1 }
+        ));
     }
 
     #[test]
@@ -475,7 +514,10 @@ mod tests {
     fn test_compile_non_incrementalizable() {
         let plan = PhysicalPlan::sort(
             PhysicalPlan::table_scan("users"),
-            alloc::vec![(Expr::column("users", "id", 0), cynos_query::ast::SortOrder::Asc)],
+            alloc::vec![(
+                Expr::column("users", "id", 0),
+                cynos_query::ast::SortOrder::Asc
+            )],
         );
         let table_ids = HashMap::new();
         assert!(compile_to_dataflow(&plan, &table_ids).is_none());
@@ -521,7 +563,11 @@ mod tests {
 
         let result = compile_to_dataflow(&plan, &table_ids).unwrap();
         match &result.dataflow {
-            DataflowNode::Aggregate { group_by, functions, .. } => {
+            DataflowNode::Aggregate {
+                group_by,
+                functions,
+                ..
+            } => {
                 assert_eq!(group_by, &[0]);
                 assert_eq!(functions.len(), 2);
                 assert_eq!(functions[0].1, AggregateType::Count);
@@ -642,15 +688,28 @@ mod tests {
         let mut view = MaterializedView::new(result.dataflow);
 
         // Insert rows: id=1 (match), id=2 (no match), id=3 (match)
-        view.on_table_change(1, vec![
-            Delta::insert(Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())])),
-            Delta::insert(Row::new(2, vec![Value::Int64(2), Value::String("Bob".into())])),
-            Delta::insert(Row::new(3, vec![Value::Int64(3), Value::String("Carol".into())])),
-        ]);
+        view.on_table_change(
+            1,
+            vec![
+                Delta::insert(Row::new(
+                    1,
+                    vec![Value::Int64(1), Value::String("Alice".into())],
+                )),
+                Delta::insert(Row::new(
+                    2,
+                    vec![Value::Int64(2), Value::String("Bob".into())],
+                )),
+                Delta::insert(Row::new(
+                    3,
+                    vec![Value::Int64(3), Value::String("Carol".into())],
+                )),
+            ],
+        );
 
         assert_eq!(view.len(), 2); // only id=1 and id=3
         let rows = view.result();
-        let ids: Vec<i64> = rows.iter()
+        let ids: Vec<i64> = rows
+            .iter()
             .filter_map(|r| r.get(0).and_then(|v| v.as_i64()))
             .collect();
         assert!(ids.contains(&1));

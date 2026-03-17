@@ -26,18 +26,12 @@ fn delta_operations(report: &mut Report) {
 
     // Single insert
     let result = measure(ITERATIONS * 100, || Delta::insert(42i64));
-    println!(
-        "    create_insert:  {:>10}",
-        format_duration(result.mean)
-    );
+    println!("    create_insert:  {:>10}", format_duration(result.mean));
     report.add_result("Incremental/Delta", "create_insert", None, result, None);
 
     // Single delete
     let result = measure(ITERATIONS * 100, || Delta::delete(42i64));
-    println!(
-        "    create_delete:  {:>10}",
-        format_duration(result.mean)
-    );
+    println!("    create_delete:  {:>10}", format_duration(result.mean));
     report.add_result("Incremental/Delta", "create_delete", None, result, None);
 }
 
@@ -46,9 +40,7 @@ fn filter_incremental_bench(report: &mut Report) {
     for &size in &[1usize, 10, 100, 1000] {
         let deltas: Vec<Delta<i64>> = (0..size as i64).map(|i| Delta::insert(i)).collect();
 
-        let result = measure(ITERATIONS, || {
-            filter_incremental(&deltas, |&x| x > 50)
-        });
+        let result = measure(ITERATIONS, || filter_incremental(&deltas, |&x| x > 50));
 
         let throughput = result.throughput(size);
         println!(
@@ -57,7 +49,13 @@ fn filter_incremental_bench(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Incremental", "filter", Some(size), result, Some(throughput));
+        report.add_result(
+            "Incremental",
+            "filter",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -66,9 +64,7 @@ fn map_incremental_bench(report: &mut Report) {
     for &size in &[1usize, 10, 100, 1000] {
         let deltas: Vec<Delta<i64>> = (0..size as i64).map(|i| Delta::insert(i)).collect();
 
-        let result = measure(ITERATIONS, || {
-            map_incremental(&deltas, |&x| x * 2)
-        });
+        let result = measure(ITERATIONS, || map_incremental(&deltas, |&x| x * 2));
 
         let throughput = result.throughput(size);
         println!(
@@ -174,7 +170,13 @@ fn aggregates(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Incremental/Aggregate", "sum_batch", Some(size), result, Some(throughput));
+        report.add_result(
+            "Incremental/Aggregate",
+            "sum_batch",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -244,7 +246,13 @@ fn incremental_join(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Incremental/Join", "batch_insert", Some(size), result, Some(throughput));
+        report.add_result(
+            "Incremental/Join",
+            "batch_insert",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -327,6 +335,12 @@ fn materialized_view(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Incremental/View", "filter_batch", Some(size), result, Some(throughput));
+        report.add_result(
+            "Incremental/View",
+            "filter_batch",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }

@@ -472,7 +472,10 @@ impl Expr {
 
 impl Expr {
     /// Converts to AST expression for JOIN conditions where table names are needed.
-    pub(crate) fn to_ast_with_table(&self, get_column_info: &impl Fn(&str) -> Option<(String, usize, DataType)>) -> AstExpr {
+    pub(crate) fn to_ast_with_table(
+        &self,
+        get_column_info: &impl Fn(&str) -> Option<(String, usize, DataType)>,
+    ) -> AstExpr {
         match &self.inner {
             ExprInner::Comparison { column, op, value } => {
                 // Build the lookup key: if table is set, use "table.column", otherwise just "column"
@@ -518,9 +521,10 @@ impl Expr {
                     if let Ok(name_val) = js_sys::Reflect::get(value, &JsValue::from_str("name")) {
                         if let Some(col_name) = name_val.as_string() {
                             // Get table name if present
-                            let table_name = js_sys::Reflect::get(value, &JsValue::from_str("tableName"))
-                                .ok()
-                                .and_then(|v| v.as_string());
+                            let table_name =
+                                js_sys::Reflect::get(value, &JsValue::from_str("tableName"))
+                                    .ok()
+                                    .and_then(|v| v.as_string());
 
                             // Build lookup key with table prefix if present
                             let col_lookup = if let Some(ref tbl) = table_name {
@@ -573,7 +577,8 @@ impl Expr {
                 }
             }
             ExprInner::Between { column, low, high } => {
-                let (table, idx, dt) = get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::Float64));
+                let (table, idx, dt) =
+                    get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::Float64));
                 let table_name = if table.is_empty() {
                     column.table.as_deref().unwrap_or("")
                 } else {
@@ -582,18 +587,30 @@ impl Expr {
                 let col_expr = AstExpr::column(table_name, &column.name, idx);
                 let low_val = js_to_value(low, dt).unwrap_or(Value::Null);
                 let high_val = js_to_value(high, dt).unwrap_or(Value::Null);
-                AstExpr::between(col_expr, AstExpr::literal(low_val), AstExpr::literal(high_val))
+                AstExpr::between(
+                    col_expr,
+                    AstExpr::literal(low_val),
+                    AstExpr::literal(high_val),
+                )
             }
             ExprInner::NotBetween { column, low, high } => {
-                let (_, idx, dt) = get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::Float64));
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let (_, idx, dt) =
+                    get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::Float64));
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
                 let low_val = js_to_value(low, dt).unwrap_or(Value::Null);
                 let high_val = js_to_value(high, dt).unwrap_or(Value::Null);
-                AstExpr::not_between(col_expr, AstExpr::literal(low_val), AstExpr::literal(high_val))
+                AstExpr::not_between(
+                    col_expr,
+                    AstExpr::literal(low_val),
+                    AstExpr::literal(high_val),
+                )
             }
             ExprInner::InList { column, values } => {
-                let (_, idx, dt) = get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::String));
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let (_, idx, dt) =
+                    get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::String));
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
 
                 let arr = js_sys::Array::from(values);
                 let vals: Vec<Value> = arr
@@ -604,8 +621,10 @@ impl Expr {
                 AstExpr::in_list(col_expr, vals)
             }
             ExprInner::NotInList { column, values } => {
-                let (_, idx, dt) = get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::String));
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let (_, idx, dt) =
+                    get_column_info(&column.name).unwrap_or((String::new(), 0, DataType::String));
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
 
                 let arr = js_sys::Array::from(values);
                 let vals: Vec<Value> = arr
@@ -616,36 +635,58 @@ impl Expr {
                 AstExpr::not_in_list(col_expr, vals)
             }
             ExprInner::Like { column, pattern } => {
-                let idx = get_column_info(&column.name).map(|(_, i, _)| i).unwrap_or(0);
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let idx = get_column_info(&column.name)
+                    .map(|(_, i, _)| i)
+                    .unwrap_or(0);
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
                 AstExpr::like(col_expr, pattern)
             }
             ExprInner::NotLike { column, pattern } => {
-                let idx = get_column_info(&column.name).map(|(_, i, _)| i).unwrap_or(0);
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let idx = get_column_info(&column.name)
+                    .map(|(_, i, _)| i)
+                    .unwrap_or(0);
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
                 AstExpr::not_like(col_expr, pattern)
             }
             ExprInner::Match { column, pattern } => {
-                let idx = get_column_info(&column.name).map(|(_, i, _)| i).unwrap_or(0);
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let idx = get_column_info(&column.name)
+                    .map(|(_, i, _)| i)
+                    .unwrap_or(0);
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
                 AstExpr::regex_match(col_expr, pattern)
             }
             ExprInner::NotMatch { column, pattern } => {
-                let idx = get_column_info(&column.name).map(|(_, i, _)| i).unwrap_or(0);
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let idx = get_column_info(&column.name)
+                    .map(|(_, i, _)| i)
+                    .unwrap_or(0);
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
                 AstExpr::not_regex_match(col_expr, pattern)
             }
             ExprInner::IsNull { column } => {
-                let idx = get_column_info(&column.name).map(|(_, i, _)| i).unwrap_or(0);
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let idx = get_column_info(&column.name)
+                    .map(|(_, i, _)| i)
+                    .unwrap_or(0);
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
                 AstExpr::is_null(col_expr)
             }
             ExprInner::IsNotNull { column } => {
-                let idx = get_column_info(&column.name).map(|(_, i, _)| i).unwrap_or(0);
-                let col_expr = AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
+                let idx = get_column_info(&column.name)
+                    .map(|(_, i, _)| i)
+                    .unwrap_or(0);
+                let col_expr =
+                    AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx);
                 AstExpr::is_not_null(col_expr)
             }
-            ExprInner::JsonbEq { column, path, value } => {
+            ExprInner::JsonbEq {
+                column,
+                path,
+                value,
+            } => {
                 // JSONB path equality - use get_column_info to get correct index
                 let col_expr = if let Some((_, idx, _)) = get_column_info(&column.name) {
                     AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx)
@@ -661,13 +702,30 @@ impl Expr {
                 };
                 AstExpr::jsonb_path_eq(col_expr, path, val)
             }
-            ExprInner::JsonbContains { column, path, value: _ } => {
+            ExprInner::JsonbContains {
+                column,
+                path,
+                value,
+            } => {
                 let col_expr = if let Some((_, idx, _)) = get_column_info(&column.name) {
                     AstExpr::column(column.table.as_deref().unwrap_or(""), &column.name, idx)
                 } else {
                     column.to_ast()
                 };
-                AstExpr::jsonb_contains(col_expr, path)
+                let val = if let Some(s) = value.as_string() {
+                    Value::String(s)
+                } else if let Some(n) = value.as_f64() {
+                    if n.fract() == 0.0 {
+                        Value::Int64(n as i64)
+                    } else {
+                        Value::Float64(n)
+                    }
+                } else if let Some(b) = value.as_bool() {
+                    Value::Boolean(b)
+                } else {
+                    Value::Null
+                };
+                AstExpr::jsonb_contains(col_expr, path, val)
             }
             ExprInner::JsonbExists { column, path } => {
                 let col_expr = if let Some((_, idx, _)) = get_column_info(&column.name) {

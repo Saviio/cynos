@@ -187,10 +187,7 @@ impl<'a> LimitSkipByIndexPass<'a> {
             PhysicalPlan::IndexScan {
                 table,
                 index,
-                range_start,
-                range_end,
-                include_start,
-                include_end,
+                bounds,
                 limit: existing_limit,
                 offset: existing_offset,
                 reverse,
@@ -211,10 +208,7 @@ impl<'a> LimitSkipByIndexPass<'a> {
                 Some(PhysicalPlan::IndexScan {
                     table,
                     index,
-                    range_start,
-                    range_end,
-                    include_start,
-                    include_end,
+                    bounds,
                     limit: new_limit,
                     offset: new_offset,
                     reverse,
@@ -238,10 +232,7 @@ impl<'a> LimitSkipByIndexPass<'a> {
                 Some(PhysicalPlan::IndexScan {
                     table,
                     index: pk_index.name.clone(),
-                    range_start: None,
-                    range_end: None,
-                    include_start: true,
-                    include_end: true,
+                    bounds: crate::planner::IndexBounds::all(),
                     limit: Some(limit),
                     offset: Some(offset),
                     reverse: false,
@@ -270,11 +261,7 @@ mod tests {
             TableStats {
                 row_count: 1000,
                 is_sorted: false,
-                indexes: alloc::vec![IndexInfo::new(
-                    "idx_id",
-                    alloc::vec!["id".into()],
-                    true
-                )],
+                indexes: alloc::vec![IndexInfo::new("idx_id", alloc::vec!["id".into()], true)],
             },
         );
 
@@ -291,10 +278,7 @@ mod tests {
             input: Box::new(PhysicalPlan::IndexScan {
                 table: "users".into(),
                 index: "idx_id".into(),
-                range_start: None,
-                range_end: None,
-                include_start: true,
-                include_end: true,
+                bounds: crate::planner::IndexBounds::all(),
                 limit: None,
                 offset: None,
                 reverse: false,
@@ -325,10 +309,7 @@ mod tests {
                 input: Box::new(PhysicalPlan::IndexScan {
                     table: "users".into(),
                     index: "idx_id".into(),
-                    range_start: None,
-                    range_end: None,
-                    include_start: true,
-                    include_end: true,
+                    bounds: crate::planner::IndexBounds::all(),
                     limit: None,
                     offset: None,
                     reverse: false,
@@ -365,10 +346,7 @@ mod tests {
                 input: Box::new(PhysicalPlan::IndexScan {
                     table: "users".into(),
                     index: "idx_id".into(),
-                    range_start: None,
-                    range_end: None,
-                    include_start: true,
-                    include_end: true,
+                    bounds: crate::planner::IndexBounds::all(),
                     limit: None,
                     offset: None,
                     reverse: false,
@@ -400,7 +378,14 @@ mod tests {
         let result = pass.optimize(plan);
 
         // Should be converted to IndexScan using primary key
-        if let PhysicalPlan::IndexScan { table, index, limit, offset, .. } = result {
+        if let PhysicalPlan::IndexScan {
+            table,
+            index,
+            limit,
+            offset,
+            ..
+        } = result
+        {
             assert_eq!(table, "users");
             assert_eq!(index, "idx_id"); // Primary key index
             assert_eq!(limit, Some(10));
@@ -453,10 +438,7 @@ mod tests {
                 input: Box::new(PhysicalPlan::IndexScan {
                     table: "users".into(),
                     index: "idx_id".into(),
-                    range_start: None,
-                    range_end: None,
-                    include_start: true,
-                    include_end: true,
+                    bounds: crate::planner::IndexBounds::all(),
                     limit: None,
                     offset: None,
                     reverse: false,
@@ -488,10 +470,7 @@ mod tests {
                 input: Box::new(PhysicalPlan::IndexScan {
                     table: "users".into(),
                     index: "idx_id".into(),
-                    range_start: None,
-                    range_end: None,
-                    include_start: true,
-                    include_end: true,
+                    bounds: crate::planner::IndexBounds::all(),
                     limit: None,
                     offset: None,
                     reverse: false,
@@ -522,10 +501,7 @@ mod tests {
             input: Box::new(PhysicalPlan::IndexScan {
                 table: "users".into(),
                 index: "idx_id".into(),
-                range_start: None,
-                range_end: None,
-                include_start: true,
-                include_end: true,
+                bounds: crate::planner::IndexBounds::all(),
                 limit: Some(10),
                 offset: None,
                 reverse: false,

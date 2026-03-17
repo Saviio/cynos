@@ -339,10 +339,7 @@ mod tests {
         let pass = NotSimplification;
 
         // NOT(a = b) → a != b
-        let expr = Expr::not(Expr::eq(
-            Expr::column("t", "a", 0),
-            Expr::literal(1i64),
-        ));
+        let expr = Expr::not(Expr::eq(Expr::column("t", "a", 0), Expr::literal(1i64)));
         let simplified = pass.simplify_expr(expr);
 
         assert!(matches!(

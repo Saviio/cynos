@@ -15,11 +15,15 @@
 //! 2. The outer relation is small enough that index lookups are efficient
 //! 3. The join is an inner equi-join
 
-use crate::ast::{BinaryOp, Expr, JoinType};
-use crate::context::ExecutionContext;
+use crate::ast::{BinaryOp, ColumnRef, Expr, JoinType};
+use crate::context::{ExecutionContext, IndexInfo};
 use crate::planner::PhysicalPlan;
 use alloc::boxed::Box;
 use alloc::string::String;
+
+const INDEX_JOIN_ALWAYS_OUTER_ROWS: usize = 64;
+const INDEX_JOIN_MAX_OUTER_ROWS: usize = 4096;
+const INDEX_JOIN_MIN_INNER_OUTER_RATIO: usize = 4;
 
 /// Pass that converts eligible joins to index nested loop joins.
 pub struct IndexJoinPass<'a> {
@@ -196,7 +200,9 @@ impl<'a> IndexJoinPass<'a> {
             | PhysicalPlan::IndexGet { .. }
             | PhysicalPlan::IndexInGet { .. }
             | PhysicalPlan::IndexNestedLoopJoin { .. }
-            | PhysicalPlan::Empty | PhysicalPlan::GinIndexScan { .. } | PhysicalPlan::GinIndexScanMulti { .. }) => plan,
+            | PhysicalPlan::Empty
+            | PhysicalPlan::GinIndexScan { .. }
+            | PhysicalPlan::GinIndexScanMulti { .. }) => plan,
         }
     }
 
@@ -212,56 +218,159 @@ impl<'a> IndexJoinPass<'a> {
         let (left_col, right_col) = self.extract_join_columns(condition)?;
 
         // Check if right side is a table scan with an index on the join column
-        if let Some((table, index)) = self.get_indexed_table_scan(right, &right_col) {
-            return Some((left.clone(), table, index));
+        if let Some((table, index)) = self.get_indexed_table_scan(right, right_col) {
+            if self.should_use_index_join(left, &table, &index) {
+                return Some((left.clone(), table, index.name.clone()));
+            }
         }
 
         // Check if left side is a table scan with an index on the join column
-        if let Some((table, index)) = self.get_indexed_table_scan(left, &left_col) {
-            return Some((right.clone(), table, index));
+        if let Some((table, index)) = self.get_indexed_table_scan(left, left_col) {
+            if self.should_use_index_join(right, &table, &index) {
+                return Some((right.clone(), table, index.name.clone()));
+            }
         }
 
         None
     }
 
     /// Extracts the column names from an equi-join condition.
-    fn extract_join_columns(&self, condition: &Expr) -> Option<(String, String)> {
+    fn extract_join_columns<'b>(
+        &self,
+        condition: &'b Expr,
+    ) -> Option<(&'b ColumnRef, &'b ColumnRef)> {
         match condition {
             Expr::BinaryOp {
                 left,
                 op: BinaryOp::Eq,
                 right,
             } => {
-                let left_col = self.extract_column_name(left)?;
-                let right_col = self.extract_column_name(right)?;
+                let left_col = self.extract_column_ref(left)?;
+                let right_col = self.extract_column_ref(right)?;
                 Some((left_col, right_col))
             }
             _ => None,
         }
     }
 
-    /// Extracts the column name from a column expression.
-    fn extract_column_name(&self, expr: &Expr) -> Option<String> {
+    fn extract_column_ref<'b>(&self, expr: &'b Expr) -> Option<&'b ColumnRef> {
         match expr {
-            Expr::Column(col_ref) => Some(col_ref.column.clone()),
+            Expr::Column(col_ref) => Some(col_ref),
             _ => None,
         }
     }
 
     /// Checks if the plan is a table scan with an index on the given column.
-    /// Returns (table_name, index_name) if found.
+    /// Returns (table_name, index_info) if found.
     fn get_indexed_table_scan(
         &self,
         plan: &PhysicalPlan,
-        column: &str,
-    ) -> Option<(String, String)> {
+        column: &ColumnRef,
+    ) -> Option<(String, IndexInfo)> {
         match plan {
             PhysicalPlan::TableScan { table } => {
+                if table != &column.table {
+                    return None;
+                }
                 // Check if there's an index on this column
-                let index = self.ctx.find_index(table, &[column])?;
-                Some((table.clone(), index.name.clone()))
+                let index = self.ctx.find_index(table, &[column.column.as_str()])?;
+                if index.is_gin() {
+                    return None;
+                }
+                Some((table.clone(), index.clone()))
             }
             _ => None,
+        }
+    }
+
+    fn should_use_index_join(
+        &self,
+        outer: &PhysicalPlan,
+        inner_table: &str,
+        inner_index: &IndexInfo,
+    ) -> bool {
+        if outer.collect_tables().len() != 1 {
+            return false;
+        }
+
+        let outer_rows = self.estimate_rows(outer);
+        let inner_rows = self
+            .ctx
+            .get_stats(inner_table)
+            .map(|stats| stats.row_count)
+            .unwrap_or(1000);
+
+        if outer_rows == 0 || inner_rows == 0 {
+            return false;
+        }
+
+        if outer_rows <= INDEX_JOIN_ALWAYS_OUTER_ROWS {
+            return true;
+        }
+
+        if inner_index.is_unique {
+            return outer_rows <= inner_rows;
+        }
+
+        outer_rows <= INDEX_JOIN_MAX_OUTER_ROWS
+            && inner_rows >= outer_rows.saturating_mul(INDEX_JOIN_MIN_INNER_OUTER_RATIO)
+    }
+
+    fn estimate_rows(&self, plan: &PhysicalPlan) -> usize {
+        match plan {
+            PhysicalPlan::TableScan { table } => self
+                .ctx
+                .get_stats(table)
+                .map(|stats| stats.row_count)
+                .unwrap_or(1000),
+            PhysicalPlan::IndexGet { .. } => 1,
+            PhysicalPlan::IndexInGet { keys, .. } => keys.len(),
+            PhysicalPlan::IndexScan { table, .. } | PhysicalPlan::GinIndexScan { table, .. } => {
+                self.ctx
+                    .get_stats(table)
+                    .map(|stats| core::cmp::max(stats.row_count / 10, 1))
+                    .unwrap_or(100)
+            }
+            PhysicalPlan::GinIndexScanMulti { table, .. } => self
+                .ctx
+                .get_stats(table)
+                .map(|stats| core::cmp::max(stats.row_count / 20, 1))
+                .unwrap_or(50),
+            PhysicalPlan::Filter { input, .. } => core::cmp::max(self.estimate_rows(input) / 10, 1),
+            PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::NoOp { input } => self.estimate_rows(input),
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            }
+            | PhysicalPlan::TopN {
+                input,
+                limit,
+                offset,
+                ..
+            } => core::cmp::min(self.estimate_rows(input), limit.saturating_add(*offset)),
+            PhysicalPlan::HashAggregate {
+                input, group_by, ..
+            } => {
+                if group_by.is_empty() {
+                    1
+                } else {
+                    core::cmp::max(self.estimate_rows(input) / 10, 1)
+                }
+            }
+            PhysicalPlan::HashJoin { left, right, .. }
+            | PhysicalPlan::SortMergeJoin { left, right, .. }
+            | PhysicalPlan::NestedLoopJoin { left, right, .. }
+            | PhysicalPlan::CrossProduct { left, right } => core::cmp::max(
+                self.estimate_rows(left)
+                    .saturating_mul(self.estimate_rows(right))
+                    / 10,
+                1,
+            ),
+            PhysicalPlan::IndexNestedLoopJoin { outer, .. } => self.estimate_rows(outer),
+            PhysicalPlan::Empty => 0,
         }
     }
 }
@@ -414,5 +523,44 @@ mod tests {
         if let PhysicalPlan::HashJoin { left, .. } = result {
             assert!(matches!(*left, PhysicalPlan::IndexNestedLoopJoin { .. }));
         }
+    }
+
+    #[test]
+    fn test_large_outer_prefers_hash_join() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "big_outer",
+            TableStats {
+                row_count: 20_000,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+        ctx.register_table(
+            "small_inner",
+            TableStats {
+                row_count: 1_000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_outer_id",
+                    alloc::vec!["outer_id".into()],
+                    false,
+                )],
+            },
+        );
+
+        let pass = IndexJoinPass::new(&ctx);
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(PhysicalPlan::table_scan("big_outer")),
+            right: Box::new(PhysicalPlan::table_scan("small_inner")),
+            condition: Expr::eq(
+                Expr::column("big_outer", "id", 0),
+                Expr::column("small_inner", "outer_id", 0),
+            ),
+            join_type: JoinType::Inner,
+        };
+
+        let result = pass.optimize(plan);
+        assert!(matches!(result, PhysicalPlan::HashJoin { .. }));
     }
 }

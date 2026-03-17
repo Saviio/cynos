@@ -166,22 +166,14 @@ mod tests {
 
     #[test]
     fn test_delta_batch_compact() {
-        let batch: DeltaBatch<i32> = vec![
-            Delta::insert(1),
-            Delta::new(2, 0),
-            Delta::delete(3),
-        ];
+        let batch: DeltaBatch<i32> = vec![Delta::insert(1), Delta::new(2, 0), Delta::delete(3)];
         let compacted = batch.compact();
         assert_eq!(compacted.len(), 2);
     }
 
     #[test]
     fn test_delta_batch_net_count() {
-        let batch: DeltaBatch<i32> = vec![
-            Delta::insert(1),
-            Delta::insert(2),
-            Delta::delete(3),
-        ];
+        let batch: DeltaBatch<i32> = vec![Delta::insert(1), Delta::insert(2), Delta::delete(3)];
         assert_eq!(batch.net_count(), 1);
     }
 }

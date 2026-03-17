@@ -49,7 +49,11 @@ impl TopNPushdown {
                 let optimized_input = self.traverse(*input);
 
                 // Check if input is a Sort - if so, convert to TopN
-                if let PhysicalPlan::Sort { input: sort_input, order_by } = optimized_input {
+                if let PhysicalPlan::Sort {
+                    input: sort_input,
+                    order_by,
+                } = optimized_input
+                {
                     // Convert to TopN - more efficient for top-k selection
                     return PhysicalPlan::TopN {
                         input: sort_input,
@@ -60,7 +64,13 @@ impl TopNPushdown {
                 }
 
                 // Check if input is IndexGet - push limit into it
-                if let PhysicalPlan::IndexGet { table, index, key, limit: _ } = optimized_input {
+                if let PhysicalPlan::IndexGet {
+                    table,
+                    index,
+                    key,
+                    limit: _,
+                } = optimized_input
+                {
                     // Push limit into IndexGet for early termination
                     // Note: offset is handled by skipping rows after IndexGet
                     if offset == 0 {
@@ -89,10 +99,7 @@ impl TopNPushdown {
                 if let PhysicalPlan::IndexScan {
                     table,
                     index,
-                    range_start,
-                    range_end,
-                    include_start,
-                    include_end,
+                    bounds,
                     limit: None,
                     offset: None,
                     reverse,
@@ -102,10 +109,7 @@ impl TopNPushdown {
                     return PhysicalPlan::IndexScan {
                         table,
                         index,
-                        range_start,
-                        range_end,
-                        include_start,
-                        include_end,
+                        bounds,
                         limit: Some(limit + offset),
                         offset: Some(offset),
                         reverse,

@@ -9,10 +9,10 @@ use crate::reactive_bridge::QueryRegistry;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use cynos_core::{reserve_row_ids, Row};
 use cynos_reactive::TableId;
 use cynos_storage::{TableCache, Transaction, TransactionState};
-use core::cell::RefCell;
 use hashbrown::HashSet;
 use wasm_bindgen::prelude::*;
 

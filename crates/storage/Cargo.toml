@@ -14,6 +14,7 @@ hash-store = ["hashbrown"]
 cynos-core = { workspace = true }
 cynos-index = { workspace = true }
 cynos-incremental = { workspace = true }
+cynos-jsonb = { workspace = true }
 hashbrown = { workspace = true, optional = true }
 
 [dev-dependencies]
@@ -21,4 +22,8 @@ criterion = { workspace = true }
 
 [[bench]]
 name = "row_store_bench"
+harness = false
+
+[[bench]]
+name = "gin_contains_bench"
 harness = false

@@ -18,8 +18,7 @@ use crate::report::Report;
 use crate::utils::*;
 use cynos_core::{Row, Value};
 use cynos_incremental::{
-    AggregateType, DataflowNode, Delta, JoinType as IvmJoinType,
-    MaterializedView,
+    AggregateType, DataflowNode, Delta, JoinType as IvmJoinType, MaterializedView,
 };
 use cynos_query::ast::{AggregateFunc, Expr, JoinType as QueryJoinType};
 use cynos_query::executor::{InMemoryDataSource, PhysicalPlanRunner};
@@ -56,10 +55,7 @@ fn make_employee(id: u64, age: i32, dept_id: i64, salary: i64) -> Row {
 fn make_department(id: u64, name: &str) -> Row {
     Row::new(
         id,
-        vec![
-            Value::Int64(id as i64),
-            Value::String(name.into()),
-        ],
+        vec![Value::Int64(id as i64), Value::String(name.into())],
     )
 }
 
@@ -77,8 +73,16 @@ fn generate_employees(count: usize) -> Vec<Row> {
 
 fn generate_departments(count: usize) -> Vec<Row> {
     let names = [
-        "Engineering", "Sales", "Marketing", "HR", "Finance",
-        "Legal", "Support", "Research", "Operations", "Design",
+        "Engineering",
+        "Sales",
+        "Marketing",
+        "HR",
+        "Finance",
+        "Legal",
+        "Support",
+        "Research",
+        "Operations",
+        "Design",
     ];
     (0..count)
         .map(|i| make_department(i as u64 + 1, names[i % names.len()]))
@@ -114,8 +118,16 @@ fn value_sort_key(v: &Value) -> String {
 
 fn sort_rows(rows: &mut Vec<Vec<Value>>) {
     rows.sort_by(|a, b| {
-        let ka: String = a.iter().map(|v| value_sort_key(v)).collect::<Vec<_>>().join("|");
-        let kb: String = b.iter().map(|v| value_sort_key(v)).collect::<Vec<_>>().join("|");
+        let ka: String = a
+            .iter()
+            .map(|v| value_sort_key(v))
+            .collect::<Vec<_>>()
+            .join("|");
+        let kb: String = b
+            .iter()
+            .map(|v| value_sort_key(v))
+            .collect::<Vec<_>>()
+            .join("|");
         ka.cmp(&kb)
     });
 }
@@ -165,7 +177,11 @@ fn rows_equivalent(a: &[Vec<Value>], b: &[Vec<Value>]) -> bool {
         return false;
     }
     a.iter().zip(b.iter()).all(|(ra, rb)| {
-        ra.len() == rb.len() && ra.iter().zip(rb.iter()).all(|(va, vb)| values_equivalent(va, vb))
+        ra.len() == rb.len()
+            && ra
+                .iter()
+                .zip(rb.iter())
+                .all(|(va, vb)| values_equivalent(va, vb))
     })
 }
 
@@ -184,7 +200,11 @@ fn print_comparison(
     report: &mut Report,
 ) {
     let speedup = requery_result.mean.as_nanos() as f64 / ivm_result.mean.as_nanos().max(1) as f64;
-    let eq_str = if equivalent { "equivalent" } else { "MISMATCH!" };
+    let eq_str = if equivalent {
+        "equivalent"
+    } else {
+        "MISMATCH!"
+    };
     println!(
         "    {:>6} rows: re-query {:>10}  ivm {:>10}  speedup {:>6.1}x  {}",
         size,
@@ -194,10 +214,17 @@ fn print_comparison(
         eq_str,
     );
     if !equivalent {
-        println!("      [DEBUG] requery rows: {}, ivm rows: {}", requery_rows.len(), ivm_rows.len());
+        println!(
+            "      [DEBUG] requery rows: {}, ivm rows: {}",
+            requery_rows.len(),
+            ivm_rows.len()
+        );
         for (i, (r, v)) in requery_rows.iter().zip(ivm_rows.iter()).enumerate() {
             if !r.iter().zip(v.iter()).all(|(a, b)| values_equivalent(a, b)) {
-                println!("      [DEBUG] first diff at row {}: requery={:?} ivm={:?}", i, r, v);
+                println!(
+                    "      [DEBUG] first diff at row {}: requery={:?} ivm={:?}",
+                    i, r, v
+                );
                 break;
             }
         }
@@ -283,7 +310,16 @@ fn filter_compare(report: &mut Report) {
             })
         };
 
-        print_comparison("filter", size, &requery_bench, &ivm_bench, equivalent, &requery_rows, &ivm_rows, report);
+        print_comparison(
+            "filter",
+            size,
+            &requery_bench,
+            &ivm_bench,
+            equivalent,
+            &requery_rows,
+            &ivm_rows,
+            report,
+        );
     }
 }
 
@@ -322,8 +358,10 @@ fn inner_join_compare(report: &mut Report) {
             Box::new(|row: &Row| vec![row.get(0).cloned().unwrap_or(Value::Null)]),
         );
         let mut view = MaterializedView::new(dataflow);
-        let dept_deltas: Vec<Delta<Row>> =
-            departments.iter().map(|r| Delta::insert(r.clone())).collect();
+        let dept_deltas: Vec<Delta<Row>> = departments
+            .iter()
+            .map(|r| Delta::insert(r.clone()))
+            .collect();
         view.on_table_change(2, dept_deltas);
         let emp_deltas: Vec<Delta<Row>> =
             employees.iter().map(|r| Delta::insert(r.clone())).collect();
@@ -347,8 +385,10 @@ fn inner_join_compare(report: &mut Report) {
                 Box::new(|row: &Row| vec![row.get(0).cloned().unwrap_or(Value::Null)]),
             );
             let mut view = MaterializedView::new(dataflow);
-            let dept_deltas: Vec<Delta<Row>> =
-                departments.iter().map(|r| Delta::insert(r.clone())).collect();
+            let dept_deltas: Vec<Delta<Row>> = departments
+                .iter()
+                .map(|r| Delta::insert(r.clone()))
+                .collect();
             view.on_table_change(2, dept_deltas);
             let emp_deltas: Vec<Delta<Row>> =
                 employees.iter().map(|r| Delta::insert(r.clone())).collect();
@@ -362,7 +402,16 @@ fn inner_join_compare(report: &mut Report) {
             })
         };
 
-        print_comparison("inner_join", size, &requery_bench, &ivm_bench, equivalent, &requery_rows, &ivm_rows, report);
+        print_comparison(
+            "inner_join",
+            size,
+            &requery_bench,
+            &ivm_bench,
+            equivalent,
+            &requery_rows,
+            &ivm_rows,
+            report,
+        );
     }
 }
 
@@ -403,8 +452,10 @@ fn left_outer_join_compare(report: &mut Report) {
             IvmJoinType::LeftOuter,
         );
         let mut view = MaterializedView::new(dataflow);
-        let dept_deltas: Vec<Delta<Row>> =
-            departments.iter().map(|r| Delta::insert(r.clone())).collect();
+        let dept_deltas: Vec<Delta<Row>> = departments
+            .iter()
+            .map(|r| Delta::insert(r.clone()))
+            .collect();
         view.on_table_change(2, dept_deltas);
         let emp_deltas: Vec<Delta<Row>> =
             employees.iter().map(|r| Delta::insert(r.clone())).collect();
@@ -429,8 +480,10 @@ fn left_outer_join_compare(report: &mut Report) {
                 IvmJoinType::LeftOuter,
             );
             let mut view = MaterializedView::new(dataflow);
-            let dept_deltas: Vec<Delta<Row>> =
-                departments.iter().map(|r| Delta::insert(r.clone())).collect();
+            let dept_deltas: Vec<Delta<Row>> = departments
+                .iter()
+                .map(|r| Delta::insert(r.clone()))
+                .collect();
             view.on_table_change(2, dept_deltas);
             let emp_deltas: Vec<Delta<Row>> =
                 employees.iter().map(|r| Delta::insert(r.clone())).collect();
@@ -444,7 +497,16 @@ fn left_outer_join_compare(report: &mut Report) {
             })
         };
 
-        print_comparison("left_outer_join", size, &requery_bench, &ivm_bench, equivalent, &requery_rows, &ivm_rows, report);
+        print_comparison(
+            "left_outer_join",
+            size,
+            &requery_bench,
+            &ivm_bench,
+            equivalent,
+            &requery_rows,
+            &ivm_rows,
+            report,
+        );
     }
 }
 
@@ -476,10 +538,7 @@ fn aggregate_count_sum_compare(report: &mut Report) {
         let dataflow = DataflowNode::Aggregate {
             input: Box::new(DataflowNode::source(1)),
             group_by: vec![3], // dept_id
-            functions: vec![
-                (0, AggregateType::Count),
-                (4, AggregateType::Sum),
-            ],
+            functions: vec![(0, AggregateType::Count), (4, AggregateType::Sum)],
         };
         let mut view = MaterializedView::new(dataflow);
         let initial_deltas: Vec<Delta<Row>> =
@@ -500,10 +559,7 @@ fn aggregate_count_sum_compare(report: &mut Report) {
             let dataflow = DataflowNode::Aggregate {
                 input: Box::new(DataflowNode::source(1)),
                 group_by: vec![3],
-                functions: vec![
-                    (0, AggregateType::Count),
-                    (4, AggregateType::Sum),
-                ],
+                functions: vec![(0, AggregateType::Count), (4, AggregateType::Sum)],
             };
             let mut view = MaterializedView::new(dataflow);
             let initial_deltas: Vec<Delta<Row>> =
@@ -518,7 +574,16 @@ fn aggregate_count_sum_compare(report: &mut Report) {
             })
         };
 
-        print_comparison("agg_count_sum", size, &requery_bench, &ivm_bench, equivalent, &requery_rows, &ivm_rows, report);
+        print_comparison(
+            "agg_count_sum",
+            size,
+            &requery_bench,
+            &ivm_bench,
+            equivalent,
+            &requery_rows,
+            &ivm_rows,
+            report,
+        );
     }
 }
 
@@ -560,10 +625,7 @@ fn aggregate_min_max_compare(report: &mut Report) {
         let dataflow = DataflowNode::Aggregate {
             input: Box::new(DataflowNode::source(1)),
             group_by: vec![3],
-            functions: vec![
-                (4, AggregateType::Min),
-                (4, AggregateType::Max),
-            ],
+            functions: vec![(4, AggregateType::Min), (4, AggregateType::Max)],
         };
         let mut view = MaterializedView::new(dataflow);
         let initial_deltas: Vec<Delta<Row>> =
@@ -584,10 +646,7 @@ fn aggregate_min_max_compare(report: &mut Report) {
             let dataflow = DataflowNode::Aggregate {
                 input: Box::new(DataflowNode::source(1)),
                 group_by: vec![3],
-                functions: vec![
-                    (4, AggregateType::Min),
-                    (4, AggregateType::Max),
-                ],
+                functions: vec![(4, AggregateType::Min), (4, AggregateType::Max)],
             };
             let mut view = MaterializedView::new(dataflow);
             let initial_deltas: Vec<Delta<Row>> =
@@ -602,7 +661,16 @@ fn aggregate_min_max_compare(report: &mut Report) {
             })
         };
 
-        print_comparison("agg_min_max", size, &requery_bench, &ivm_bench, equivalent, &requery_rows, &ivm_rows, report);
+        print_comparison(
+            "agg_min_max",
+            size,
+            &requery_bench,
+            &ivm_bench,
+            equivalent,
+            &requery_rows,
+            &ivm_rows,
+            report,
+        );
     }
 }
 
@@ -652,8 +720,10 @@ fn filter_join_compare(report: &mut Report) {
             Box::new(|row: &Row| vec![row.get(0).cloned().unwrap_or(Value::Null)]),
         );
         let mut view = MaterializedView::new(dataflow);
-        let dept_deltas: Vec<Delta<Row>> =
-            departments.iter().map(|r| Delta::insert(r.clone())).collect();
+        let dept_deltas: Vec<Delta<Row>> = departments
+            .iter()
+            .map(|r| Delta::insert(r.clone()))
+            .collect();
         view.on_table_change(2, dept_deltas);
         let emp_deltas: Vec<Delta<Row>> =
             employees.iter().map(|r| Delta::insert(r.clone())).collect();
@@ -682,8 +752,10 @@ fn filter_join_compare(report: &mut Report) {
                 Box::new(|row: &Row| vec![row.get(0).cloned().unwrap_or(Value::Null)]),
             );
             let mut view = MaterializedView::new(dataflow);
-            let dept_deltas: Vec<Delta<Row>> =
-                departments.iter().map(|r| Delta::insert(r.clone())).collect();
+            let dept_deltas: Vec<Delta<Row>> = departments
+                .iter()
+                .map(|r| Delta::insert(r.clone()))
+                .collect();
             view.on_table_change(2, dept_deltas);
             let emp_deltas: Vec<Delta<Row>> =
                 employees.iter().map(|r| Delta::insert(r.clone())).collect();
@@ -697,6 +769,15 @@ fn filter_join_compare(report: &mut Report) {
             })
         };
 
-        print_comparison("filter_join", size, &requery_bench, &ivm_bench, equivalent, &requery_rows, &ivm_rows, report);
+        print_comparison(
+            "filter_join",
+            size,
+            &requery_bench,
+            &ivm_bench,
+            equivalent,
+            &requery_rows,
+            &ivm_rows,
+            report,
+        );
     }
 }

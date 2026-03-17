@@ -2,7 +2,7 @@
 
 use crate::report::Report;
 use crate::utils::*;
-use cynos_jsonb::{JsonbBinary, JsonbObject, JsonbValue, JsonPath};
+use cynos_jsonb::{JsonPath, JsonbBinary, JsonbObject, JsonbValue};
 
 pub fn run(report: &mut Report) {
     parse(report);
@@ -36,7 +36,10 @@ fn create_array_json(size: usize) -> JsonbValue {
         .map(|i| {
             let mut obj = JsonbObject::new();
             obj.insert("id".into(), JsonbValue::Number(i as f64));
-            obj.insert("name".into(), JsonbValue::String(format!("item_{}", i).into()));
+            obj.insert(
+                "name".into(),
+                JsonbValue::String(format!("item_{}", i).into()),
+            );
             obj.insert("value".into(), JsonbValue::Number((i * 100) as f64));
             JsonbValue::Object(obj)
         })
@@ -60,11 +63,7 @@ fn parse(report: &mut Report) {
     for (name, path_str) in paths {
         let result = measure(ITERATIONS * 100, || JsonPath::parse(path_str));
 
-        println!(
-            "    {:<12}: {:>10}",
-            name,
-            format_duration(result.mean)
-        );
+        println!("    {:<12}: {:>10}", name, format_duration(result.mean));
         report.add_result("JSONB/Parse", name, None, result, None);
     }
 }
@@ -78,10 +77,7 @@ fn encode_decode(report: &mut Report) {
         let binary = JsonbBinary::encode(&simple);
         binary.decode()
     });
-    println!(
-        "    simple:      {:>10}",
-        format_duration(result.mean)
-    );
+    println!("    simple:      {:>10}", format_duration(result.mean));
     report.add_result("JSONB/Codec", "simple", None, result, None);
 
     // Nested object
@@ -96,7 +92,13 @@ fn encode_decode(report: &mut Report) {
             depth,
             format_duration(result.mean)
         );
-        report.add_result("JSONB/Codec", &format!("nested_{}", depth), None, result, None);
+        report.add_result(
+            "JSONB/Codec",
+            &format!("nested_{}", depth),
+            None,
+            result,
+            None,
+        );
     }
 
     // Array
@@ -113,7 +115,13 @@ fn encode_decode(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("JSONB/Codec", &format!("array_{}", size), Some(size), result, Some(throughput));
+        report.add_result(
+            "JSONB/Codec",
+            &format!("array_{}", size),
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -124,20 +132,14 @@ fn query(report: &mut Report) {
     let simple = create_simple_json();
     let path = JsonPath::parse("$.name").unwrap();
     let result = measure(ITERATIONS * 100, || simple.query(&path));
-    println!(
-        "    simple:      {:>10}",
-        format_duration(result.mean)
-    );
+    println!("    simple:      {:>10}", format_duration(result.mean));
     report.add_result("JSONB/Query", "simple", None, result, None);
 
     // Nested query
     let nested = create_nested_json(10);
     let path = JsonPath::parse("$.level_9.level_8.level_7.index").unwrap();
     let result = measure(ITERATIONS * 100, || nested.query(&path));
-    println!(
-        "    nested:      {:>10}",
-        format_duration(result.mean)
-    );
+    println!("    nested:      {:>10}", format_duration(result.mean));
     report.add_result("JSONB/Query", "nested", None, result, None);
 
     // Array query - now correctly matches $.items[*].name
@@ -163,7 +165,13 @@ fn query(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("JSONB/Query", &format!("array_{}", size), Some(size), result, Some(throughput));
+        report.add_result(
+            "JSONB/Query",
+            &format!("array_{}", size),
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -173,7 +181,10 @@ fn operations(report: &mut Report) {
     // Create a larger object for more realistic testing
     let mut large_obj = JsonbObject::new();
     for i in 0..100 {
-        large_obj.insert(format!("key_{}", i).into(), JsonbValue::String(format!("value_{}", i).into()));
+        large_obj.insert(
+            format!("key_{}", i).into(),
+            JsonbValue::String(format!("value_{}", i).into()),
+        );
     }
     let large_json = JsonbValue::Object(large_obj.clone());
 
@@ -217,7 +228,10 @@ fn operations(report: &mut Report) {
     let result = measure(ITERATIONS, || {
         let mut obj = JsonbObject::new();
         for i in 0..100 {
-            obj.insert(format!("key_{}", i).into(), JsonbValue::String(format!("value_{}", i).into()));
+            obj.insert(
+                format!("key_{}", i).into(),
+                JsonbValue::String(format!("value_{}", i).into()),
+            );
         }
         obj
     });

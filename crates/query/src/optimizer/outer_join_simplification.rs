@@ -308,14 +308,13 @@ impl OuterJoinSimplification {
                     || self.expr_references_tables(right, tables)
             }
             Expr::UnaryOp { expr, .. } => self.expr_references_tables(expr, tables),
-            Expr::Function { args, .. } => {
-                args.iter().any(|arg| self.expr_references_tables(arg, tables))
-            }
-            Expr::Aggregate { expr, .. } => {
-                expr.as_ref()
-                    .map(|e| self.expr_references_tables(e, tables))
-                    .unwrap_or(false)
-            }
+            Expr::Function { args, .. } => args
+                .iter()
+                .any(|arg| self.expr_references_tables(arg, tables)),
+            Expr::Aggregate { expr, .. } => expr
+                .as_ref()
+                .map(|e| self.expr_references_tables(e, tables))
+                .unwrap_or(false),
             Expr::Between { expr, low, high } => {
                 self.expr_references_tables(expr, tables)
                     || self.expr_references_tables(low, tables)
@@ -588,10 +587,7 @@ mod tests {
             ),
             Expr::and(
                 Expr::gt(Expr::column("orders", "amount", 1), Expr::literal(100i64)),
-                Expr::eq(
-                    Expr::column("orders", "status", 2),
-                    Expr::literal("active"),
-                ),
+                Expr::eq(Expr::column("orders", "status", 2), Expr::literal("active")),
             ),
         );
 

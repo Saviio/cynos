@@ -247,10 +247,11 @@ fn benchmark_live_query_create(size: usize) -> f64 {
 
     // Measure: dataflow construction + query initialization with initial data
     let start = Instant::now();
-    let dataflow = DataflowNode::filter(
-        DataflowNode::source(1),
-        |row| row.get(2).map(|v| matches!(v, Value::Int32(a) if *a > 30)).unwrap_or(false)
-    );
+    let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
+        row.get(2)
+            .map(|v| matches!(v, Value::Int32(a) if *a > 30))
+            .unwrap_or(false)
+    });
     let mut query = ObservableQuery::with_initial(dataflow, initial_rows);
 
     // Subscribe to ensure the query is fully set up
@@ -270,10 +271,11 @@ fn benchmark_live_query_with_filter(size: usize) -> f64 {
     }
 
     // Create dataflow with filter: age > 30
-    let dataflow = DataflowNode::filter(
-        DataflowNode::source(1),
-        |row| row.get(2).map(|v| matches!(v, Value::Int32(a) if *a > 30)).unwrap_or(false)
-    );
+    let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
+        row.get(2)
+            .map(|v| matches!(v, Value::Int32(a) if *a > 30))
+            .unwrap_or(false)
+    });
 
     // Initialize with filtered data
     let initial_rows: Vec<Row> = store
@@ -384,10 +386,11 @@ fn benchmark_live_query_delete_propagation(size: usize) -> f64 {
     }
 
     // Create dataflow with filter: age > 30
-    let dataflow = DataflowNode::filter(
-        DataflowNode::source(1),
-        |row| row.get(2).map(|v| matches!(v, Value::Int32(a) if *a > 30)).unwrap_or(false)
-    );
+    let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
+        row.get(2)
+            .map(|v| matches!(v, Value::Int32(a) if *a > 30))
+            .unwrap_or(false)
+    });
 
     // Initialize with filtered data
     let initial_rows: Vec<Row> = store
@@ -438,10 +441,11 @@ fn benchmark_live_query_batch_propagation(size: usize, batch_size: usize) -> f64
     }
 
     // Create dataflow with filter: age > 30
-    let dataflow = DataflowNode::filter(
-        DataflowNode::source(1),
-        |row| row.get(2).map(|v| matches!(v, Value::Int32(a) if *a > 30)).unwrap_or(false)
-    );
+    let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
+        row.get(2)
+            .map(|v| matches!(v, Value::Int32(a) if *a > 30))
+            .unwrap_or(false)
+    });
 
     // Initialize with filtered data
     let initial_rows: Vec<Row> = store
@@ -506,10 +510,11 @@ fn benchmark_live_query_chained_operators(size: usize) -> f64 {
 
     // Create dataflow: filter(age > 30) -> project(id, name, salary)
     let dataflow = DataflowNode::project(
-        DataflowNode::filter(
-            DataflowNode::source(1),
-            |row| row.get(2).map(|v| matches!(v, Value::Int32(a) if *a > 30)).unwrap_or(false)
-        ),
+        DataflowNode::filter(DataflowNode::source(1), |row| {
+            row.get(2)
+                .map(|v| matches!(v, Value::Int32(a) if *a > 30))
+                .unwrap_or(false)
+        }),
         vec![0, 1, 4], // id, name, salary
     );
 
@@ -522,11 +527,14 @@ fn benchmark_live_query_chained_operators(size: usize) -> f64 {
                 .unwrap_or(false)
         })
         .map(|row| {
-            Row::new(row.id(), vec![
-                row.get(0).cloned().unwrap_or(Value::Null),
-                row.get(1).cloned().unwrap_or(Value::Null),
-                row.get(4).cloned().unwrap_or(Value::Null),
-            ])
+            Row::new(
+                row.id(),
+                vec![
+                    row.get(0).cloned().unwrap_or(Value::Null),
+                    row.get(1).cloned().unwrap_or(Value::Null),
+                    row.get(4).cloned().unwrap_or(Value::Null),
+                ],
+            )
         })
         .collect();
 
@@ -578,10 +586,11 @@ fn benchmark_live_query_filtered_out(size: usize) -> f64 {
     }
 
     // Create dataflow with filter: age > 30
-    let dataflow = DataflowNode::filter(
-        DataflowNode::source(1),
-        |row| row.get(2).map(|v| matches!(v, Value::Int32(a) if *a > 30)).unwrap_or(false)
-    );
+    let dataflow = DataflowNode::filter(DataflowNode::source(1), |row| {
+        row.get(2)
+            .map(|v| matches!(v, Value::Int32(a) if *a > 30))
+            .unwrap_or(false)
+    });
 
     // Initialize with filtered data
     let initial_rows: Vec<Row> = store
@@ -722,10 +731,7 @@ fn main() {
     println!("Live Query (create with filter dataflow):");
     for &size in &sizes {
         let duration = benchmark_live_query_create(size);
-        println!(
-            "  {:>5} rows: {:>8.3}ms",
-            size, duration
-        );
+        println!("  {:>5} rows: {:>8.3}ms", size, duration);
     }
     println!();
 
@@ -752,10 +758,7 @@ fn main() {
     println!("Live Query (single delete through filter):");
     for &size in &sizes {
         let duration = benchmark_live_query_delete_propagation(size);
-        println!(
-            "  {:>5} rows: {:>8.3}ms (single delete)",
-            size, duration
-        );
+        println!("  {:>5} rows: {:>8.3}ms (single delete)", size, duration);
     }
     println!();
 
@@ -765,7 +768,10 @@ fn main() {
             let duration = benchmark_live_query_batch_propagation(size, batch_size);
             println!(
                 "  {:>5} rows, batch {:>3}: {:>8.3}ms ({:>8.1}μs/row)",
-                size, batch_size, duration, duration * 1000.0 / batch_size as f64
+                size,
+                batch_size,
+                duration,
+                duration * 1000.0 / batch_size as f64
             );
         }
     }
@@ -774,10 +780,7 @@ fn main() {
     println!("Live Query (chained operators: filter -> project):");
     for &size in &sizes {
         let duration = benchmark_live_query_chained_operators(size);
-        println!(
-            "  {:>5} rows: {:>8.3}ms (single insert)",
-            size, duration
-        );
+        println!("  {:>5} rows: {:>8.3}ms (single insert)", size, duration);
     }
     println!();
 

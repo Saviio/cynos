@@ -4,8 +4,8 @@ use crate::executor::{Relation, RelationEntry, SharedTables};
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use cynos_core::{Row, Value};
 use core::hash::{Hash, Hasher};
+use cynos_core::{Row, Value};
 use hashbrown::HashMap;
 
 /// A wrapper around Value reference that implements Hash and Eq for use as HashMap key.
@@ -68,11 +68,29 @@ impl HashJoin {
         // Determine which relation to use for build vs probe
         // For outer join, we must use right for build (to preserve all left rows)
         let (build_rel, probe_rel, build_key_idx, probe_key_idx, swap) = if self.is_outer_join {
-            (&right, &left, self.right_key_index, self.left_key_index, true)
+            (
+                &right,
+                &left,
+                self.right_key_index,
+                self.left_key_index,
+                true,
+            )
         } else if left.len() <= right.len() {
-            (&left, &right, self.left_key_index, self.right_key_index, false)
+            (
+                &left,
+                &right,
+                self.left_key_index,
+                self.right_key_index,
+                false,
+            )
         } else {
-            (&right, &left, self.right_key_index, self.left_key_index, true)
+            (
+                &right,
+                &left,
+                self.right_key_index,
+                self.left_key_index,
+                true,
+            )
         };
 
         // Build phase: create hash table mapping key values to entry indices
@@ -91,16 +109,8 @@ impl HashJoin {
         }
 
         // Probe phase
-        let build_col_count = build_rel
-            .entries
-            .first()
-            .map(|e| e.row.len())
-            .unwrap_or(0);
-        let probe_col_count = probe_rel
-            .entries
-            .first()
-            .map(|e| e.row.len())
-            .unwrap_or(0);
+        let build_col_count = build_rel.entries.first().map(|e| e.row.len()).unwrap_or(0);
+        let probe_col_count = probe_rel.entries.first().map(|e| e.row.len()).unwrap_or(0);
         let total_col_count = if swap {
             probe_col_count + build_col_count
         } else {
@@ -144,11 +154,17 @@ impl HashJoin {
                             let combined_version = if swap {
                                 values.extend(probe_entry.row.values().iter().cloned());
                                 values.extend(build_entry.row.values().iter().cloned());
-                                probe_entry.row.version().wrapping_add(build_entry.row.version())
+                                probe_entry
+                                    .row
+                                    .version()
+                                    .wrapping_add(build_entry.row.version())
                             } else {
                                 values.extend(build_entry.row.values().iter().cloned());
                                 values.extend(probe_entry.row.values().iter().cloned());
-                                build_entry.row.version().wrapping_add(probe_entry.row.version())
+                                build_entry
+                                    .row
+                                    .version()
+                                    .wrapping_add(probe_entry.row.version())
                             };
 
                             result_entries.push(RelationEntry::new_combined(
@@ -233,8 +249,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cynos_core::Row;
     use alloc::vec;
+    use cynos_core::Row;
 
     #[test]
     fn test_hash_join_inner() {
@@ -286,13 +302,7 @@ mod tests {
         let left = vec![(1, "A"), (2, "B"), (3, "C")];
         let right = vec![(1, "X"), (2, "Y"), (4, "Z")];
 
-        let result = hash_join(
-            &left,
-            &right,
-            |l| l.0,
-            |r| r.0,
-            |l, r| (l.1, r.1),
-        );
+        let result = hash_join(&left, &right, |l| l.0, |r| r.0, |l, r| (l.1, r.1));
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&("A", "X")));

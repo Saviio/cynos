@@ -8,4 +8,3 @@ pub use predicate::{
     CombinedPredicate, EvalType, JoinPredicate, JoinType, LogicalOp, Predicate, PredicateClone,
     ValuePredicate,
 };
-

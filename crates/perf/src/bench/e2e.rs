@@ -177,7 +177,13 @@ fn query_workflow(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("E2E", "query_workflow", Some(size), result, Some(throughput));
+        report.add_result(
+            "E2E",
+            "query_workflow",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -235,7 +241,13 @@ fn live_query_workflow(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("E2E", "live_query_workflow", Some(size), result, Some(throughput));
+        report.add_result(
+            "E2E",
+            "live_query_workflow",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -324,6 +336,12 @@ fn optimized_query(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("E2E", "optimized_query", Some(size), result, Some(throughput));
+        report.add_result(
+            "E2E",
+            "optimized_query",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }

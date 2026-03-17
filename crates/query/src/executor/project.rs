@@ -30,13 +30,20 @@ impl ProjectExecutor {
                     .iter()
                     .map(|&idx| entry.get_field(idx).cloned().unwrap_or(Value::Null))
                     .collect();
-                RelationEntry::new_combined(Rc::new(Row::new(entry.id(), values)), shared_tables.clone())
+                RelationEntry::new_combined(
+                    Rc::new(Row::new(entry.id(), values)),
+                    shared_tables.clone(),
+                )
             })
             .collect();
 
         // After projection, we have a single combined result with projected columns
         let table_column_counts = vec![self.column_indices.len()];
-        Relation { entries, tables, table_column_counts }
+        Relation {
+            entries,
+            tables,
+            table_column_counts,
+        }
     }
 }
 
@@ -52,7 +59,10 @@ where
         .into_iter()
         .map(|entry| {
             let values = transform(&entry);
-            RelationEntry::new_combined(Rc::new(Row::new(entry.id(), values)), shared_tables.clone())
+            RelationEntry::new_combined(
+                Rc::new(Row::new(entry.id(), values)),
+                shared_tables.clone(),
+            )
         })
         .collect();
 
@@ -62,20 +72,38 @@ where
     } else {
         vec![entries[0].row.len()]
     };
-    Relation { entries, tables, table_column_counts }
+    Relation {
+        entries,
+        tables,
+        table_column_counts,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cynos_core::Row;
     use alloc::vec;
+    use cynos_core::Row;
 
     #[test]
     fn test_project_executor() {
         let rows = vec![
-            Rc::new(Row::new(1, vec![Value::Int64(1), Value::String("Alice".into()), Value::Int64(25)])),
-            Rc::new(Row::new(2, vec![Value::Int64(2), Value::String("Bob".into()), Value::Int64(30)])),
+            Rc::new(Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    Value::String("Alice".into()),
+                    Value::Int64(25),
+                ],
+            )),
+            Rc::new(Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    Value::String("Bob".into()),
+                    Value::Int64(30),
+                ],
+            )),
         ];
         let input = Relation::from_rows(rows, vec!["users".into()]);
 
@@ -92,7 +120,10 @@ mod tests {
 
     #[test]
     fn test_project_relation_transform() {
-        let rows = vec![Rc::new(Row::new(1, vec![Value::Int64(10), Value::Int64(20)]))];
+        let rows = vec![Rc::new(Row::new(
+            1,
+            vec![Value::Int64(10), Value::Int64(20)],
+        ))];
         let input = Relation::from_rows(rows, vec!["t".into()]);
 
         let result = project_relation(input, |entry| {

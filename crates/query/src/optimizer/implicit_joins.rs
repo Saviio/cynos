@@ -128,12 +128,7 @@ impl ImplicitJoinsPass {
 
     /// Checks if the predicate is a join predicate that references both sides
     /// of the cross product.
-    fn is_join_predicate(
-        &self,
-        predicate: &Expr,
-        left: &LogicalPlan,
-        right: &LogicalPlan,
-    ) -> bool {
+    fn is_join_predicate(&self, predicate: &Expr, left: &LogicalPlan, right: &LogicalPlan) -> bool {
         let left_tables = self.collect_tables(left);
         let right_tables = self.collect_tables(right);
         let predicate_tables = self.collect_predicate_tables(predicate);
@@ -163,9 +158,7 @@ impl ImplicitJoinsPass {
             | LogicalPlan::IndexGet { table, .. }
             | LogicalPlan::IndexInGet { table, .. }
             | LogicalPlan::GinIndexScan { table, .. }
-            | LogicalPlan::GinIndexScanMulti { table, .. } => {
-                tables.push(table.clone())
-            }
+            | LogicalPlan::GinIndexScanMulti { table, .. } => tables.push(table.clone()),
             LogicalPlan::Filter { input, .. }
             | LogicalPlan::Project { input, .. }
             | LogicalPlan::Aggregate { input, .. }

@@ -51,14 +51,20 @@ impl IndexScanExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cynos_core::Value;
     use alloc::vec;
+    use cynos_core::Value;
 
     #[test]
     fn test_table_scan() {
         let rows = vec![
-            Rc::new(Row::new(1, vec![Value::Int64(1), Value::String("Alice".into())])),
-            Rc::new(Row::new(2, vec![Value::Int64(2), Value::String("Bob".into())])),
+            Rc::new(Row::new(
+                1,
+                vec![Value::Int64(1), Value::String("Alice".into())],
+            )),
+            Rc::new(Row::new(
+                2,
+                vec![Value::Int64(2), Value::String("Bob".into())],
+            )),
         ];
         let executor = TableScanExecutor::new("users", rows);
         let result = executor.execute();

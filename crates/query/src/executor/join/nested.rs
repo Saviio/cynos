@@ -67,26 +67,24 @@ impl NestedLoopJoin {
     }
 
     /// Executes the nested loop join with a custom predicate.
-    pub fn execute_with_predicate<F>(&self, left: Relation, right: Relation, predicate: F) -> Relation
+    pub fn execute_with_predicate<F>(
+        &self,
+        left: Relation,
+        right: Relation,
+        predicate: F,
+    ) -> Relation
     where
         F: Fn(&Value, &Value) -> bool,
     {
         let mut result_entries = Vec::new();
         let left_tables = left.tables().to_vec();
         let right_tables = right.tables().to_vec();
-        let left_col_count = left
-            .entries
-            .first()
-            .map(|e| e.row.len())
-            .unwrap_or(0);
-        let right_col_count = right
-            .entries
-            .first()
-            .map(|e| e.row.len())
-            .unwrap_or(0);
+        let left_col_count = left.entries.first().map(|e| e.row.len()).unwrap_or(0);
+        let right_col_count = right.entries.first().map(|e| e.row.len()).unwrap_or(0);
 
         // Track which right rows have been matched (for RIGHT/FULL OUTER)
-        let track_right_matches = matches!(self.join_type, JoinType::RightOuter | JoinType::FullOuter);
+        let track_right_matches =
+            matches!(self.join_type, JoinType::RightOuter | JoinType::FullOuter);
         let mut right_matched = if track_right_matches {
             vec![false; right.entries.len()]
         } else {
@@ -98,7 +96,8 @@ impl NestedLoopJoin {
         let right_entries: Vec<_> = right.entries.iter().enumerate().collect();
         let block_count = (right_entries.len() + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-        let emit_unmatched_left = matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter);
+        let emit_unmatched_left =
+            matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter);
 
         for left_entry in left.iter() {
             let mut match_found = false;
@@ -213,8 +212,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cynos_core::Row;
     use alloc::vec;
+    use cynos_core::Row;
 
     #[test]
     fn test_nested_loop_join_inner() {
@@ -269,9 +268,7 @@ mod tests {
             Row::new(1, vec![Value::Int64(2)]),
             Row::new(2, vec![Value::Int64(3)]),
         ];
-        let right_rows = vec![
-            Row::new(10, vec![Value::Int64(1)]),
-        ];
+        let right_rows = vec![Row::new(10, vec![Value::Int64(1)])];
 
         let left = Relation::from_rows_owned(left_rows, vec!["left".into()]);
         let right = Relation::from_rows_owned(right_rows, vec!["right".into()]);
@@ -288,12 +285,7 @@ mod tests {
         let left = vec![(1, "A"), (2, "B"), (3, "C")];
         let right = vec![(1, "X"), (2, "Y"), (4, "Z")];
 
-        let result = nested_loop_join(
-            &left,
-            &right,
-            |l, r| l.0 == r.0,
-            |l, r| (l.1, r.1),
-        );
+        let result = nested_loop_join(&left, &right, |l, r| l.0 == r.0, |l, r| (l.1, r.1));
 
         assert_eq!(result.len(), 2);
         assert!(result.contains(&("A", "X")));
@@ -348,15 +340,17 @@ mod tests {
 
         // Should have 2 rows: (1,1) matched + (NULL,3) unmatched right
         assert_eq!(
-            result.len(), 2,
+            result.len(),
+            2,
             "Bug 5: RIGHT OUTER JOIN should return unmatched right rows. Expected 2 rows, got {}",
             result.len()
         );
 
         // Verify the unmatched right row has NULL for left columns
-        let has_null_left = result.entries.iter().any(|e| {
-            e.get_field(0).map(|v| v.is_null()).unwrap_or(false)
-        });
+        let has_null_left = result
+            .entries
+            .iter()
+            .any(|e| e.get_field(0).map(|v| v.is_null()).unwrap_or(false));
         assert!(
             has_null_left,
             "Bug 5: RIGHT OUTER JOIN should have NULL for unmatched left columns"

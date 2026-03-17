@@ -326,18 +326,30 @@ impl Relation {
             .into_iter()
             .map(|row| RelationEntry::new_shared(row, shared_tables.clone()))
             .collect();
-        Self { entries, tables, table_column_counts }
+        Self {
+            entries,
+            tables,
+            table_column_counts,
+        }
     }
 
     /// Creates a relation from Rc<Row>s with explicit column count.
-    pub fn from_rows_with_column_count(rows: Vec<Rc<Row>>, tables: Vec<String>, column_count: usize) -> Self {
+    pub fn from_rows_with_column_count(
+        rows: Vec<Rc<Row>>,
+        tables: Vec<String>,
+        column_count: usize,
+    ) -> Self {
         let shared_tables: SharedTables = Arc::from(tables.as_slice());
         let table_column_counts = alloc::vec![column_count];
         let entries = rows
             .into_iter()
             .map(|row| RelationEntry::new_shared(row, shared_tables.clone()))
             .collect();
-        Self { entries, tables, table_column_counts }
+        Self {
+            entries,
+            tables,
+            table_column_counts,
+        }
     }
 
     /// Creates a relation from owned Rows.
@@ -359,12 +371,24 @@ impl Relation {
                 tables: TablesStorage::Shared(shared_tables.clone()),
             })
             .collect();
-        Self { entries, tables, table_column_counts }
+        Self {
+            entries,
+            tables,
+            table_column_counts,
+        }
     }
 
     /// Creates a relation from existing entries with metadata.
-    pub fn from_entries(entries: Vec<RelationEntry>, tables: Vec<String>, table_column_counts: Vec<usize>) -> Self {
-        Self { entries, tables, table_column_counts }
+    pub fn from_entries(
+        entries: Vec<RelationEntry>,
+        tables: Vec<String>,
+        table_column_counts: Vec<usize>,
+    ) -> Self {
+        Self {
+            entries,
+            tables,
+            table_column_counts,
+        }
     }
 
     /// Returns the tables in this relation.
@@ -427,7 +451,10 @@ mod tests {
 
     #[test]
     fn test_relation_entry() {
-        let row = Rc::new(Row::new(1, vec![Value::Int64(42), Value::String("test".into())]));
+        let row = Rc::new(Row::new(
+            1,
+            vec![Value::Int64(42), Value::String("test".into())],
+        ));
         let entry = RelationEntry::from_row(row, "users");
 
         assert_eq!(entry.id(), 1);
@@ -444,12 +471,8 @@ mod tests {
         let left_entry = RelationEntry::from_row(left_row, "a");
         let right_entry = RelationEntry::from_row(right_row, "b");
 
-        let combined = RelationEntry::combine(
-            &left_entry,
-            &["a".into()],
-            &right_entry,
-            &["b".into()],
-        );
+        let combined =
+            RelationEntry::combine(&left_entry, &["a".into()], &right_entry, &["b".into()]);
 
         assert!(combined.is_combined);
         assert_eq!(combined.tables(), &["a", "b"]);

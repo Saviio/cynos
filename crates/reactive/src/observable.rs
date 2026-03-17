@@ -75,7 +75,8 @@ impl ObservableQuery {
         left_key_fn: impl Fn(&Row) -> Vec<Value>,
         right_key_fn: impl Fn(&Row) -> Vec<Value>,
     ) {
-        self.view.initialize_join_state(left_rows, right_rows, left_key_fn, right_key_fn);
+        self.view
+            .initialize_join_state(left_rows, right_rows, left_key_fn, right_key_fn);
     }
 
     /// Returns the current result as a Vec.
@@ -251,8 +252,8 @@ mod tests {
     use super::*;
     use alloc::rc::Rc;
     use alloc::vec;
-    use cynos_core::Value;
     use core::cell::RefCell;
+    use cynos_core::Value;
 
     fn make_row(id: u64, age: i64) -> Row {
         Row::new(id, vec![Value::Int64(id as i64), Value::Int64(age)])
@@ -314,7 +315,10 @@ mod tests {
             changes_clone.borrow_mut().push(changes.clone());
         });
 
-        let deltas = vec![Delta::insert(make_row(1, 25)), Delta::insert(make_row(2, 30))];
+        let deltas = vec![
+            Delta::insert(make_row(1, 25)),
+            Delta::insert(make_row(2, 30)),
+        ];
 
         query.on_table_change(1, deltas);
 

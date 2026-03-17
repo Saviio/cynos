@@ -56,7 +56,13 @@ fn filter(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Query/Executor", "filter", Some(size), result, Some(throughput));
+        report.add_result(
+            "Query/Executor",
+            "filter",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -81,7 +87,13 @@ fn sort(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Query/Executor", "sort", Some(size), result, Some(throughput));
+        report.add_result(
+            "Query/Executor",
+            "sort",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -106,7 +118,13 @@ fn project(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Query/Executor", "project", Some(size), result, Some(throughput));
+        report.add_result(
+            "Query/Executor",
+            "project",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -131,7 +149,13 @@ fn limit(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Query/Executor", "limit", Some(size), result, Some(throughput));
+        report.add_result(
+            "Query/Executor",
+            "limit",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }
 
@@ -172,6 +196,12 @@ fn combined_query(report: &mut Report) {
             format_duration(result.mean),
             format_throughput(throughput)
         );
-        report.add_result("Query/Executor", "combined", Some(size), result, Some(throughput));
+        report.add_result(
+            "Query/Executor",
+            "combined",
+            Some(size),
+            result,
+            Some(throughput),
+        );
     }
 }

@@ -124,7 +124,11 @@ impl<K: Clone + Ord, I: Index<K>> Index<K> for NullableIndex<K, I> {
         // Check how many were actually removed
         let new_count = self.inner.get(key).len();
         let removed = if value.is_some() {
-            if new_count < old_count { 1 } else { 0 }
+            if new_count < old_count {
+                1
+            } else {
+                0
+            }
         } else {
             old_count
         };
