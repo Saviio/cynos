@@ -235,8 +235,8 @@ These are the typical asymptotics for the current implementation, not hard real-
 | Standalone hash-index lookup | Average `O(1)` | Implemented in `cynos-index`, but not the default secondary-index path in `RowStore` today |
 | GIN-style key lookup | Proportional to extracted keys + posting-list work | Best thought of as inverted-index style rather than a plain `O(1)` hash lookup |
 | `observe()` / `changes()` | Re-executes the query and materializes the current result | Cost scales with the full query path, not just the delta |
-| `trace()` | `O(|Δoutput|)` delivery after incremental compilation | Only for plans that can be lowered to incremental dataflow |
-| Incremental `COUNT` / `SUM` / `AVG` | `O(|Δinput|)` over affected groups | Maintains running aggregate state |
+| `trace()` | `O(Δoutput)` delivery after incremental compilation | Only for plans that can be lowered to incremental dataflow |
+| Incremental `COUNT` / `SUM` / `AVG` | `O(Δinput)` over affected groups | Maintains running aggregate state |
 | Incremental `MIN` / `MAX` | `O(log group_size)` per delta | Implemented with ordered multisets in `cynos-incremental` |
 
 ## Binary Results
