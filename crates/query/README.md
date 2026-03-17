@@ -1,45 +1,77 @@
 # cynos-query
 
-Query engine for Cynos in-memory database.
+AST, planner, optimizer passes, physical plans, and executors for Cynos queries.
 
 ## Overview
 
-This crate provides the query execution engine including:
+`cynos-query` does not own storage by itself. Instead, it defines the query language and the execution machinery that runs against a `DataSource` implementation.
 
-- `ast`: Expression and predicate AST definitions
-- `planner`: Logical and physical query plans
-- `optimizer`: Query optimization passes
-- `executor`: Query execution operators
-- `context`: Execution context
-- `plan_cache`: Query plan caching for repeated queries
+Main modules:
 
-## Features
+- `ast`: expression trees, predicates, aggregates, and join types.
+- `planner`: logical plans, physical plans, plan properties, and the `QueryPlanner` pipeline.
+- `optimizer`: logical and physical optimization passes.
+- `executor`: relational executors and the `PhysicalPlanRunner`.
+- `context`: table statistics and index metadata used by context-aware planning.
+- `plan_cache`: fingerprints and a simple LRU-style cache for compiled plans.
 
-- `#![no_std]` compatible
-- Cost-based query optimization
-- Multiple join algorithms (hash join, merge join, nested loop)
-- Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
-- Sort and limit operations
-- Plan caching for repeated queries
+## Planning Model
 
-## Query Operators
+The planner is rule/heuristic-based rather than a full cost-based optimizer.
 
-| Operator | Description |
-|----------|-------------|
-| Scan | Full table scan or index scan |
-| Filter | Row filtering with predicates |
-| Project | Column projection |
-| Join | Hash/Merge/Nested loop joins |
-| Aggregate | Group by with aggregations |
-| Sort | ORDER BY implementation |
-| Limit | LIMIT/OFFSET implementation |
+Default pipeline in `QueryPlanner`:
 
-## Optimization Passes
+1. Logical rewrites: `NotSimplification`, `AndPredicatePass`, `CrossProductPass`, `ImplicitJoinsPass`, `OuterJoinSimplification`, `PredicatePushdown`, `JoinReorder`.
+2. Context-aware logical optimization: `IndexSelection`.
+3. Logical -> physical conversion.
+4. Physical rewrites: `TopNPushdown`, `OrderByIndexPass`, `LimitSkipByIndexPass`.
 
-- Predicate pushdown
-- Join reordering
-- Index selection
-- Projection pruning
+## Execution Notes
+
+- The executor supports filter, projection, aggregation, sort, limit/offset, cross product, and multiple join operators.
+- The execution layer includes hash join, sort-merge join, and nested-loop join implementations.
+- The default planner currently chooses hash join for equi-joins and nested-loop join otherwise.
+- `PhysicalPlan::is_incrementalizable()` is used by the WASM layer to decide whether a plan can be lowered into incremental dataflow.
+
+## Example
+
+```rust
+use cynos_query::ast::Expr;
+use cynos_query::context::{ExecutionContext, IndexInfo, TableStats};
+use cynos_query::planner::{LogicalPlan, QueryPlanner};
+
+let plan = LogicalPlan::project(
+    LogicalPlan::filter(
+        LogicalPlan::scan("users"),
+        Expr::gt(
+            Expr::column("users", "age", 1),
+            Expr::literal(18_i64),
+        ),
+    ),
+    vec![Expr::column("users", "name", 0)],
+);
+
+let mut ctx = ExecutionContext::new();
+ctx.register_table(
+    "users",
+    TableStats {
+        row_count: 10_000,
+        is_sorted: false,
+        indexes: vec![IndexInfo::new("idx_age", vec!["age".into()], false)],
+    },
+);
+
+let planner = QueryPlanner::new(ctx);
+let physical = planner.plan(plan);
+
+assert!(physical.is_incrementalizable());
+```
+
+## Related Crates
+
+- `cynos-storage` provides the table data and index access used by the runner.
+- `cynos-database` adapts this crate to the WASM/JS API and wires in plan caching.
+- `cynos-incremental` reuses physical-plan structure for the incremental path.
 
 ## License
 

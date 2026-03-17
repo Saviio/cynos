@@ -1,55 +1,65 @@
 # cynos-jsonb
 
-JSONB data type implementation for Cynos database.
+JSONB value model, binary codec, JSONPath subset, and JSONB operators for Cynos.
 
 ## Overview
 
-This crate provides a complete JSONB implementation including:
+This crate provides the structured JSONB pieces used by storage, query planning, and indexing:
 
-- `JsonbValue`: The core JSON value type with sorted object keys
-- `JsonbBinary`: Binary encoding/decoding for efficient storage
-- `JsonPath`: JSONPath query language support
-- `JsonbOp`: PostgreSQL-compatible JSONB operators
-- GIN index support for efficient querying
+- `JsonbValue` / `JsonbObject`: owned JSONB value types with sorted object keys.
+- `JsonbBinary`: compact binary encode/decode support.
+- `JsonPath`: parser for a practical JSONPath subset.
+- `JsonbOp`: JSONB-style operators such as field access, containment, and key existence.
+- Extraction helpers (`extract_keys`, `extract_key_values`, `extract_paths`, `extract_scalars`) used for GIN indexing.
 
-## Features
+## What This Crate Does Not Do
 
-- `#![no_std]` compatible
-- Compact binary encoding for storage efficiency
-- Full JSONPath query support
-- PostgreSQL-compatible operators (@>, <@, ?, ?|, ?&)
+- It does not expose a full generic JSON text parser like `serde_json`.
+- In practice you build values programmatically, decode them from `JsonbBinary`, or receive them through higher-level database APIs.
 
-## Usage
+## Supported JSONPath Syntax
+
+- `$` root
+- `.field` or `['field']`
+- `[index]`
+- `[start:end]`
+- `[*]` and `.*`
+- `..field`
+- `[?(@.field <op> value)]`
+
+## Example
 
 ```rust
-use cynos_jsonb::{JsonbValue, JsonbObject, JsonPath, JsonbBinary};
+use cynos_jsonb::{JsonPath, JsonbBinary, JsonbObject, JsonbOp, JsonbValue};
 
-// Create a JSON object
-let mut obj = JsonbObject::new();
-obj.insert("name".into(), JsonbValue::String("Alice".into()));
-obj.insert("age".into(), JsonbValue::Number(25.0));
+fn main() -> Result<(), cynos_jsonb::ParseError> {
+    let mut obj = JsonbObject::new();
+    obj.insert("name".into(), JsonbValue::String("Alice".into()));
+    obj.insert("age".into(), JsonbValue::Number(25.0));
 
-let json = JsonbValue::Object(obj);
+    let json = JsonbValue::Object(obj.clone());
 
-// Query with JSONPath
-let path = JsonPath::parse("$.name").unwrap();
-let results = json.query(&path);
-assert_eq!(results[0], &JsonbValue::String("Alice".into()));
+    let path = JsonPath::parse("$.name")?;
+    let matches = json.query(&path);
+    assert_eq!(matches[0], &JsonbValue::String("Alice".into()));
 
-// Binary encoding
-let binary = JsonbBinary::encode(&json);
-let decoded = binary.decode();
-assert_eq!(json, decoded);
+    let encoded = JsonbBinary::encode(&json);
+    let decoded = encoded.decode();
+    assert_eq!(decoded, JsonbValue::Object(obj));
+
+    assert_eq!(
+        json.apply_op(&JsonbOp::HasKey("name".into())),
+        Some(JsonbValue::Bool(true)),
+    );
+    Ok(())
+}
 ```
 
-## JSONPath Support
+## Notes
 
-- `$` - Root element
-- `.key` - Object member access
-- `[n]` - Array index access
-- `[*]` - Wildcard array access
-- `..key` - Recursive descent
-- `[?(@.key > value)]` - Filter expressions
+- Objects keep keys sorted so lookup is efficient and deterministic.
+- `contains()` and related operators recurse structurally for objects and arrays.
+- The GIN helpers intentionally work on extracted tokens rather than the original textual JSON representation.
 
 ## License
 

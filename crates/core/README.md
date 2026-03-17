@@ -1,50 +1,64 @@
 # cynos-core
 
-Core types and schema definitions for Cynos database.
+Core types, row model, schema definitions, and shared error types for Cynos.
 
 ## Overview
 
-This crate provides the foundational types for the Cynos in-memory database:
+`cynos-core` is the foundation used by every other Rust crate in the workspace. It owns:
 
-- `DataType`: Supported data types (Boolean, Int32, Int64, Float64, String, DateTime, Bytes, Jsonb)
-- `Value`: Runtime values that can be stored in the database
-- `Row`: A row of values with a unique identifier
-- `schema`: Schema definitions (Column, Table, Index, Constraints)
-- `Error`: Error types for database operations
+- `DataType`: the logical types Cynos understands.
+- `Value`: the runtime cell value enum used across storage, query, and reactive layers.
+- `Row`: the row container, including row IDs and version tracking.
+- `schema`: columns, tables, indexes, constraints, and the `TableBuilder` API.
+- `Error` / `Result`: shared error surface for low-level operations.
 
-## Features
+## Design Notes
 
-- `#![no_std]` compatible - works in embedded and WASM environments
-- Zero external dependencies for minimal footprint
-- Type-safe schema definitions with builder pattern
+- `#![no_std]` + `alloc` friendly.
+- `Bytes` and `Jsonb` columns are nullable by default; scalar types are not.
+- `cynos_core::JsonbValue` is intentionally an opaque byte carrier for the generic `Value::Jsonb` variant. The parsed JSONB value model lives in `cynos-jsonb`.
+- `TableBuilder` validates identifiers, supports primary keys, unique constraints, secondary indexes, and foreign keys.
+- `TableBuilder::add_index()` automatically marks JSONB indexes as GIN at the schema layer.
+- Auto-increment is only valid on a single-column `Int32` or `Int64` primary key.
 
-## Usage
+## Example
 
 ```rust
-use cynos_core::{DataType, Value, Row};
-use cynos_core::schema::{TableBuilder, Column};
+use cynos_core::schema::TableBuilder;
+use cynos_core::{DataType, Row, Value};
 
-// Create a table schema
-let table = TableBuilder::new("users")
-    .unwrap()
-    .add_column("id", DataType::Int64)
-    .unwrap()
-    .add_column("name", DataType::String)
-    .unwrap()
-    .add_primary_key(&["id"], true)
-    .unwrap()
-    .build()
-    .unwrap();
+fn main() -> cynos_core::Result<()> {
+    let users = TableBuilder::new("users")?
+        .add_column("id", DataType::Int64)?
+        .add_column("name", DataType::String)?
+        .add_column("profile", DataType::Jsonb)?
+        .add_primary_key(&["id"], true)?
+        .add_index("idx_name", &["name"], false)?
+        .add_index("idx_profile", &["profile"], false)?
+        .build()?;
 
-// Create a row
-let row = Row::new(1, vec![
-    Value::Int64(1),
-    Value::String("Alice".into()),
-]);
+    let row = Row::new(
+        42,
+        vec![
+            Value::Int64(42),
+            Value::String("Alice".into()),
+            Value::Null,
+        ],
+    );
 
-assert_eq!(row.id(), 1);
-assert_eq!(row.get(1), Some(&Value::String("Alice".into())));
+    assert_eq!(users.columns().len(), 3);
+    assert_eq!(row.id(), 42);
+    assert_eq!(row.version(), 1);
+    Ok(())
+}
 ```
+
+`idx_profile` is represented as a GIN index definition because it targets a JSONB column.
+
+## Related Crates
+
+- Use `cynos-storage` to actually store rows described by these schemas.
+- Use `cynos-jsonb` when you need a structured JSONB value model instead of opaque bytes.
 
 ## License
 

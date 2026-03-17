@@ -1,80 +1,117 @@
 # cynos-database
 
-WASM API bindings and JavaScript API for Cynos database.
+WASM-facing database API that stitches together storage, query planning, reactive delivery, and binary encoding.
 
 ## Overview
 
-This crate provides the public API for the Cynos in-memory database, including WASM bindings for use in JavaScript/TypeScript applications.
+`cynos-database` is the host-facing crate in the Rust workspace. It exposes `wasm-bindgen` types such as:
 
-## Core Components
+- `Database`
+- `JsTableBuilder` / `JsTable`
+- `SelectBuilder`, `InsertBuilder`, `UpdateBuilder`, `DeleteBuilder`
+- `JsObservableQuery`, `JsChangesStream`, `JsIvmObservableQuery`
+- `BinaryResult` and `SchemaLayout`
 
-- `Database`: Main entry point for database operations
-- `TableBuilder`: Builder for creating table schemas
-- `SelectBuilder`: Query builder for SELECT statements with reactive query support
-- `InsertBuilder`, `UpdateBuilder`, `DeleteBuilder`: DML builders
-- `JsObservableQuery`: Re-query observable — re-executes cached physical plan on each change, O(result_set)
-- `JsIvmObservableQuery`: IVM observable — propagates DBSP deltas through dataflow, O(Δoutput)
-- `JsChangesStream`: Convenience wrapper over re-query with immediate initial emission
+The published JS package `@cynos/core` in `js/packages/core` is built on top of these WASM exports.
 
-## Features
+## Query Surface
 
-- Full WASM support for browser and Node.js
-- Type-safe query builder API
-- Reactive queries with subscription support
-- Binary protocol for efficient data transfer
+The select builder currently supports:
 
-## Usage (JavaScript)
+- Projection (`'*'`, single column, arrays, or variadic columns)
+- `where(...)`
+- `orderBy(...)`, `limit(...)`, `offset(...)`
+- `innerJoin(...)` and `leftJoin(...)`
+- `groupBy(...)`
+- Aggregates: `count`, `countCol`, `sum`, `avg`, `min`, `max`, `stddev`, `geomean`, `distinct`
+- `explain()`, `getSchemaLayout()`, and `execBinary()`
 
-```javascript
-import { Database, DataType, col } from '@cynos/core';
+## Reactive Modes
 
-const db = await Database.create('mydb');
+| API | Engine path | Callback payload | Typical delivery cost | Notes |
+| --- | --- | --- | --- | --- |
+| `observe()` | Re-query | Full current result set on change | Re-executes the query and rematerializes the current result | Call `getResult()` yourself for the initial state |
+| `changes()` | Re-query | Full current result set immediately and on later changes | Same as `observe()`, but with an eager initial emission | Good fit for UI state |
+| `trace()` | Incremental dataflow | `{ added, removed }` | Scales with delta propagation after the plan is compiled to dataflow | Fails for non-incrementalizable plans such as `ORDER BY` / `LIMIT` / `TopN` |
 
-db.createTable('users')
-  .column('id', DataType.Int64, { primaryKey: true })
-  .column('name', DataType.String)
-  .column('age', DataType.Int32)
-  .build();
+## JavaScript Example
+
+```ts
+import {
+  ColumnOptions,
+  JsDataType,
+  ResultSet,
+  col,
+  createDatabase,
+  initCynos,
+} from '@cynos/core';
+
+await initCynos();
+const db = createDatabase('demo');
+
+const users = db.createTable('users')
+  .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+  .column('name', JsDataType.String)
+  .column('age', JsDataType.Int32)
+  .index('idx_age', 'age');
+
+db.registerTable(users);
 
 await db.insert('users').values([
   { id: 1, name: 'Alice', age: 25 },
   { id: 2, name: 'Bob', age: 30 },
 ]).exec();
 
-const results = await db.select()
+const current = await db
+  .select('*')
   .from('users')
-  .where(col('age').gt(25))
+  .where(col('age').gt(18))
   .exec();
-```
 
-## Reactive Queries
+const stream = db.select('*').from('users').changes();
+const stop = stream.subscribe((rows) => {
+  console.log('current result', rows);
+});
 
-Two reactive query strategies with explicit API:
-
-```javascript
-// IVM path — O(Δoutput), delta-based via DBSP dataflow
-// Only supports incrementalizable operators (no ORDER BY / LIMIT)
-const ivm = db.select('*')
+const trace = db
+  .select('*')
   .from('users')
   .where(col('age').gt(18))
   .trace();
 
-ivm.subscribe((delta) => {
-  console.log('Added:', delta.added);   // only new rows
-  console.log('Removed:', delta.removed); // only removed rows
+const stopTrace = trace.subscribe((delta) => {
+  console.log(delta.added, delta.removed);
 });
 
-// Re-query path — O(result_set), re-executes full query on each change
-// Supports all operators including ORDER BY / LIMIT
-const requery = db.select('*')
-  .from('users')
-  .where(col('age').gt(18))
-  .orderBy('name')
-  .changes();
+const query = db.select('*').from('users');
+const layout = query.getSchemaLayout();
+const binary = await query.execBinary();
+const rs = new ResultSet(binary, layout);
+console.log(rs.toArray());
+rs.free();
+```
 
-requery.subscribe((rows) => {
-  console.log('Current result:', rows); // full result set
-});
+## Transactions
+
+`db.transaction()` returns a `JsTransaction` wrapper with `insert`, `update`, `delete`, `commit`, and `rollback` methods.
+
+Current behavior:
+
+- Transactions are journal-based and operate on in-memory state.
+- Commit/rollback integrate with the re-query notification path.
+- For direct delta-driven IVM notifications, the non-transactional CRUD builders (`insert` / `update` / `delete`) are the fully wired path today.
+
+## Build Notes
+
+```bash
+# Raw WASM build
+cd crates/database
+wasm-pack build --target web
+
+# Or build the JS package workspace that wraps this crate
+cd ../../js
+pnpm install
+pnpm build
 ```
 
 ## License

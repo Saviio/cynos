@@ -1,55 +1,67 @@
 # cynos-incremental
 
-Incremental View Maintenance (IVM) for Cynos database.
+Incremental dataflow and materialized views for Cynos.
 
 ## Overview
 
-This crate implements Incremental View Maintenance (IVM) based on DBSP (Database Stream Processing) theory. Instead of recomputing query results from scratch on every data change, it propagates only deltas through a dataflow graph — achieving O(|Δoutput|) complexity per update rather than O(|result_set|).
+`cynos-incremental` provides the DBSP-style dataflow layer used for incremental view maintenance (IVM). Instead of re-running a full query after every change, it propagates `Delta<T>` updates through a graph of incremental operators.
 
-## Core Concepts
+Core pieces:
 
-- `Delta<T>`: Represents a change to data (+1 for insert, -1 for delete)
-- `DiffCollection<T>`: A collection that tracks both snapshot and pending changes
-- `DataflowNode`: Composable nodes in a dataflow graph representing query operators (filter, map, join, aggregate)
-- `MaterializedView`: A cached query result that updates incrementally via delta propagation
+- `Delta<T>` / `DeltaBatch<T>`: insert/delete change representation.
+- `DataflowNode`: source, filter, project, map, join, and aggregate nodes.
+- `MaterializedView`: current result state plus operator-specific maintenance state.
+- `JoinState` / aggregate state types: internal structures that keep joins and aggregates incremental.
+- `DiffCollection` / `ConsolidatedCollection`: lightweight multiset-oriented helpers.
 
-## Incremental Operators
+## Supported Operators
 
-- `filter_incremental`: Filters deltas based on a predicate — O(|Δinput|)
-- `map_incremental`: Transforms deltas using a mapper function — O(|Δinput|)
-- `project_incremental`: Projects specific columns from row deltas — O(|Δinput|)
-- `IncrementalHashJoin`: Maintains join results incrementally with hash-indexed state — O(|Δinput| × |matching keys|)
-- `IncrementalCount/Sum/Avg`: Incremental aggregate functions — O(|Δinput|) per group
-- `IncrementalMin/Max`: Incremental min/max with fallback re-scan on current-extremum deletion
+- Filter, project, and map.
+- Inner, left outer, right outer, and full outer joins.
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, and `MAX`.
+- `MIN`/`MAX` use ordered multisets internally so deletes do not require a full rescan.
 
-## Features
+## Typical Update Costs
 
-- `#![no_std]` compatible
-- DBSP-based delta propagation through composable dataflow graphs
-- Support for complex query patterns (filter, map, join, aggregate)
-- Composable operators: `Filter → Join → Aggregate` pipelines work incrementally end-to-end
+`cynos-incremental` is useful precisely because different operators scale with the touched delta rather than the whole result:
 
-## Usage
+| Operator family | Typical cost | Notes |
+| --- | --- | --- |
+| Filter / map / project | `O(|Δinput|)` | Processes only changed rows |
+| Hash-based join state updates | Proportional to rows matched by the touched keys | Join fan-out dominates the actual cost |
+| `COUNT` / `SUM` / `AVG` | `O(|Δinput|)` over affected groups | Running aggregate state is updated in place |
+| `MIN` / `MAX` | `O(log group_size)` per delta | Backed by ordered `BTreeMap` multisets |
+| End-to-end incremental plan | Roughly `O(|Δoutput|)` delivery when every node is incremental | Only applies when the full plan can stay on the incremental path |
+
+## Example
 
 ```rust
-use cynos_incremental::{Delta, MaterializedView, DataflowNode};
 use cynos_core::{Row, Value};
+use cynos_incremental::{DataflowNode, Delta, MaterializedView};
 
-// Create a dataflow: Source -> Filter(age > 18)
 let dataflow = DataflowNode::filter(
     DataflowNode::source(1),
-    |row| row.get(1).and_then(|v| v.as_i64()).map(|age| age > 18).unwrap_or(false)
+    |row| row.get(1).and_then(|v| v.as_i64()).map(|age| age > 18).unwrap_or(false),
 );
 
 let mut view = MaterializedView::new(dataflow);
-
-// Insert a row that passes the filter
-let deltas = vec![Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(25)]))];
-let output = view.on_table_change(1, deltas);
+let output = view.on_table_change(
+    1,
+    vec![Delta::insert(Row::new(
+        1,
+        vec![Value::Int64(1), Value::Int64(25)],
+    ))],
+);
 
 assert_eq!(output.len(), 1);
 assert_eq!(view.len(), 1);
 ```
+
+## Notes
+
+- This crate is delta-oriented and intentionally lower level than the JS-facing reactive APIs.
+- `cynos-database` compiles incrementalizable physical plans into `DataflowNode` graphs via `dataflow_compiler`.
+- `cynos-reactive` wraps `MaterializedView` with subscriptions and change-set delivery.
 
 ## License
 

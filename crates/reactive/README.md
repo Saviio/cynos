@@ -1,53 +1,56 @@
 # cynos-reactive
 
-Reactive query system for Cynos database.
+Delta-oriented observable queries built on top of `cynos-incremental`.
 
 ## Overview
 
-This crate implements the reactive query layer that bridges `cynos-incremental` (DBSP dataflow) with subscriber notifications. It wraps `MaterializedView` into `ObservableQuery`, managing subscriptions and delivering `ChangeSet` deltas to callbacks.
+`cynos-reactive` wraps `MaterializedView` with subscriptions and change-set delivery. It is the incremental, delta-based reactive layer used by the WASM API's `trace()` mode.
 
-## Core Concepts
+Main types:
 
-- `ChangeSet`: Delta output from IVM — contains `added` and `removed` rows after a table change
-- `ObservableQuery`: Wraps a `MaterializedView`, manages subscriptions, and delivers `ChangeSet` to callbacks on each table change
-- `QueryRegistry`: Routes table-level DML events to dependent `ObservableQuery` instances; supports both IVM and re-query paths
+- `ObservableQuery`: owns a `MaterializedView` and a `SubscriptionManager`.
+- `ChangeSet`: carries `added`, `removed`, `modified`, and optional `current_result` data.
+- `Changes`: helper for explicit initial-state + incremental processing.
+- `QueryRegistry`: routes table-level deltas to registered `ObservableQuery` instances.
 
-## Key APIs
+## Important Scope Boundary
 
-- `ObservableQuery::subscribe(callback)`: Register a callback that receives `ChangeSet` on each delta propagation
-- `ObservableQuery::on_table_change(table_id, deltas)`: Feed deltas from DML into the dataflow, propagate, and notify subscribers
-- `ObservableQuery::result()`: Get the current materialized result set
+This crate is the delta-based path only.
 
-## Features
+- Re-query observables that re-execute a physical plan on every change are implemented in `cynos-database`.
+- `cynos-reactive::QueryRegistry` knows only about `ObservableQuery` values from this crate.
 
-- `#![no_std]` compatible
-- Efficient change propagation
-- Multiple subscription patterns (callback, iterator)
-
-## Usage
+## Example
 
 ```rust
-use cynos_reactive::{ObservableQuery, ChangeSet};
-use cynos_incremental::{DataflowNode, Delta};
 use cynos_core::{Row, Value};
+use cynos_incremental::{DataflowNode, Delta};
+use cynos_reactive::{ChangeSet, ObservableQuery};
 
-// Create an observable query with a filter dataflow
 let dataflow = DataflowNode::filter(
     DataflowNode::source(1),
-    |row| row.get(1).and_then(|v| v.as_i64()).map(|age| age > 18).unwrap_or(false)
+    |row| row.get(1).and_then(|v| v.as_i64()).map(|age| age > 18).unwrap_or(false),
 );
 
 let mut query = ObservableQuery::new(dataflow);
-
-// Subscribe to delta changes
-query.subscribe(|change_set: &ChangeSet| {
-    println!("Added: {}, Removed: {}", change_set.added.len(), change_set.removed.len());
+let _sub = query.subscribe(|changes: &ChangeSet| {
+    println!("added={}, removed={}", changes.added.len(), changes.removed.len());
 });
 
-// Feed a table change — delta propagates through dataflow, subscribers notified
-let deltas = vec![Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(25)]))];
-query.on_table_change(1, deltas);
+query.on_table_change(
+    1,
+    vec![Delta::insert(Row::new(
+        1,
+        vec![Value::Int64(1), Value::Int64(25)],
+    ))],
+);
 ```
+
+## Notes
+
+- `ObservableQuery::initialize()` can seed an initial result and notify subscribers.
+- `Changes::initial()` returns the initial result as additions; `Changes::process()` returns a `ChangeSet` that also includes `current_result`.
+- The callback path used by `ObservableQuery::on_table_change()` is optimized for delta delivery and does not populate `current_result` unless you compute it explicitly.
 
 ## License
 
