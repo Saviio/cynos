@@ -194,7 +194,7 @@ Practical guidance:
 
 ## Local Bench Snapshot
 
-To make the tradeoff less abstract, the workspace benchmark harness was run locally on this machine on 2026-03-17 with:
+To make this tradeoff less abstract, benchmarks were conducted natively at the Rust layer on a Mac mini M4, before cross-compilation to WASM. The absolute numbers will differ in WASM environments (browsers, runtimes), but the relative performance characteristics shown here reflect the underlying algorithmic tradeoffs.
 
 ```bash
 cargo run -p cynos-perf --release
