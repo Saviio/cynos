@@ -194,7 +194,7 @@ Practical guidance:
 
 ## Local Bench Snapshot
 
-To make the tradeoff less abstract, the workspace benchmark harness was run locally on this machine on 2026-03-17 with:
+To make this tradeoff less abstract, benchmarks were conducted natively at the Rust layer on a Mac mini M4, before cross-compilation to WASM. The absolute numbers will differ in WASM environments (browsers, runtimes), but the relative performance characteristics shown here reflect the underlying algorithmic tradeoffs.
 
 ```bash
 cargo run -p cynos-perf --release
@@ -235,8 +235,8 @@ These are the typical asymptotics for the current implementation, not hard real-
 | Standalone hash-index lookup | Average `O(1)` | Implemented in `cynos-index`, but not the default secondary-index path in `RowStore` today |
 | GIN-style key lookup | Proportional to extracted keys + posting-list work | Best thought of as inverted-index style rather than a plain `O(1)` hash lookup |
 | `observe()` / `changes()` | Re-executes the query and materializes the current result | Cost scales with the full query path, not just the delta |
-| `trace()` | `O(|Δoutput|)` delivery after incremental compilation | Only for plans that can be lowered to incremental dataflow |
-| Incremental `COUNT` / `SUM` / `AVG` | `O(|Δinput|)` over affected groups | Maintains running aggregate state |
+| `trace()` | `O(Δoutput)` delivery after incremental compilation | Only for plans that can be lowered to incremental dataflow |
+| Incremental `COUNT` / `SUM` / `AVG` | `O(Δinput)` over affected groups | Maintains running aggregate state |
 | Incremental `MIN` / `MAX` | `O(log group_size)` per delta | Implemented with ordered multisets in `cynos-incremental` |
 
 ## Binary Results
@@ -310,7 +310,7 @@ pnpm build
 
 ## Browser / Runtime Compatibility
 
-WASM is a first-class target for Cynos, so the root README should call out the runtime assumptions explicitly.
+Compilation to WASM and execution in browser-like environments are first-class features of cynos. To provide a complete picture, this section presents additional compatibility data.
 
 The current JS package and generated glue code rely on these platform features:
 
