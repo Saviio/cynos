@@ -1702,6 +1702,169 @@ describe('4. JOIN 操作', () => {
   });
 });
 
+describe('4.4 UNION', () => {
+  it('UNION 应该去重并支持跨表结果合并', async () => {
+    const db = new Database('union_query_1');
+
+    db.registerTable(
+      db.createTable('active_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+    db.registerTable(
+      db.createTable('archived_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+
+    await db.insert('active_users').values([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+    ]).exec();
+    await db.insert('archived_users').values([
+      { id: 2, name: 'Bob' },
+      { id: 3, name: 'Cara' },
+    ]).exec();
+
+    const result = await execAndVerifyBinary(
+      db.select('*')
+        .from('active_users')
+        .union(db.select('*').from('archived_users'))
+        .orderBy('id', JsSortOrder.Asc)
+    );
+
+    expect(result).toEqual([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+      { id: 3, name: 'Cara' },
+    ]);
+  });
+
+  it('UNION ALL 应该保留重复行', async () => {
+    const db = new Database('union_query_2');
+
+    db.registerTable(
+      db.createTable('active_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+    db.registerTable(
+      db.createTable('archived_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+
+    await db.insert('active_users').values([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+    ]).exec();
+    await db.insert('archived_users').values([
+      { id: 2, name: 'Bob' },
+      { id: 3, name: 'Cara' },
+    ]).exec();
+
+    const result = await execAndVerifyBinary(
+      db.select('*')
+        .from('active_users')
+        .unionAll(db.select('*').from('archived_users'))
+        .orderBy('id', JsSortOrder.Asc)
+    );
+
+    expect(result).toEqual([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+      { id: 2, name: 'Bob' },
+      { id: 3, name: 'Cara' },
+    ]);
+  });
+
+  it('UNION observe() 应该响应两侧表的变化', async () => {
+    const db = new Database('union_query_3');
+
+    db.registerTable(
+      db.createTable('active_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+    db.registerTable(
+      db.createTable('archived_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+
+    await db.insert('active_users').values([
+      { id: 1, name: 'Alice' },
+    ]).exec();
+    await db.insert('archived_users').values([
+      { id: 2, name: 'Bob' },
+    ]).exec();
+
+    const query = db.select('*')
+      .from('active_users')
+      .unionAll(db.select('*').from('archived_users'))
+      .orderBy('id', JsSortOrder.Asc);
+    const observable = query.observe();
+
+    expect(observable.getResult()).toEqual([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+    ]);
+
+    let lastResult: any[] = observable.getResult();
+    const unsubscribe = observable.subscribe((rows: any[]) => {
+      lastResult = rows;
+    });
+
+    await db.insert('archived_users').values([
+      { id: 3, name: 'Cara' },
+    ]).exec();
+    await tick();
+
+    expect(lastResult).toEqual([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+      { id: 3, name: 'Cara' },
+    ]);
+
+    await db.insert('active_users').values([
+      { id: 4, name: 'Dora' },
+    ]).exec();
+    await tick();
+
+    expect(lastResult).toEqual([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+      { id: 3, name: 'Cara' },
+      { id: 4, name: 'Dora' },
+    ]);
+
+    unsubscribe();
+  });
+
+  it('UNION explain() 应该生成 Union 物理计划', () => {
+    const db = new Database('union_query_4');
+
+    db.registerTable(
+      db.createTable('active_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+    db.registerTable(
+      db.createTable('archived_users')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+    );
+
+    const plan = db.select('*')
+      .from('active_users')
+      .union(db.select('*').from('archived_users'))
+      .explain();
+
+    expect(plan.logical).toContain('Union');
+    expect(plan.physical).toContain('Union');
+  });
+});
+
 // ============================================================================
 // 第五部分：索引和主键测试
 // ============================================================================

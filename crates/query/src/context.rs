@@ -6,6 +6,8 @@ use alloc::vec::Vec;
 /// Index type enumeration for query optimization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum QueryIndexType {
+    /// Hash index - O(1) point lookups.
+    Hash,
     /// B+Tree index - O(log n) range queries.
     #[default]
     BTree,
@@ -67,6 +69,26 @@ impl IndexInfo {
     /// Returns true if this is a GIN index.
     pub fn is_gin(&self) -> bool {
         self.index_type == QueryIndexType::Gin
+    }
+
+    /// Returns true if this is a hash index.
+    pub fn is_hash(&self) -> bool {
+        self.index_type == QueryIndexType::Hash
+    }
+
+    /// Returns true if this index can satisfy point lookups.
+    pub fn supports_point_lookup(&self) -> bool {
+        !self.is_gin()
+    }
+
+    /// Returns true if this index can satisfy ordered/range scans.
+    pub fn supports_range(&self) -> bool {
+        self.index_type == QueryIndexType::BTree
+    }
+
+    /// Returns true if this index preserves key order.
+    pub fn supports_ordering(&self) -> bool {
+        self.supports_range()
     }
 }
 
@@ -130,7 +152,8 @@ impl ExecutionContext {
     pub fn find_index_prefix(&self, table: &str, columns: &[&str]) -> Option<&IndexInfo> {
         self.table_stats.get(table).and_then(|s| {
             s.indexes.iter().find(|idx| {
-                idx.columns.len() >= columns.len()
+                idx.supports_ordering()
+                    && idx.columns.len() >= columns.len()
                     && idx.columns.iter().zip(columns.iter()).all(|(a, b)| a == *b)
             })
         })
@@ -158,7 +181,7 @@ impl ExecutionContext {
         self.table_stats.get(table).and_then(|s| {
             s.indexes
                 .iter()
-                .find(|idx| idx.is_unique && idx.index_type == QueryIndexType::BTree)
+                .find(|idx| idx.is_unique && idx.supports_ordering())
         })
     }
 }

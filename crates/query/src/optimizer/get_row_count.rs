@@ -242,6 +242,19 @@ impl<'a> GetRowCountPass<'a> {
                 )
             }
 
+            PhysicalPlan::Union { left, right, all } => {
+                let (left_opt, _) = self.traverse(*left);
+                let (right_opt, _) = self.traverse(*right);
+                (
+                    PhysicalPlan::Union {
+                        left: Box::new(left_opt),
+                        right: Box::new(right_opt),
+                        all,
+                    },
+                    None,
+                )
+            }
+
             // Leaf nodes - no transformation
             plan @ (PhysicalPlan::TableScan { .. }
             | PhysicalPlan::IndexScan { .. }

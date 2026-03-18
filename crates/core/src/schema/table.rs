@@ -286,6 +286,51 @@ impl TableBuilder {
         Ok(self)
     }
 
+    /// Adds a hash index for point-lookups on scalar columns.
+    pub fn add_hash_index(
+        mut self,
+        name: impl Into<String>,
+        columns: &[&str],
+        unique: bool,
+    ) -> Result<Self> {
+        let name = name.into();
+        Self::check_naming_rules(&name)?;
+
+        let indexed_cols: Vec<IndexedColumn> =
+            columns.iter().map(|n| IndexedColumn::new(*n)).collect();
+
+        for col in &indexed_cols {
+            let column = self.columns.iter().find(|c| c.name() == col.name);
+            match column {
+                None => {
+                    return Err(Error::InvalidSchema {
+                        message: format!("Column not found: {}", col.name),
+                    })
+                }
+                Some(c) if c.data_type() == DataType::Jsonb => {
+                    return Err(Error::InvalidSchema {
+                        message: format!(
+                            "Hash index is not supported for JSONB column: {}",
+                            col.name
+                        ),
+                    })
+                }
+                Some(c) if !c.is_indexable() => {
+                    return Err(Error::InvalidSchema {
+                        message: format!("Column is not indexable: {}", col.name),
+                    })
+                }
+                _ => {}
+            }
+        }
+
+        let idx = IndexDef::new(name, &self.name, indexed_cols)
+            .unique(unique)
+            .index_type(IndexType::Hash);
+        self.indices.push(idx);
+        Ok(self)
+    }
+
     /// Adds a foreign key constraint.
     pub fn add_foreign_key(
         mut self,
@@ -437,6 +482,24 @@ mod tests {
             .add_column("id", DataType::Int64);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_add_hash_index() {
+        let table = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("email", DataType::String)
+            .unwrap()
+            .add_hash_index("idx_email_hash", &["email"], true)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let index = table.get_index("idx_email_hash").unwrap();
+        assert_eq!(index.get_index_type(), IndexType::Hash);
+        assert!(index.is_unique());
     }
 }
 

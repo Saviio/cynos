@@ -47,6 +47,67 @@ pub struct SelectBuilder {
     joins: Vec<JoinClause>,
     group_by_cols: Vec<String>,
     aggregates: Vec<(AggregateFunc, Option<String>)>, // (func, column_name or None for COUNT(*))
+    frozen_base: Option<FrozenQueryBase>,
+}
+
+#[derive(Clone)]
+struct OutputColumn {
+    name: String,
+    data_type: DataType,
+    is_nullable: bool,
+}
+
+#[derive(Clone)]
+struct QueryOutput {
+    schema: Table,
+    columns: Vec<OutputColumn>,
+}
+
+impl QueryOutput {
+    fn column_names(&self) -> Vec<String> {
+        self.columns.iter().map(|col| col.name.clone()).collect()
+    }
+
+    fn layout(&self) -> SchemaLayout {
+        use crate::binary_protocol::{BinaryDataType, ColumnLayout};
+
+        let mut columns = Vec::with_capacity(self.columns.len());
+        let mut offset = 0usize;
+
+        for column in &self.columns {
+            let binary_type = BinaryDataType::from(column.data_type);
+            let fixed_size = binary_type.fixed_size();
+            columns.push(ColumnLayout {
+                name: column.name.clone(),
+                data_type: binary_type,
+                fixed_size,
+                is_nullable: column.is_nullable,
+                offset,
+            });
+            offset += fixed_size;
+        }
+
+        let null_mask_size = (columns.len() + 7) / 8;
+        let data_size: usize = columns.iter().map(|column| column.fixed_size).sum();
+        let row_stride = null_mask_size + data_size;
+
+        SchemaLayout::new(columns, row_stride, null_mask_size)
+    }
+
+    fn is_compatible_with(&self, other: &Self) -> bool {
+        self.columns.len() == other.columns.len()
+            && self
+                .columns
+                .iter()
+                .zip(other.columns.iter())
+                .all(|(left, right)| left.data_type == right.data_type)
+    }
+}
+
+#[derive(Clone)]
+struct FrozenQueryBase {
+    plan: LogicalPlan,
+    output: QueryOutput,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +158,7 @@ impl SelectBuilder {
             joins: Vec::new(),
             group_by_cols: Vec::new(),
             aggregates: Vec::new(),
+            frozen_base: None,
         }
     }
 
@@ -229,33 +291,26 @@ impl SelectBuilder {
         }
     }
 
-    /// Builds a LogicalPlan from the query builder state.
-    fn build_logical_plan(&self, table_name: &str) -> LogicalPlan {
-        // Start with a table scan
+    /// Builds the scan/join root for a non-set-operation query.
+    fn build_source_plan(&self, table_name: &str) -> LogicalPlan {
         let mut plan = LogicalPlan::Scan {
             table: table_name.to_string(),
         };
 
-        // Track column offsets for each table in the JOIN
-        // Key: reference name (alias if present, otherwise table name), Value: starting column offset
         let mut table_offsets: hashbrown::HashMap<String, usize> = hashbrown::HashMap::new();
 
-        // Add main table offset
         if let Some(schema) = self.get_schema() {
             table_offsets.insert(table_name.to_string(), 0);
             let mut current_offset = schema.columns().len();
 
-            // Add JOINs if any
             for join in &self.joins {
                 let right_plan = LogicalPlan::Scan {
                     table: join.table.clone(),
                 };
 
-                // Record offset using reference name (alias if present)
                 let ref_name = join.reference_name().to_string();
                 table_offsets.insert(ref_name.clone(), current_offset);
 
-                // Convert join condition to AST with correct offsets
                 let get_col_info = |name: &str| {
                     self.get_column_info_for_join_with_offsets_alias(name, join, &table_offsets)
                 };
@@ -264,19 +319,14 @@ impl SelectBuilder {
                 plan = match join.join_type {
                     JoinType::Inner => LogicalPlan::inner_join(plan, right_plan, ast_condition),
                     JoinType::Left => LogicalPlan::left_join(plan, right_plan, ast_condition),
-                    JoinType::Right => {
-                        // Right join is left join with swapped operands
-                        LogicalPlan::left_join(right_plan, plan, ast_condition)
-                    }
+                    JoinType::Right => LogicalPlan::left_join(right_plan, plan, ast_condition),
                 };
 
-                // Update offset for next join
                 if let Some(store) = self.cache.borrow().get_table(&join.table) {
                     current_offset += store.schema().columns().len();
                 }
             }
         } else {
-            // Fallback: no schema available, use old logic
             for join in &self.joins {
                 let right_plan = LogicalPlan::Scan {
                     table: join.table.clone(),
@@ -293,10 +343,12 @@ impl SelectBuilder {
             }
         }
 
-        // Add filter if WHERE clause exists
+        plan
+    }
+
+    /// Applies WHERE / GROUP BY / ORDER BY / LIMIT / projection clauses on top of a root plan.
+    fn apply_query_modifiers(&self, mut plan: LogicalPlan) -> LogicalPlan {
         if let Some(ref predicate) = self.where_clause {
-            // Use get_column_info_any_table to get the correct table-relative index
-            // The optimizer may push this filter to a single table, so we need table-relative indices
             let get_col_info = |name: &str| self.get_column_info_any_table(name);
             let ast_predicate = predicate.to_ast_with_table(&get_col_info);
             plan = LogicalPlan::Filter {
@@ -305,7 +357,6 @@ impl SelectBuilder {
             };
         }
 
-        // Add aggregate if GROUP BY or aggregate functions are specified
         if !self.group_by_cols.is_empty() || !self.aggregates.is_empty() {
             let group_by_exprs: Vec<_> = self
                 .group_by_cols
@@ -338,7 +389,6 @@ impl SelectBuilder {
                                 (*func, cynos_query::ast::Expr::column(&tbl, col_name, idx))
                             })
                     } else {
-                        // COUNT(*) - use a dummy column expression
                         Some((
                             *func,
                             cynos_query::ast::Expr::literal(cynos_core::Value::Int64(1)),
@@ -350,16 +400,13 @@ impl SelectBuilder {
             plan = LogicalPlan::aggregate(plan, group_by_exprs, agg_exprs);
         }
 
-        // Add ORDER BY if specified
         if !self.order_by.is_empty() {
             let order_exprs: Vec<_> = self
                 .order_by
                 .iter()
                 .filter_map(|(col, order)| {
-                    // Use get_column_info_for_projection to correctly handle JOIN queries
                     self.get_column_info_for_projection(col)
                         .map(|(tbl, idx, _)| {
-                            // Extract just the column name if qualified
                             let col_name = if let Some(dot_pos) = col.find('.') {
                                 &col[dot_pos + 1..]
                             } else {
@@ -375,25 +422,20 @@ impl SelectBuilder {
             };
         }
 
-        // Add LIMIT/OFFSET if specified
-        // Use a very large limit if only offset is specified
         if self.limit_val.is_some() || self.offset_val.is_some() {
             plan = LogicalPlan::Limit {
                 input: Box::new(plan),
-                limit: self.limit_val.unwrap_or(1_000_000_000), // Large but safe limit
+                limit: self.limit_val.unwrap_or(1_000_000_000),
                 offset: self.offset_val.unwrap_or(0),
             };
         }
 
-        // Add projection if specific columns are selected
         if let Some(cols) = self.parse_columns() {
             let project_exprs: Vec<_> = cols
                 .iter()
                 .filter_map(|col| {
-                    // Use get_column_info_for_projection to get the correct index for JOIN queries
                     self.get_column_info_for_projection(col)
                         .map(|(tbl, idx, _)| {
-                            // Extract just the column name if qualified
                             let col_name = if let Some(dot_pos) = col.find('.') {
                                 &col[dot_pos + 1..]
                             } else {
@@ -413,6 +455,16 @@ impl SelectBuilder {
         }
 
         plan
+    }
+
+    /// Builds a LogicalPlan from the query builder state.
+    fn build_logical_plan(&self, table_name: &str) -> LogicalPlan {
+        let root = self
+            .frozen_base
+            .as_ref()
+            .map(|base| base.plan.clone())
+            .unwrap_or_else(|| self.build_source_plan(table_name));
+        self.apply_query_modifiers(root)
     }
 
     /// Gets column info for projection, calculating the correct index for JOIN queries.
@@ -458,6 +510,208 @@ impl SelectBuilder {
         }
 
         None
+    }
+
+    fn representative_schema(&self) -> Result<Table, JsValue> {
+        let table_name = self
+            .from_table
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("FROM table not specified"))?;
+
+        self.cache
+            .borrow()
+            .get_table(table_name)
+            .map(|store| store.schema().clone())
+            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))
+    }
+
+    fn normalize_column_names(column_names: &[String]) -> Vec<String> {
+        let mut name_counts: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
+        for col_name in column_names {
+            let simple_name = if let Some(dot_pos) = col_name.find('.') {
+                &col_name[dot_pos + 1..]
+            } else {
+                col_name.as_str()
+            };
+            *name_counts.entry(simple_name).or_insert(0) += 1;
+        }
+
+        column_names
+            .iter()
+            .map(|name| {
+                if let Some(dot_pos) = name.find('.') {
+                    let simple_name = &name[dot_pos + 1..];
+                    if name_counts.get(simple_name).copied().unwrap_or(0) > 1 {
+                        name.clone()
+                    } else {
+                        simple_name.to_string()
+                    }
+                } else {
+                    name.clone()
+                }
+            })
+            .collect()
+    }
+
+    fn build_projection_output(&self, column_names: &[String]) -> Result<QueryOutput, JsValue> {
+        let normalized_names = Self::normalize_column_names(column_names);
+        let columns: Vec<OutputColumn> = column_names
+            .iter()
+            .zip(normalized_names.into_iter())
+            .filter_map(|(column_name, output_name)| {
+                self.get_column_info_any_table(column_name)
+                    .map(|(_, _, data_type)| OutputColumn {
+                        name: output_name,
+                        data_type,
+                        is_nullable: true,
+                    })
+            })
+            .collect();
+
+        Ok(QueryOutput {
+            schema: self.representative_schema()?,
+            columns,
+        })
+    }
+
+    fn build_join_output(&self) -> Result<QueryOutput, JsValue> {
+        let main_schema = self.representative_schema()?;
+        let mut schemas = alloc::vec![main_schema.clone()];
+
+        {
+            let cache = self.cache.borrow();
+            for join in &self.joins {
+                let join_store = cache.get_table(&join.table).ok_or_else(|| {
+                    JsValue::from_str(&alloc::format!("Join table not found: {}", join.table))
+                })?;
+                schemas.push(join_store.schema().clone());
+            }
+        }
+
+        let mut name_counts: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
+        for schema in &schemas {
+            for col in schema.columns() {
+                *name_counts.entry(col.name()).or_insert(0) += 1;
+            }
+        }
+
+        let mut columns = Vec::new();
+        for (schema_idx, schema) in schemas.iter().enumerate() {
+            for col in schema.columns() {
+                let output_name = if name_counts.get(col.name()).copied().unwrap_or(0) > 1 {
+                    alloc::format!("{}.{}", schema.name(), col.name())
+                } else {
+                    col.name().to_string()
+                };
+                columns.push(OutputColumn {
+                    name: output_name,
+                    data_type: col.data_type(),
+                    is_nullable: schema_idx > 0 || col.is_nullable(),
+                });
+            }
+        }
+
+        Ok(QueryOutput {
+            schema: main_schema,
+            columns,
+        })
+    }
+
+    fn aggregate_output_type(func: AggregateFunc, input_type: Option<DataType>) -> DataType {
+        match func {
+            AggregateFunc::Count | AggregateFunc::Distinct => DataType::Int64,
+            AggregateFunc::Avg | AggregateFunc::StdDev | AggregateFunc::GeoMean => {
+                DataType::Float64
+            }
+            AggregateFunc::Sum => match input_type {
+                Some(DataType::Float64) => DataType::Float64,
+                _ => DataType::Int64,
+            },
+            AggregateFunc::Min | AggregateFunc::Max => input_type.unwrap_or(DataType::Float64),
+        }
+    }
+
+    fn describe_output(&self) -> Result<QueryOutput, JsValue> {
+        if !self.group_by_cols.is_empty() || !self.aggregates.is_empty() {
+            let group_columns = self.group_by_cols.iter().filter_map(|col| {
+                self.get_column_info_for_projection(col)
+                    .map(|(_, _, data_type)| OutputColumn {
+                        name: if let Some(dot_pos) = col.find('.') {
+                            col[dot_pos + 1..].to_string()
+                        } else {
+                            col.clone()
+                        },
+                        data_type,
+                        is_nullable: true,
+                    })
+            });
+
+            let aggregate_columns = self.aggregates.iter().map(|(func, col_opt)| {
+                let input_type = col_opt
+                    .as_deref()
+                    .and_then(|col| self.get_column_info_for_projection(col))
+                    .map(|(_, _, data_type)| data_type);
+                let name = if let Some(col) = col_opt {
+                    let simple_name = if let Some(dot_pos) = col.find('.') {
+                        &col[dot_pos + 1..]
+                    } else {
+                        col.as_str()
+                    };
+                    alloc::format!(
+                        "{}_{}",
+                        match func {
+                            AggregateFunc::Count => "count",
+                            AggregateFunc::Sum => "sum",
+                            AggregateFunc::Avg => "avg",
+                            AggregateFunc::Min => "min",
+                            AggregateFunc::Max => "max",
+                            AggregateFunc::Distinct => "distinct",
+                            AggregateFunc::StdDev => "stddev",
+                            AggregateFunc::GeoMean => "geomean",
+                        },
+                        simple_name
+                    )
+                } else {
+                    "count".to_string()
+                };
+
+                OutputColumn {
+                    name,
+                    data_type: Self::aggregate_output_type(*func, input_type),
+                    is_nullable: true,
+                }
+            });
+
+            return Ok(QueryOutput {
+                schema: self.representative_schema()?,
+                columns: group_columns.chain(aggregate_columns).collect(),
+            });
+        }
+
+        if let Some(cols) = self.parse_columns() {
+            return self.build_projection_output(&cols);
+        }
+
+        if let Some(base) = &self.frozen_base {
+            return Ok(base.output.clone());
+        }
+
+        if !self.joins.is_empty() {
+            return self.build_join_output();
+        }
+
+        let schema = self.representative_schema()?;
+        let columns = schema
+            .columns()
+            .iter()
+            .map(|col| OutputColumn {
+                name: col.name().to_string(),
+                data_type: col.data_type(),
+                is_nullable: col.is_nullable(),
+            })
+            .collect();
+
+        Ok(QueryOutput { schema, columns })
     }
 
     /// Creates a SchemaLayout for projected columns, supporting multi-table column references.
@@ -675,6 +929,45 @@ impl SelectBuilder {
 
         None
     }
+
+    fn clear_query_modifiers(&mut self) {
+        self.columns = JsValue::UNDEFINED;
+        self.where_clause = None;
+        self.order_by.clear();
+        self.limit_val = None;
+        self.offset_val = None;
+        self.group_by_cols.clear();
+        self.aggregates.clear();
+    }
+
+    fn compose_union(mut self, other: &SelectBuilder, all: bool) -> Result<Self, JsValue> {
+        let left_table = self
+            .from_table
+            .clone()
+            .ok_or_else(|| JsValue::from_str("Left side of UNION is missing FROM"))?;
+        let right_table = other
+            .from_table
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("Right side of UNION is missing FROM"))?;
+
+        let left_plan = self.build_logical_plan(&left_table);
+        let right_plan = other.build_logical_plan(right_table);
+        let left_output = self.describe_output()?;
+        let right_output = other.describe_output()?;
+
+        if !left_output.is_compatible_with(&right_output) {
+            return Err(JsValue::from_str(
+                "UNION operands must produce the same number of columns with matching types",
+            ));
+        }
+
+        self.frozen_base = Some(FrozenQueryBase {
+            plan: LogicalPlan::union(left_plan, right_plan, all),
+            output: left_output,
+        });
+        self.clear_query_modifiers();
+        Ok(self)
+    }
 }
 
 #[wasm_bindgen]
@@ -713,6 +1006,17 @@ impl SelectBuilder {
     pub fn offset(mut self, n: usize) -> Self {
         self.offset_val = Some(n);
         self
+    }
+
+    /// Combines this query with another query using UNION (distinct).
+    pub fn union(self, other: &SelectBuilder) -> Result<Self, JsValue> {
+        self.compose_union(other, false)
+    }
+
+    /// Combines this query with another query using UNION ALL.
+    #[wasm_bindgen(js_name = unionAll)]
+    pub fn union_all(self, other: &SelectBuilder) -> Result<Self, JsValue> {
+        self.compose_union(other, true)
     }
 
     /// Parses a table specification that may include an alias.
@@ -849,8 +1153,6 @@ impl SelectBuilder {
             .get_table(table_name)
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
-        let schema = store.schema().clone();
-
         // Build logical plan using query engine
         // ORDER BY, LIMIT, and OFFSET are now handled in the logical plan
         let plan = self.build_logical_plan(table_name);
@@ -859,16 +1161,19 @@ impl SelectBuilder {
         let rows = execute_plan(&cache, table_name, plan)
             .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
 
-        // Convert to JS array
+        if self.frozen_base.is_some() {
+            let output = self.describe_output()?;
+            return Ok(projected_rows_to_js_array(&rows, &output.column_names()));
+        }
+
+        let schema = store.schema().clone();
+
         if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
-            // For aggregate queries, build column names from group_by + aggregates
-            Ok(self.aggregate_rows_to_js_array(&rows))
+            let output = self.describe_output()?;
+            Ok(projected_rows_to_js_array(&rows, &output.column_names()))
         } else if let Some(cols) = self.parse_columns() {
-            // When we have projection, the rows contain only the projected columns
-            // in the order specified by the projection
             Ok(projected_rows_to_js_array(&rows, &cols))
         } else if !self.joins.is_empty() {
-            // For JOIN queries without projection, collect all schemas and use joined conversion
             let mut schemas: Vec<&Table> = Vec::with_capacity(1 + self.joins.len());
             schemas.push(store.schema());
             for join in &self.joins {
@@ -881,64 +1186,6 @@ impl SelectBuilder {
         } else {
             Ok(rows_to_js_array(&rows, &schema))
         }
-    }
-
-    /// Builds column names for aggregate queries.
-    /// Returns: group_by columns + aggregate function names (e.g., "count", "sum_value")
-    fn build_aggregate_column_names(&self) -> Vec<String> {
-        let mut col_names: Vec<String> = Vec::new();
-        for col in &self.group_by_cols {
-            // Use simple column name (without table prefix)
-            let simple_name = if let Some(dot_pos) = col.find('.') {
-                &col[dot_pos + 1..]
-            } else {
-                col.as_str()
-            };
-            col_names.push(simple_name.to_string());
-        }
-        for (func, col_opt) in &self.aggregates {
-            let func_name = match func {
-                AggregateFunc::Count => "count",
-                AggregateFunc::Sum => "sum",
-                AggregateFunc::Avg => "avg",
-                AggregateFunc::Min => "min",
-                AggregateFunc::Max => "max",
-                AggregateFunc::Distinct => "distinct",
-                AggregateFunc::StdDev => "stddev",
-                AggregateFunc::GeoMean => "geomean",
-            };
-            let col_name = if let Some(col) = col_opt {
-                let simple_name = if let Some(dot_pos) = col.find('.') {
-                    &col[dot_pos + 1..]
-                } else {
-                    col.as_str()
-                };
-                alloc::format!("{}_{}", func_name, simple_name)
-            } else {
-                func_name.to_string() // COUNT(*)
-            };
-            col_names.push(col_name);
-        }
-        col_names
-    }
-
-    /// Converts aggregate result rows to JS array.
-    fn aggregate_rows_to_js_array(&self, rows: &[Rc<Row>]) -> JsValue {
-        let result = js_sys::Array::new();
-        let col_names = self.build_aggregate_column_names();
-
-        for row in rows {
-            let obj = js_sys::Object::new();
-            for (i, name) in col_names.iter().enumerate() {
-                if let Some(value) = row.get(i) {
-                    let js_val = crate::convert::value_to_js(value);
-                    let _ = js_sys::Reflect::set(&obj, &JsValue::from_str(name), &js_val);
-                }
-            }
-            result.push(&obj);
-        }
-
-        result.into()
     }
 
     /// Explains the query plan without executing it.
@@ -981,25 +1228,20 @@ impl SelectBuilder {
             .as_ref()
             .ok_or_else(|| JsValue::from_str("FROM table not specified"))?;
 
-        let table_id = self
-            .table_id_map
-            .borrow()
-            .get(table_name)
-            .copied()
-            .ok_or_else(|| {
-                JsValue::from_str(&alloc::format!("Table ID not found: {}", table_name))
-            })?;
-
         let cache_ref = self.cache.clone();
         let cache = cache_ref.borrow();
         let store = cache
             .get_table(table_name)
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
+        // Build logical plan and compile to physical plan (cached for re-execution)
+        let logical_plan = self.build_logical_plan(table_name);
+        let output = self.describe_output()?;
+        let output_columns = output.column_names();
         let schema = store.schema().clone();
-
-        // Build binary layout: merge main table + all joined table schemas
-        let binary_layout = if self.joins.is_empty() {
+        let binary_layout = if self.frozen_base.is_some() {
+            output.layout()
+        } else if self.joins.is_empty() {
             if let Some(cols) = self.parse_columns() {
                 SchemaLayout::from_projection(&schema, &cols)
             } else {
@@ -1016,9 +1258,6 @@ impl SelectBuilder {
             }
             SchemaLayout::from_schemas(&schemas)
         };
-
-        // Build logical plan and compile to physical plan (cached for re-execution)
-        let logical_plan = self.build_logical_plan(table_name);
         let physical_plan = compile_plan(&cache, table_name, logical_plan.clone());
 
         // Get initial result using the compiled physical plan
@@ -1031,19 +1270,29 @@ impl SelectBuilder {
         let observable = ReQueryObservable::new(physical_plan, cache_ref.clone(), initial_rows);
         let observable_rc = Rc::new(RefCell::new(observable));
 
-        // Register with query registry
-        self.query_registry
-            .borrow_mut()
-            .register(observable_rc.clone(), table_id);
+        {
+            let table_id_map = self.table_id_map.borrow();
+            let mut registry = self.query_registry.borrow_mut();
+            for table in logical_plan.collect_tables() {
+                let table_id = table_id_map.get(&table).copied().ok_or_else(|| {
+                    JsValue::from_str(&alloc::format!("Table ID not found: {}", table))
+                })?;
+                registry.register(observable_rc.clone(), table_id);
+            }
+        }
 
-        // Return observable with appropriate column info
-        if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
-            // For aggregate queries, build column names from group_by + aggregates
-            let aggregate_cols = self.build_aggregate_column_names();
-            Ok(JsObservableQuery::new_with_aggregates(
+        if self.frozen_base.is_some() {
+            Ok(JsObservableQuery::new_with_projection(
                 observable_rc,
-                schema,
-                aggregate_cols,
+                output.schema,
+                output_columns,
+                binary_layout,
+            ))
+        } else if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
+            Ok(JsObservableQuery::new_with_projection(
+                observable_rc,
+                output.schema,
+                output_columns,
                 binary_layout,
             ))
         } else if let Some(cols) = self.parse_columns() {
@@ -1082,10 +1331,14 @@ impl SelectBuilder {
             .get_table(table_name)
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
+        // Build logical plan and compile to physical plan
+        let logical_plan = self.build_logical_plan(table_name);
+        let output = self.describe_output()?;
+        let output_columns = output.column_names();
         let schema = store.schema().clone();
-
-        // Build binary layout
-        let binary_layout = if self.joins.is_empty() {
+        let binary_layout = if self.frozen_base.is_some() {
+            output.layout()
+        } else if self.joins.is_empty() {
             if let Some(cols) = self.parse_columns() {
                 SchemaLayout::from_projection(&schema, &cols)
             } else {
@@ -1102,9 +1355,6 @@ impl SelectBuilder {
             }
             SchemaLayout::from_schemas(&schemas)
         };
-
-        // Build logical plan and compile to physical plan
-        let logical_plan = self.build_logical_plan(table_name);
         let physical_plan = compile_plan(&cache, table_name, logical_plan);
 
         // Compile physical plan to dataflow — errors if not incrementalizable
@@ -1133,13 +1383,14 @@ impl SelectBuilder {
             .borrow_mut()
             .register_ivm(observable_rc.clone());
 
-        // Return with appropriate column info
-        if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
-            let aggregate_cols = self.build_aggregate_column_names();
-            Ok(JsIvmObservableQuery::new_with_aggregates(
+        if self.frozen_base.is_some()
+            || !self.aggregates.is_empty()
+            || !self.group_by_cols.is_empty()
+        {
+            Ok(JsIvmObservableQuery::new_with_projection(
                 observable_rc,
-                schema,
-                aggregate_cols,
+                output.schema,
+                output_columns,
                 binary_layout,
             ))
         } else if let Some(cols) = self.parse_columns() {
@@ -1162,6 +1413,10 @@ impl SelectBuilder {
     /// The layout can be cached by JS for repeated queries on the same table.
     #[wasm_bindgen(js_name = getSchemaLayout)]
     pub fn get_schema_layout(&self) -> Result<crate::binary_protocol::SchemaLayout, JsValue> {
+        if self.frozen_base.is_some() {
+            return Ok(self.describe_output()?.layout());
+        }
+
         let table_name = self
             .from_table
             .as_ref()
@@ -1174,12 +1429,7 @@ impl SelectBuilder {
 
         let schema = store.schema();
 
-        // Create layout based on projection
-        // - Projection queries: create new each time
-        // - Full table queries: use cache (get_or_create)
         let layout = if let Some(cols) = self.parse_columns() {
-            // Projection query: create layout from projected columns
-            // For JOIN queries, we need to look up columns from multiple tables
             self.create_projection_layout(&cols)
         } else {
             self.schema_layout_cache
@@ -1205,10 +1455,19 @@ impl SelectBuilder {
             .get_table(table_name)
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
-        let schema = store.schema();
-
         // Build logical plan
         let plan = self.build_logical_plan(table_name);
+        let schema = store.schema();
+        let layout = if self.frozen_base.is_some() {
+            self.describe_output()?.layout()
+        } else if let Some(cols) = self.parse_columns() {
+            self.create_projection_layout(&cols)
+        } else {
+            self.schema_layout_cache
+                .borrow_mut()
+                .get_or_create_full(table_name, schema)
+                .clone()
+        };
 
         // Compute plan fingerprint for caching
         let fingerprint = compute_plan_fingerprint(&plan);
@@ -1222,21 +1481,6 @@ impl SelectBuilder {
             // Execute the cached physical plan
             execute_physical_plan(&cache, physical_plan)
                 .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?
-        };
-
-        // Create layout based on projection
-        // - Projection queries: create new each time (column combinations vary too much)
-        // - Full table queries: use cache (get_or_create)
-        let layout = if let Some(cols) = self.parse_columns() {
-            // Projection query: create layout from projected columns
-            // For JOIN queries, we need to look up columns from multiple tables
-            self.create_projection_layout(&cols)
-        } else {
-            // Full table query: use cached layout (clone for encoder)
-            self.schema_layout_cache
-                .borrow_mut()
-                .get_or_create_full(table_name, schema)
-                .clone()
         };
 
         // Encode to binary

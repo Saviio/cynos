@@ -32,7 +32,9 @@ impl<'a> OrderByIndexPass<'a> {
                     return optimized_input;
                 }
 
-                if let Some(rewritten_input) = self.rewrite_for_order(optimized_input.clone(), &order_by, None) {
+                if let Some(rewritten_input) =
+                    self.rewrite_for_order(optimized_input.clone(), &order_by, None)
+                {
                     if self.input_satisfies_order(&rewritten_input, &order_by) {
                         return rewritten_input;
                     }
@@ -60,9 +62,11 @@ impl<'a> OrderByIndexPass<'a> {
                     };
                 }
 
-                if let Some(rewritten_input) =
-                    self.rewrite_for_order(optimized_input.clone(), &order_by, Some((limit, offset)))
-                {
+                if let Some(rewritten_input) = self.rewrite_for_order(
+                    optimized_input.clone(),
+                    &order_by,
+                    Some((limit, offset)),
+                ) {
                     if self.input_satisfies_order(&rewritten_input, &order_by) {
                         return if self.can_push_limit_into_scan(&rewritten_input) {
                             rewritten_input
@@ -160,6 +164,11 @@ impl<'a> OrderByIndexPass<'a> {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
             },
+            PhysicalPlan::Union { left, right, all } => PhysicalPlan::Union {
+                left: Box::new(self.traverse(*left)),
+                right: Box::new(self.traverse(*right)),
+                all,
+            },
             PhysicalPlan::NoOp { input } => PhysicalPlan::NoOp {
                 input: Box::new(self.traverse(*input)),
             },
@@ -189,10 +198,13 @@ impl<'a> OrderByIndexPass<'a> {
         match plan {
             PhysicalPlan::TableScan { table } => {
                 let order_columns = self.extract_order_columns(order_by)?;
-                let column_refs: Vec<&str> = order_columns.iter().map(|column| column.as_str()).collect();
+                let column_refs: Vec<&str> =
+                    order_columns.iter().map(|column| column.as_str()).collect();
                 let index = self.ctx.find_index_prefix(&table, &column_refs)?;
                 let reverse = self.check_order_match(order_by, &index.columns)?;
-                let (limit, offset) = scan_limit.map(|(limit, offset)| (Some(limit), Some(offset))).unwrap_or((None, None));
+                let (limit, offset) = scan_limit
+                    .map(|(limit, offset)| (Some(limit), Some(offset)))
+                    .unwrap_or((None, None));
                 Some(PhysicalPlan::IndexScan {
                     table,
                     index: index.name.clone(),
@@ -211,6 +223,9 @@ impl<'a> OrderByIndexPass<'a> {
                 ..
             } => {
                 let index_info = self.ctx.find_index_by_name(&table, &index)?;
+                if !index_info.supports_ordering() {
+                    return None;
+                }
                 let reverse = self.check_order_match(order_by, &index_info.columns)?;
                 let (limit, offset) = match scan_limit {
                     Some((limit, offset)) => {
@@ -365,7 +380,10 @@ mod tests {
         let result = pass.optimize(plan);
         match result {
             PhysicalPlan::Filter { input, .. } => {
-                assert!(matches!(*input, PhysicalPlan::IndexScan { reverse: false, .. }));
+                assert!(matches!(
+                    *input,
+                    PhysicalPlan::IndexScan { reverse: false, .. }
+                ));
             }
             other => panic!("expected filter over index scan, got {:?}", other),
         }
@@ -423,7 +441,11 @@ mod tests {
 
         let result = pass.optimize(plan);
         match result {
-            PhysicalPlan::Limit { input, limit, offset } => {
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
                 assert_eq!(limit, 10);
                 assert_eq!(offset, 3);
                 assert!(matches!(*input, PhysicalPlan::Filter { .. }));

@@ -300,11 +300,13 @@ impl IndexSelection {
             // Find an index that covers the IN column
             if let Some(index) = ctx.find_index(table, &[in_info.column.as_str()]) {
                 // Use IndexInGet for IN queries with indexed columns
-                return Some(LogicalPlan::IndexInGet {
-                    table: table.into(),
-                    index: index.name.clone(),
-                    keys: in_info.values,
-                });
+                if index.supports_point_lookup() {
+                    return Some(LogicalPlan::IndexInGet {
+                        table: table.into(),
+                        index: index.name.clone(),
+                        keys: in_info.values,
+                    });
+                }
             }
         }
 
@@ -340,7 +342,7 @@ impl IndexSelection {
         }
 
         // Decide whether to use IndexScan or IndexGet based on predicate type
-        if pred_info.is_point_lookup {
+        if pred_info.is_point_lookup && index.supports_point_lookup() {
             // Use IndexGet for equality lookups
             if let Some(value) = pred_info.value {
                 return Some(LogicalPlan::IndexGet {
@@ -349,7 +351,7 @@ impl IndexSelection {
                     key: value,
                 });
             }
-        } else if pred_info.is_range {
+        } else if pred_info.is_range && index.supports_range() {
             // Use IndexScan for range predicates
             let (range_start, range_end, include_start, include_end) =
                 self.compute_range(&pred_info);
@@ -384,8 +386,7 @@ impl IndexSelection {
                 {
                     // Find an index for this column
                     if let Some(index) = ctx.find_index(table, &[col.column.as_str()]) {
-                        // Skip GIN indexes
-                        if index.is_gin() {
+                        if !index.supports_range() {
                             return None;
                         }
                         // Use IndexScan for BETWEEN
@@ -444,7 +445,7 @@ impl IndexSelection {
         let mut best: Option<(usize, bool, LogicalPlan, Vec<Expr>)> = None;
 
         for index in &stats.indexes {
-            if index.is_gin() || index.columns.len() <= 1 {
+            if !index.supports_range() || index.columns.len() <= 1 {
                 continue;
             }
 
@@ -477,7 +478,8 @@ impl IndexSelection {
             let replace = match &best {
                 None => true,
                 Some((best_used, best_point, _, _)) => {
-                    candidate.0 > *best_used || (candidate.0 == *best_used && candidate.1 && !*best_point)
+                    candidate.0 > *best_used
+                        || (candidate.0 == *best_used && candidate.1 && !*best_point)
                 }
             };
 
@@ -738,7 +740,10 @@ impl IndexSelection {
                 if let Some(pred_info) = self.analyze_predicate(predicate) {
                     // Check if there's a B-Tree index for this column
                     if let Some(index) = ctx.find_index(table, &[pred_info.column.as_str()]) {
-                        if !index.is_gin() && (pred_info.is_point_lookup || pred_info.is_range) {
+                        let supports_predicate = (pred_info.is_point_lookup
+                            && index.supports_point_lookup())
+                            || (pred_info.is_range && index.supports_range());
+                        if supports_predicate {
                             indexable.push((predicate.clone(), pred_info, index.clone()));
                             return;
                         }
@@ -1414,7 +1419,7 @@ impl IndexSelection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{IndexInfo, TableStats};
+    use crate::context::{IndexInfo, QueryIndexType, TableStats};
     use alloc::collections::BTreeSet;
 
     fn test_contains_trigram_key(path: &str) -> String {
@@ -1500,6 +1505,56 @@ mod tests {
         let optimized = pass.optimize(plan);
         // Should convert to IndexScan for range predicate
         assert!(matches!(optimized, LogicalPlan::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_hash_index_selection_uses_point_lookup() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "users",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_id_hash", alloc::vec!["id".into()], true)
+                        .with_type(QueryIndexType::Hash),
+                ],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+        let plan = LogicalPlan::filter(
+            LogicalPlan::scan("users"),
+            Expr::eq(Expr::column("users", "id", 0), Expr::literal(42i64)),
+        );
+
+        let optimized = pass.optimize(plan);
+        assert!(matches!(optimized, LogicalPlan::IndexGet { .. }));
+    }
+
+    #[test]
+    fn test_hash_index_selection_skips_range_scan() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "users",
+            TableStats {
+                row_count: 1000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_id_hash", alloc::vec!["id".into()], true)
+                        .with_type(QueryIndexType::Hash),
+                ],
+            },
+        );
+
+        let pass = IndexSelection::with_context(ctx);
+        let plan = LogicalPlan::filter(
+            LogicalPlan::scan("users"),
+            Expr::gt(Expr::column("users", "id", 0), Expr::literal(42i64)),
+        );
+
+        let optimized = pass.optimize(plan);
+        assert!(matches!(optimized, LogicalPlan::Filter { .. }));
     }
 
     #[test]
@@ -2262,7 +2317,7 @@ mod tests {
                     assert!(!upper_exclusive, "Upper bound should be inclusive (<=)");
                 }
                 other => panic!("Expected bound range, got {:?}", other),
-            }
+            },
             other => {
                 panic!("Expected IndexScan, got: {:?}", other);
             }

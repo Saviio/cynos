@@ -51,7 +51,9 @@ impl OrderingProperty {
             .zip(order_by.iter())
             .all(|(actual, (expr, order))| match expr {
                 Expr::Column(col) => {
-                    actual.table == col.table && actual.column == col.column && actual.order == *order
+                    actual.table == col.table
+                        && actual.column == col.column
+                        && actual.order == *order
                 }
                 _ => false,
             })
@@ -103,7 +105,11 @@ impl PhysicalProperties {
                 let ordering = ctx.get_stats(table).and_then(|stats| {
                     if stats.is_sorted {
                         ctx.find_primary_index(table).map(|idx| {
-                            OrderingProperty::from_index_columns(table, &idx.columns, SortOrder::Asc)
+                            OrderingProperty::from_index_columns(
+                                table,
+                                &idx.columns,
+                                SortOrder::Asc,
+                            )
                         })
                     } else {
                         None
@@ -132,17 +138,24 @@ impl PhysicalProperties {
                         None => base.saturating_sub(offset.unwrap_or(0)),
                     }
                 });
-                let ordering = ctx.find_index_by_name(table, index).map(|idx| {
-                    OrderingProperty::from_index_columns(
-                        table,
-                        &idx.columns,
-                        if *reverse {
-                            SortOrder::Desc
+                let ordering = ctx
+                    .find_index_by_name(table, index)
+                    .map(|idx| {
+                        if idx.supports_ordering() {
+                            Some(OrderingProperty::from_index_columns(
+                                table,
+                                &idx.columns,
+                                if *reverse {
+                                    SortOrder::Desc
+                                } else {
+                                    SortOrder::Asc
+                                },
+                            ))
                         } else {
-                            SortOrder::Asc
-                        },
-                    )
-                });
+                            None
+                        }
+                    })
+                    .flatten();
                 Self {
                     estimated_rows,
                     ordering,
@@ -173,7 +186,9 @@ impl PhysicalProperties {
                 let input = Self::derive(input, ctx);
                 Self {
                     estimated_rows: input.estimated_rows,
-                    ordering: input.ordering.and_then(|ordering| ordering.projected(columns)),
+                    ordering: input
+                        .ordering
+                        .and_then(|ordering| ordering.projected(columns)),
                 }
             }
             PhysicalPlan::Sort { order_by, input } => Self {
@@ -234,15 +249,13 @@ impl PhysicalProperties {
                 estimated_rows: if group_by.is_empty() {
                     Some(1)
                 } else {
-                    Self::derive(input, ctx)
-                        .estimated_rows
-                        .map(|rows| {
-                            if rows == 0 {
-                                0
-                            } else {
-                                core::cmp::max(rows / 4, 1)
-                            }
-                        })
+                    Self::derive(input, ctx).estimated_rows.map(|rows| {
+                        if rows == 0 {
+                            0
+                        } else {
+                            core::cmp::max(rows / 4, 1)
+                        }
+                    })
                 },
                 ordering: None,
             },
@@ -250,7 +263,8 @@ impl PhysicalProperties {
             | PhysicalPlan::SortMergeJoin { .. }
             | PhysicalPlan::NestedLoopJoin { .. }
             | PhysicalPlan::IndexNestedLoopJoin { .. }
-            | PhysicalPlan::CrossProduct { .. } => Self {
+            | PhysicalPlan::CrossProduct { .. }
+            | PhysicalPlan::Union { .. } => Self {
                 estimated_rows: None,
                 ordering: None,
             },
@@ -275,7 +289,11 @@ mod tests {
             TableStats {
                 row_count: 1000,
                 is_sorted: false,
-                indexes: alloc::vec![IndexInfo::new("idx_score", alloc::vec!["score".into()], false)],
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_score",
+                    alloc::vec!["score".into()],
+                    false
+                )],
             },
         );
         ctx
@@ -305,7 +323,8 @@ mod tests {
         assert!(props
             .ordering
             .as_ref()
-            .map(|ordering| ordering.satisfies(&[(Expr::column("scores", "score", 1), SortOrder::Asc)]))
+            .map(|ordering| ordering
+                .satisfies(&[(Expr::column("scores", "score", 1), SortOrder::Asc)]))
             .unwrap_or(false));
     }
 
@@ -322,7 +341,8 @@ mod tests {
         assert!(props
             .ordering
             .as_ref()
-            .map(|ordering| ordering.satisfies(&[(Expr::column("scores", "score", 1), SortOrder::Desc)]))
+            .map(|ordering| ordering
+                .satisfies(&[(Expr::column("scores", "score", 1), SortOrder::Desc)]))
             .unwrap_or(false));
     }
 }

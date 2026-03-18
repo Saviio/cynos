@@ -110,6 +110,14 @@ impl<'a> EvalContext<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SimpleBinaryPredicate<'a> {
+    column_index: usize,
+    op: BinaryOp,
+    literal: &'a Value,
+    column_on_left: bool,
+}
+
 /// Error type for plan execution.
 #[derive(Clone, Debug)]
 pub enum ExecutionError {
@@ -340,14 +348,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 limit,
                 offset,
                 reverse,
-            } => self.execute_index_scan(
-                table,
-                index,
-                bounds,
-                *limit,
-                *offset,
-                *reverse,
-            ),
+            } => self.execute_index_scan(table, index, bounds, *limit, *offset, *reverse),
 
             PhysicalPlan::IndexGet {
                 table,
@@ -375,6 +376,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             } => self.execute_gin_index_scan_multi(table, index, pairs),
 
             PhysicalPlan::Filter { input, predicate } => {
+                if let PhysicalPlan::TableScan { table } = input.as_ref() {
+                    if let Some(simple_predicate) = Self::simple_binary_predicate(predicate) {
+                        return self.execute_filtered_table_scan(table, simple_predicate);
+                    }
+                }
+
                 let input_rel = self.execute(input)?;
                 self.execute_filter(input_rel, predicate)
             }
@@ -463,6 +470,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 self.execute_cross_product(left_rel, right_rel)
             }
 
+            PhysicalPlan::Union { left, right, all } => {
+                let left_rel = self.execute(left)?;
+                let right_rel = self.execute(right)?;
+                self.execute_union(left_rel, right_rel, *all)
+            }
+
             PhysicalPlan::NoOp { input } => self.execute(input),
 
             PhysicalPlan::TopN {
@@ -486,6 +499,25 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         let column_count = self.data_source.get_column_count(table)?;
         Ok(Relation::from_rows_with_column_count(
             rows,
+            alloc::vec![table.into()],
+            column_count,
+        ))
+    }
+
+    fn execute_filtered_table_scan(
+        &self,
+        table: &str,
+        predicate: SimpleBinaryPredicate<'_>,
+    ) -> ExecutionResult<Relation> {
+        let rows = self.data_source.get_table_rows(table)?;
+        let column_count = self.data_source.get_column_count(table)?;
+        let filtered_rows = rows
+            .into_iter()
+            .filter(|row| self.eval_simple_binary_predicate_row(row.as_ref(), predicate))
+            .collect();
+
+        Ok(Relation::from_rows_with_column_count(
+            filtered_rows,
             alloc::vec![table.into()],
             column_count,
         ))
@@ -536,28 +568,32 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     offset.unwrap_or(0),
                     reverse,
                 )?,
-                KeyRange::LowerBound { value, exclusive } => self.data_source.get_index_range_with_limit(
-                    table,
-                    index,
-                    Some(value),
-                    None,
-                    !exclusive,
-                    true,
-                    limit,
-                    offset.unwrap_or(0),
-                    reverse,
-                )?,
-                KeyRange::UpperBound { value, exclusive } => self.data_source.get_index_range_with_limit(
-                    table,
-                    index,
-                    None,
-                    Some(value),
-                    true,
-                    !exclusive,
-                    limit,
-                    offset.unwrap_or(0),
-                    reverse,
-                )?,
+                KeyRange::LowerBound { value, exclusive } => {
+                    self.data_source.get_index_range_with_limit(
+                        table,
+                        index,
+                        Some(value),
+                        None,
+                        !exclusive,
+                        true,
+                        limit,
+                        offset.unwrap_or(0),
+                        reverse,
+                    )?
+                }
+                KeyRange::UpperBound { value, exclusive } => {
+                    self.data_source.get_index_range_with_limit(
+                        table,
+                        index,
+                        None,
+                        Some(value),
+                        true,
+                        !exclusive,
+                        limit,
+                        offset.unwrap_or(0),
+                        reverse,
+                    )?
+                }
                 KeyRange::Bound {
                     lower,
                     upper,
@@ -575,14 +611,16 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     reverse,
                 )?,
             },
-            IndexBounds::Composite(range) => self.data_source.get_index_range_composite_with_limit(
-                table,
-                index,
-                Some(range),
-                limit,
-                offset.unwrap_or(0),
-                reverse,
-            )?,
+            IndexBounds::Composite(range) => {
+                self.data_source.get_index_range_composite_with_limit(
+                    table,
+                    index,
+                    Some(range),
+                    limit,
+                    offset.unwrap_or(0),
+                    reverse,
+                )?
+            }
         };
         let column_count = self.data_source.get_column_count(table)?;
         Ok(Relation::from_rows_with_column_count(
@@ -690,6 +728,27 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
     fn execute_filter(&self, input: Relation, predicate: &Expr) -> ExecutionResult<Relation> {
         let tables = input.tables().to_vec();
         let table_column_counts = input.table_column_counts().to_vec();
+
+        if tables.len() <= 1 {
+            let simple_predicate = Self::simple_binary_predicate(predicate);
+            let entries: Vec<RelationEntry> = input
+                .into_iter()
+                .filter(|entry| {
+                    if let Some(simple_predicate) = simple_predicate {
+                        self.eval_simple_binary_predicate(entry, simple_predicate)
+                    } else {
+                        self.eval_predicate(predicate, entry)
+                    }
+                })
+                .collect();
+
+            return Ok(Relation {
+                entries,
+                tables,
+                table_column_counts,
+            });
+        }
+
         let ctx = EvalContext::new(&tables, &table_column_counts);
 
         let entries: Vec<RelationEntry> = input
@@ -702,6 +761,81 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             tables,
             table_column_counts,
         })
+    }
+
+    fn simple_binary_predicate(predicate: &Expr) -> Option<SimpleBinaryPredicate<'_>> {
+        match predicate {
+            Expr::BinaryOp { left, op, right } => match (left.as_ref(), right.as_ref()) {
+                (Expr::Column(column), Expr::Literal(literal)) => Some(SimpleBinaryPredicate {
+                    column_index: column.index,
+                    op: *op,
+                    literal,
+                    column_on_left: true,
+                }),
+                (Expr::Literal(literal), Expr::Column(column)) => Some(SimpleBinaryPredicate {
+                    column_index: column.index,
+                    op: *op,
+                    literal,
+                    column_on_left: false,
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn eval_simple_binary_predicate(
+        &self,
+        entry: &RelationEntry,
+        predicate: SimpleBinaryPredicate<'_>,
+    ) -> bool {
+        let null = Value::Null;
+        let value = entry.get_field(predicate.column_index).unwrap_or(&null);
+        self.eval_simple_binary_predicate_value(value, predicate)
+    }
+
+    #[inline]
+    fn eval_simple_binary_predicate_row(
+        &self,
+        row: &Row,
+        predicate: SimpleBinaryPredicate<'_>,
+    ) -> bool {
+        let null = Value::Null;
+        let value = row.get(predicate.column_index).unwrap_or(&null);
+        self.eval_simple_binary_predicate_value(value, predicate)
+    }
+
+    #[inline]
+    fn eval_simple_binary_predicate_value(
+        &self,
+        value: &Value,
+        predicate: SimpleBinaryPredicate<'_>,
+    ) -> bool {
+        if predicate.column_on_left {
+            self.eval_binary_op_bool(predicate.op, value, predicate.literal)
+        } else {
+            self.eval_binary_op_bool(predicate.op, predicate.literal, value)
+        }
+    }
+
+    #[inline]
+    fn eval_binary_op_bool(&self, op: BinaryOp, left: &Value, right: &Value) -> bool {
+        match op {
+            BinaryOp::Eq => left == right,
+            BinaryOp::Ne => left != right,
+            BinaryOp::Lt => left < right,
+            BinaryOp::Le => left <= right,
+            BinaryOp::Gt => left > right,
+            BinaryOp::Ge => left >= right,
+            BinaryOp::And => {
+                matches!(left, Value::Boolean(true)) && matches!(right, Value::Boolean(true))
+            }
+            BinaryOp::Or => {
+                matches!(left, Value::Boolean(true)) || matches!(right, Value::Boolean(true))
+            }
+            _ => matches!(self.eval_binary_op(op, left, right), Value::Boolean(true)),
+        }
     }
 
     // ========== Project Operation ==========
@@ -948,6 +1082,41 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             tables,
             table_column_counts,
         })
+    }
+
+    fn execute_union(
+        &self,
+        left: Relation,
+        right: Relation,
+        all: bool,
+    ) -> ExecutionResult<Relation> {
+        let left_width: usize = left.table_column_counts().iter().sum();
+        let right_width: usize = right.table_column_counts().iter().sum();
+        if left_width != right_width {
+            return Err(ExecutionError::InvalidOperation(
+                "UNION inputs must have the same column count".into(),
+            ));
+        }
+
+        let tables = left.tables().to_vec();
+        let table_column_counts = left.table_column_counts().to_vec();
+
+        if all {
+            let entries = left.into_iter().chain(right).collect();
+            return Ok(Relation::from_entries(entries, tables, table_column_counts));
+        }
+
+        let mut seen = alloc::collections::BTreeSet::new();
+        let mut entries = Vec::new();
+
+        for entry in left.into_iter().chain(right) {
+            let key = entry.row.values().to_vec();
+            if seen.insert(key) {
+                entries.push(entry);
+            }
+        }
+
+        Ok(Relation::from_entries(entries, tables, table_column_counts))
     }
 
     // ========== Aggregate Operation ==========
@@ -2518,7 +2687,11 @@ impl DataSource for InMemoryDataSource {
         let range = in_memory_scalar_range(range_start, range_end, include_start, include_end);
 
         for (key, row_indices) in &index_data.key_to_rows {
-            if range.as_ref().map(|range| range.contains(key)).unwrap_or(true) {
+            if range
+                .as_ref()
+                .map(|range| range.contains(key))
+                .unwrap_or(true)
+            {
                 for &idx in row_indices {
                     result.push(Rc::clone(&table_data.rows[idx]));
                 }
@@ -2559,7 +2732,12 @@ impl DataSource for InMemoryDataSource {
         let keys_in_range: Vec<&InMemoryIndexKey> = index_data
             .key_to_rows
             .keys()
-            .filter(|key| range.as_ref().map(|range| range.contains(key)).unwrap_or(true))
+            .filter(|key| {
+                range
+                    .as_ref()
+                    .map(|range| range.contains(key))
+                    .unwrap_or(true)
+            })
             .collect();
 
         let mut result = Vec::new();
@@ -2657,7 +2835,12 @@ impl DataSource for InMemoryDataSource {
         let keys_in_range: Vec<&InMemoryIndexKey> = index_data
             .key_to_rows
             .keys()
-            .filter(|key| range.as_ref().map(|range| range.contains(key)).unwrap_or(true))
+            .filter(|key| {
+                range
+                    .as_ref()
+                    .map(|range| range.contains(key))
+                    .unwrap_or(true)
+            })
             .collect();
 
         let mut result = Vec::new();
@@ -2799,22 +2982,10 @@ mod tests {
         ds.add_table(
             "scores",
             vec![
-                Row::new(
-                    1,
-                    vec![Value::String("apac".into()), Value::Int64(5)],
-                ),
-                Row::new(
-                    2,
-                    vec![Value::String("apac".into()), Value::Int64(10)],
-                ),
-                Row::new(
-                    3,
-                    vec![Value::String("apac".into()), Value::Int64(20)],
-                ),
-                Row::new(
-                    4,
-                    vec![Value::String("emea".into()), Value::Int64(10)],
-                ),
+                Row::new(1, vec![Value::String("apac".into()), Value::Int64(5)]),
+                Row::new(2, vec![Value::String("apac".into()), Value::Int64(10)]),
+                Row::new(3, vec![Value::String("apac".into()), Value::Int64(20)]),
+                Row::new(4, vec![Value::String("emea".into()), Value::Int64(10)]),
             ],
             2,
         );
@@ -2877,6 +3048,27 @@ mod tests {
         let result = runner.execute(&plan).unwrap();
 
         assert_eq!(result.len(), 2); // Alice and Charlie
+    }
+
+    #[test]
+    fn test_filter_literal_on_left() {
+        let ds = create_test_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let plan = PhysicalPlan::filter(
+            PhysicalPlan::table_scan("users"),
+            Expr::lt(
+                Expr::literal(Value::Int64(10)),
+                Expr::column("users", "dept_id", 2),
+            ),
+        );
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.entries[0].get_field(1),
+            Some(&Value::String("Bob".into()))
+        );
     }
 
     #[test]
@@ -3046,6 +3238,88 @@ mod tests {
 
         // 2 * 3 = 6
         assert_eq!(result.len(), 6);
+    }
+
+    #[test]
+    fn test_union_distinct() {
+        let ds = create_test_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let left = PhysicalPlan::project(
+            PhysicalPlan::filter(
+                PhysicalPlan::table_scan("users"),
+                Expr::eq(
+                    Expr::column("users", "dept_id", 2),
+                    Expr::literal(Value::Int64(10)),
+                ),
+            ),
+            vec![Expr::column("users", "name", 1)],
+        );
+        let right = PhysicalPlan::project(
+            PhysicalPlan::filter(
+                PhysicalPlan::table_scan("users"),
+                Expr::In {
+                    expr: Box::new(Expr::column("users", "name", 1)),
+                    list: vec![
+                        Expr::literal(Value::String("Alice".into())),
+                        Expr::literal(Value::String("Bob".into())),
+                    ],
+                },
+            ),
+            vec![Expr::column("users", "name", 1)],
+        );
+
+        let result = runner
+            .execute(&PhysicalPlan::union(left, right, false))
+            .unwrap();
+        let names: Vec<String> = result
+            .entries
+            .iter()
+            .map(|entry| match entry.get_field(0) {
+                Some(Value::String(name)) => name.clone(),
+                other => panic!("expected name string, got {:?}", other),
+            })
+            .collect();
+
+        assert_eq!(result.len(), 3);
+        assert!(names.contains(&String::from("Alice")));
+        assert!(names.contains(&String::from("Bob")));
+        assert!(names.contains(&String::from("Charlie")));
+    }
+
+    #[test]
+    fn test_union_all_preserves_duplicates() {
+        let ds = create_test_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let left = PhysicalPlan::project(
+            PhysicalPlan::filter(
+                PhysicalPlan::table_scan("users"),
+                Expr::eq(
+                    Expr::column("users", "dept_id", 2),
+                    Expr::literal(Value::Int64(10)),
+                ),
+            ),
+            vec![Expr::column("users", "name", 1)],
+        );
+        let right = PhysicalPlan::project(
+            PhysicalPlan::filter(
+                PhysicalPlan::table_scan("users"),
+                Expr::In {
+                    expr: Box::new(Expr::column("users", "name", 1)),
+                    list: vec![
+                        Expr::literal(Value::String("Alice".into())),
+                        Expr::literal(Value::String("Bob".into())),
+                    ],
+                },
+            ),
+            vec![Expr::column("users", "name", 1)],
+        );
+
+        let result = runner
+            .execute(&PhysicalPlan::union(left, right, true))
+            .unwrap();
+        assert_eq!(result.len(), 4);
     }
 
     #[test]

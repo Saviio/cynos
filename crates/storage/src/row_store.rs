@@ -8,7 +8,7 @@ use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use cynos_core::schema::Table;
+use cynos_core::schema::{IndexType, Table};
 use cynos_core::{Error, Result, Row, RowId, Value};
 use cynos_incremental::Delta;
 use cynos_index::{
@@ -298,8 +298,22 @@ impl HashIndexStore {
         self.inner.remove(key, row_id);
     }
 
+    fn remove_batch_index_keys(&mut self, entries: &[(IndexKey, RowId)]) {
+        self.inner.remove_batch(entries);
+    }
+
     fn contains_index_key(&self, key: &IndexKey) -> bool {
         self.inner.contains_key(key)
+    }
+
+    fn get_range_index_keys(
+        &self,
+        range: Option<&KeyRange<IndexKey>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+    ) -> Vec<RowId> {
+        self.inner.get_range(range, reverse, limit, skip)
     }
 }
 
@@ -362,6 +376,79 @@ impl IndexStore for HashIndexStore {
     }
 }
 
+enum SecondaryIndexStore {
+    BTree(BTreeIndexStore),
+    Hash(HashIndexStore),
+}
+
+impl SecondaryIndexStore {
+    fn new(index_type: IndexType, unique: bool) -> Self {
+        match index_type {
+            IndexType::Hash => Self::Hash(HashIndexStore::new(unique)),
+            IndexType::BTree | IndexType::Gin => Self::BTree(BTreeIndexStore::new(unique)),
+        }
+    }
+
+    fn add_index_key(
+        &mut self,
+        key: IndexKey,
+        row_id: RowId,
+    ) -> core::result::Result<(), cynos_index::IndexError> {
+        match self {
+            Self::BTree(index) => index.add_index_key(key, row_id),
+            Self::Hash(index) => index.add_index_key(key, row_id),
+        }
+    }
+
+    fn remove_index_key(&mut self, key: &IndexKey, row_id: Option<RowId>) {
+        match self {
+            Self::BTree(index) => index.remove_index_key(key, row_id),
+            Self::Hash(index) => index.remove_index_key(key, row_id),
+        }
+    }
+
+    fn remove_batch_index_keys(&mut self, entries: &[(IndexKey, RowId)]) {
+        match self {
+            Self::BTree(index) => index.remove_batch_index_keys(entries),
+            Self::Hash(index) => index.remove_batch_index_keys(entries),
+        }
+    }
+
+    fn contains_index_key(&self, key: &IndexKey) -> bool {
+        match self {
+            Self::BTree(index) => index.contains_index_key(key),
+            Self::Hash(index) => index.contains_index_key(key),
+        }
+    }
+
+    fn is_unique(&self) -> bool {
+        match self {
+            Self::BTree(index) => index.is_unique(),
+            Self::Hash(index) => index.is_unique(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::BTree(index) => index.clear(),
+            Self::Hash(index) => index.clear(),
+        }
+    }
+
+    fn get_range_index_keys(
+        &self,
+        range: Option<&KeyRange<IndexKey>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+    ) -> Vec<RowId> {
+        match self {
+            Self::BTree(index) => index.get_range_index_keys(range, reverse, limit, skip),
+            Self::Hash(index) => index.get_range_index_keys(range, reverse, limit, skip),
+        }
+    }
+}
+
 /// Extracts the key value from a row for the given column indices.
 fn extract_key(row: &Row, col_indices: &[usize]) -> IndexKey {
     IndexKey::from_row(row, col_indices)
@@ -388,7 +475,7 @@ pub struct RowStore {
     row_id_index: BTreeIndexStore,
     primary_index: Option<BTreeIndexStore>,
     pk_columns: Vec<usize>,
-    secondary_indices: BTreeMap<String, BTreeIndexStore>,
+    secondary_indices: BTreeMap<String, SecondaryIndexStore>,
     index_columns: BTreeMap<String, Vec<usize>>,
     /// GIN indexes for JSONB columns
     gin_indices: BTreeMap<String, GinIndex>,
@@ -428,7 +515,7 @@ impl RowStore {
                 .collect();
 
             // Check if this is a GIN index (for JSONB columns)
-            if idx.get_index_type() == cynos_core::schema::IndexType::Gin {
+            if idx.get_index_type() == IndexType::Gin {
                 if let Some(&col_idx) = cols.first() {
                     store
                         .gin_indices
@@ -440,7 +527,7 @@ impl RowStore {
             } else {
                 store.secondary_indices.insert(
                     idx.name().to_string(),
-                    BTreeIndexStore::new(idx.is_unique()),
+                    SecondaryIndexStore::new(idx.get_index_type(), idx.is_unique()),
                 );
                 store.index_columns.insert(idx.name().to_string(), cols);
             }
@@ -834,14 +921,7 @@ impl RowStore {
 
     /// Gets rows by index scan.
     pub fn index_scan(&self, index_name: &str, range: Option<&KeyRange<Value>>) -> Vec<Rc<Row>> {
-        if let Some(idx) = self.secondary_indices.get(index_name) {
-            idx.get_range(range, false, None, 0)
-                .iter()
-                .filter_map(|&id| self.rows.get(&id).cloned())
-                .collect()
-        } else {
-            Vec::new()
-        }
+        self.index_scan_with_options(index_name, range, None, 0, false)
     }
 
     /// Gets rows by index scan with limit.
@@ -884,7 +964,8 @@ impl RowStore {
         };
 
         let row_ids = if columns.len() == 1 {
-            idx.get_range(range, reverse, limit, offset)
+            let normalized_range = IndexKey::from_scalar_range(range);
+            idx.get_range_index_keys(normalized_range.as_ref(), reverse, limit, offset)
         } else if range.is_none() {
             idx.get_range_index_keys(None, reverse, limit, offset)
         } else {
@@ -1539,6 +1620,21 @@ mod tests {
             .unwrap()
     }
 
+    fn test_schema_with_hash_index() -> Table {
+        TableBuilder::new("test_hash")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("value", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_hash_index("idx_value_hash", &["value"], false)
+            .unwrap()
+            .build()
+            .unwrap()
+    }
+
     #[test]
     fn test_row_store_insert() {
         let mut store = RowStore::new(test_schema());
@@ -1622,6 +1718,49 @@ mod tests {
         store.delete(1).unwrap();
         let results = store.index_scan("idx_value", Some(&KeyRange::only(Value::Int64(100))));
         assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_row_store_hash_index_point_lookup() {
+        let mut store = RowStore::new(test_schema_with_hash_index());
+        store
+            .insert(Row::new(1, vec![Value::Int64(1), Value::Int64(100)]))
+            .unwrap();
+        store
+            .insert(Row::new(2, vec![Value::Int64(2), Value::Int64(200)]))
+            .unwrap();
+
+        let results = store.index_scan("idx_value_hash", Some(&KeyRange::only(Value::Int64(200))));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id(), 2);
+    }
+
+    #[test]
+    fn test_row_store_hash_index_range_scan_is_correct() {
+        let mut store = RowStore::new(test_schema_with_hash_index());
+        store
+            .insert(Row::new(1, vec![Value::Int64(1), Value::Int64(100)]))
+            .unwrap();
+        store
+            .insert(Row::new(2, vec![Value::Int64(2), Value::Int64(200)]))
+            .unwrap();
+        store
+            .insert(Row::new(3, vec![Value::Int64(3), Value::Int64(300)]))
+            .unwrap();
+
+        let results = store.index_scan(
+            "idx_value_hash",
+            Some(&KeyRange::bound(
+                Value::Int64(150),
+                Value::Int64(300),
+                false,
+                false,
+            )),
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id(), 2);
+        assert_eq!(results[1].id(), 3);
     }
 
     #[test]

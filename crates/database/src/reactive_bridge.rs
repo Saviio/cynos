@@ -251,6 +251,27 @@ impl QueryRegistry {
         }
     }
 
+    fn flush_requery_changes(&self, changes: HashMap<TableId, HashSet<u64>>) {
+        let mut merged: HashMap<usize, (Rc<RefCell<ReQueryObservable>>, HashSet<u64>)> =
+            HashMap::new();
+
+        for (table_id, changed_ids) in changes {
+            if let Some(queries) = self.queries.get(&table_id) {
+                for query in queries {
+                    let key = Rc::as_ptr(query) as usize;
+                    let entry = merged
+                        .entry(key)
+                        .or_insert_with(|| (query.clone(), HashSet::new()));
+                    entry.1.extend(changed_ids.iter().copied());
+                }
+            }
+        }
+
+        for (_, (query, changed_ids)) in merged {
+            query.borrow_mut().on_change(&changed_ids);
+        }
+    }
+
     /// Handles table changes by batching and scheduling a flush.
     /// Multiple rapid changes are coalesced into a single re-query/propagation.
     pub fn on_table_change(&mut self, table_id: TableId, changed_ids: &HashSet<u64>) {
@@ -342,13 +363,7 @@ impl QueryRegistry {
                             pending_changes.borrow_mut().drain().collect();
                         {
                             let registry = self_ref_clone.borrow();
-                            for (table_id, changed_ids) in changes {
-                                if let Some(queries) = registry.queries.get(&table_id) {
-                                    for query in queries {
-                                        query.borrow_mut().on_change(&changed_ids);
-                                    }
-                                }
-                            }
+                            registry.flush_requery_changes(changes);
                         }
 
                         // GC: remove queries with no subscribers to prevent memory leaks
@@ -394,13 +409,7 @@ impl QueryRegistry {
         // Flush re-query changes
         let changes: HashMap<TableId, HashSet<u64>> =
             self.pending_changes.borrow_mut().drain().collect();
-        for (table_id, changed_ids) in changes {
-            if let Some(queries) = self.queries.get(&table_id) {
-                for query in queries {
-                    query.borrow_mut().on_change(&changed_ids);
-                }
-            }
-        }
+        self.flush_requery_changes(changes);
 
         self.gc_dead_queries();
     }
@@ -426,13 +435,7 @@ impl QueryRegistry {
         // Flush re-query changes
         let changes: HashMap<TableId, HashSet<u64>> =
             self.pending_changes.borrow_mut().drain().collect();
-        for (table_id, changed_ids) in changes {
-            if let Some(queries) = self.queries.get(&table_id) {
-                for query in queries {
-                    query.borrow_mut().on_change(&changed_ids);
-                }
-            }
-        }
+        self.flush_requery_changes(changes);
 
         self.gc_dead_queries();
     }
@@ -585,12 +588,7 @@ impl JsObservableQuery {
                 inner_unsub.borrow_mut().unsubscribe(sub_id);
             }
         }) as Box<dyn FnMut()>);
-        let js_fn: js_sys::Function = unsubscribe
-            .as_ref()
-            .unchecked_ref::<js_sys::Function>()
-            .clone();
-        unsubscribe.forget();
-        js_fn
+        unsubscribe.into_js_value().unchecked_into()
     }
 
     /// Returns the current result as a JavaScript array.
@@ -753,12 +751,7 @@ impl JsIvmObservableQuery {
                 inner_unsub.borrow_mut().unsubscribe(sub_id);
             }
         }) as Box<dyn FnMut()>);
-        let js_fn: js_sys::Function = unsubscribe
-            .as_ref()
-            .unchecked_ref::<js_sys::Function>()
-            .clone();
-        unsubscribe.forget();
-        js_fn
+        unsubscribe.into_js_value().unchecked_into()
     }
 
     /// Returns the current result as a JavaScript array.
@@ -913,12 +906,7 @@ impl JsChangesStream {
                 inner.borrow_mut().unsubscribe(sub_id);
             }
         }) as Box<dyn FnMut()>);
-        let js_fn: js_sys::Function = unsubscribe
-            .as_ref()
-            .unchecked_ref::<js_sys::Function>()
-            .clone();
-        unsubscribe.forget();
-        js_fn
+        unsubscribe.into_js_value().unchecked_into()
     }
 
     /// Returns the current result.

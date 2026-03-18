@@ -207,7 +207,10 @@ fn compile_node(
         PhysicalPlan::Empty => Some(DataflowNode::source(u32::MAX)), // sentinel
 
         // Non-incrementalizable — should have been caught by is_incrementalizable()
-        PhysicalPlan::Sort { .. } | PhysicalPlan::Limit { .. } | PhysicalPlan::TopN { .. } => None,
+        PhysicalPlan::Sort { .. }
+        | PhysicalPlan::Limit { .. }
+        | PhysicalPlan::TopN { .. }
+        | PhysicalPlan::Union { .. } => None,
     }
 }
 

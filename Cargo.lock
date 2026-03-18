@@ -244,6 +244,7 @@ version = "0.1.0"
 name = "cynos-database"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "cynos-binary",
  "cynos-core",
  "cynos-incremental",

@@ -1,8 +1,8 @@
 //! Physical query plan definitions.
 
-use crate::planner::IndexBounds;
 use crate::ast::JoinType;
 use crate::ast::{AggregateFunc, Expr, SortOrder};
+use crate::planner::IndexBounds;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -156,6 +156,13 @@ pub enum PhysicalPlan {
     CrossProduct {
         left: Box<PhysicalPlan>,
         right: Box<PhysicalPlan>,
+    },
+
+    /// Union of two relations.
+    Union {
+        left: Box<PhysicalPlan>,
+        right: Box<PhysicalPlan>,
+        all: bool,
     },
 
     /// No-op step (passes through input).
@@ -422,6 +429,15 @@ impl PhysicalPlan {
         }
     }
 
+    /// Creates a union plan.
+    pub fn union(left: PhysicalPlan, right: PhysicalPlan, all: bool) -> Self {
+        PhysicalPlan::Union {
+            left: Box::new(left),
+            right: Box::new(right),
+            all,
+        }
+    }
+
     /// Checks if this plan can be incrementalized.
     pub fn is_incrementalizable(&self) -> bool {
         match self {
@@ -440,6 +456,7 @@ impl PhysicalPlan {
             | PhysicalPlan::NestedLoopJoin { .. }
             | PhysicalPlan::IndexNestedLoopJoin { .. } => true,
             PhysicalPlan::CrossProduct { .. } => true,
+            PhysicalPlan::Union { .. } => false,
             PhysicalPlan::NoOp { input } => input.is_incrementalizable(),
             PhysicalPlan::Empty => true,
             PhysicalPlan::GinIndexScan { .. } | PhysicalPlan::GinIndexScanMulti { .. } => true,
@@ -466,7 +483,8 @@ impl PhysicalPlan {
             PhysicalPlan::HashJoin { left, right, .. }
             | PhysicalPlan::SortMergeJoin { left, right, .. }
             | PhysicalPlan::NestedLoopJoin { left, right, .. }
-            | PhysicalPlan::CrossProduct { left, right } => {
+            | PhysicalPlan::CrossProduct { left, right }
+            | PhysicalPlan::Union { left, right, .. } => {
                 alloc::vec![left.as_ref(), right.as_ref()]
             }
             PhysicalPlan::IndexNestedLoopJoin { outer, .. } => alloc::vec![outer.as_ref()],
@@ -512,7 +530,8 @@ impl PhysicalPlan {
             PhysicalPlan::HashJoin { left, right, .. }
             | PhysicalPlan::SortMergeJoin { left, right, .. }
             | PhysicalPlan::NestedLoopJoin { left, right, .. }
-            | PhysicalPlan::CrossProduct { left, right } => {
+            | PhysicalPlan::CrossProduct { left, right }
+            | PhysicalPlan::Union { left, right, .. } => {
                 left.collect_tables_into(tables);
                 right.collect_tables_into(tables);
             }

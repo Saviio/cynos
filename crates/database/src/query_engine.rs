@@ -215,8 +215,9 @@ fn register_table_context(cache: &TableCache, ctx: &mut ExecutionContext, table_
         let mut indexes = Vec::new();
         for idx in schema.indices() {
             let index_type = match idx.get_index_type() {
+                cynos_core::schema::IndexType::Hash => QueryIndexType::Hash,
+                cynos_core::schema::IndexType::BTree => QueryIndexType::BTree,
                 cynos_core::schema::IndexType::Gin => QueryIndexType::Gin,
-                _ => QueryIndexType::BTree,
             };
             indexes.push(
                 IndexInfo::new(

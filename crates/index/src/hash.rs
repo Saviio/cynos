@@ -3,7 +3,7 @@
 //! This module provides a hash-based index for O(1) point queries.
 
 use crate::stats::IndexStats;
-use crate::traits::{Index, IndexError, KeyRange};
+use crate::traits::{Index, IndexError, KeyRange, RangeIndex};
 use alloc::vec::Vec;
 use cynos_core::RowId;
 use hashbrown::HashMap;
@@ -134,6 +134,38 @@ impl<K: Eq + core::hash::Hash + Clone + Ord> Index<K> for HashIndex<K> {
             KeyRange::All => self.stats.total_rows(),
             KeyRange::Only(key) => self.map.get(key).map(|v| v.len()).unwrap_or(0),
             _ => self.stats.total_rows(), // Hash index doesn't efficiently support range queries
+        }
+    }
+}
+
+impl<K: Eq + core::hash::Hash + Clone + Ord> RangeIndex<K> for HashIndex<K> {
+    fn get_range(
+        &self,
+        range: Option<&KeyRange<K>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+    ) -> Vec<RowId> {
+        let mut entries: Vec<(&K, &Vec<RowId>)> = self
+            .map
+            .iter()
+            .filter(|(key, _)| match range {
+                Some(range) => range.contains(key),
+                None => true,
+            })
+            .collect();
+
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        if reverse {
+            entries.reverse();
+        }
+
+        let iter = entries
+            .into_iter()
+            .flat_map(|(_, row_ids)| row_ids.iter().copied());
+        match limit {
+            Some(limit) => iter.skip(skip).take(limit).collect(),
+            None => iter.skip(skip).collect(),
         }
     }
 }

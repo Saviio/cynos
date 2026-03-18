@@ -1,8 +1,8 @@
 //! Logical query plan definitions.
 
-use crate::planner::IndexBounds;
 use crate::ast::JoinType;
 use crate::ast::{AggregateFunc, Expr, SortOrder};
+use crate::planner::IndexBounds;
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -204,6 +204,15 @@ impl LogicalPlan {
         LogicalPlan::CrossProduct {
             left: Box::new(left),
             right: Box::new(right),
+        }
+    }
+
+    /// Creates a union plan.
+    pub fn union(left: LogicalPlan, right: LogicalPlan, all: bool) -> Self {
+        LogicalPlan::Union {
+            left: Box::new(left),
+            right: Box::new(right),
+            all,
         }
     }
 

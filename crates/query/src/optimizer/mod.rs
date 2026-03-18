@@ -249,9 +249,10 @@ impl Optimizer {
                 }
             }
 
-            LogicalPlan::Union { .. } => {
-                // Union not yet implemented in physical plan
-                PhysicalPlan::Empty
+            LogicalPlan::Union { left, right, all } => {
+                let left_physical = self.logical_to_physical(*left);
+                let right_physical = self.logical_to_physical(*right);
+                PhysicalPlan::union(left_physical, right_physical, all)
             }
 
             LogicalPlan::Empty => PhysicalPlan::Empty,

@@ -1,11 +1,11 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use std::boxed::Box;
 use cynos_core::{Row, Value};
 use cynos_query::ast::{Expr, SortOrder};
 use cynos_query::context::{ExecutionContext, IndexInfo, TableStats};
 use cynos_query::executor::{InMemoryDataSource, PhysicalPlanRunner};
 use cynos_query::optimizer::OrderByIndexPass;
 use cynos_query::planner::{IndexBounds, LogicalPlan, PhysicalPlan, QueryPlanner};
+use std::boxed::Box;
 
 fn create_join_reorder_case(
     large_rows: usize,
@@ -298,7 +298,8 @@ fn create_composite_bounds_case(
         },
     );
 
-    let optimized = QueryPlanner::new(ctx).plan(LogicalPlan::filter(LogicalPlan::scan("scores"), predicate));
+    let optimized =
+        QueryPlanner::new(ctx).plan(LogicalPlan::filter(LogicalPlan::scan("scores"), predicate));
     assert!(
         matches!(optimized, PhysicalPlan::IndexScan { .. }),
         "expected composite bounds to produce an index scan, got {:?}",

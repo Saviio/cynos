@@ -94,6 +94,12 @@ impl<'a> LimitSkipByIndexPass<'a> {
                 offset,
             },
 
+            PhysicalPlan::Union { left, right, all } => PhysicalPlan::Union {
+                left: Box::new(self.traverse(*left)),
+                right: Box::new(self.traverse(*right)),
+                all,
+            },
+
             PhysicalPlan::HashJoin {
                 left,
                 right,

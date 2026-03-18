@@ -287,7 +287,11 @@ impl QueryPlanner {
                 }
             }
 
-            LogicalPlan::Union { .. } => PhysicalPlan::Empty,
+            LogicalPlan::Union { left, right, all } => {
+                let left_physical = self.logical_to_physical(*left);
+                let right_physical = self.logical_to_physical(*right);
+                PhysicalPlan::union(left_physical, right_physical, all)
+            }
 
             LogicalPlan::Empty => PhysicalPlan::Empty,
         }
@@ -382,6 +386,21 @@ mod tests {
 
         // Should use IndexGet
         assert!(matches!(physical, PhysicalPlan::IndexGet { .. }));
+    }
+
+    #[test]
+    fn test_query_planner_union_lowers_to_physical_union() {
+        let ctx = create_test_context();
+        let planner = QueryPlanner::new(ctx);
+
+        let plan = LogicalPlan::union(
+            LogicalPlan::scan("users"),
+            LogicalPlan::scan("users"),
+            false,
+        );
+        let physical = planner.plan(plan);
+
+        assert!(matches!(physical, PhysicalPlan::Union { all: false, .. }));
     }
 
     #[test]

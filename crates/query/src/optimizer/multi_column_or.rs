@@ -198,6 +198,12 @@ impl<'a> MultiColumnOrPass<'a> {
                 right: Box::new(self.traverse(*right)),
             },
 
+            PhysicalPlan::Union { left, right, all } => PhysicalPlan::Union {
+                left: Box::new(self.traverse(*left)),
+                right: Box::new(self.traverse(*right)),
+                all,
+            },
+
             PhysicalPlan::NoOp { input } => PhysicalPlan::NoOp {
                 input: Box::new(self.traverse(*input)),
             },

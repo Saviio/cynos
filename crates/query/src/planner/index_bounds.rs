@@ -35,12 +35,9 @@ impl IndexBounds {
         include_end: bool,
     ) -> Self {
         match (range_start, range_end) {
-            (Some(start), Some(end)) => Self::Scalar(KeyRange::bound(
-                start,
-                end,
-                !include_start,
-                !include_end,
-            )),
+            (Some(start), Some(end)) => {
+                Self::Scalar(KeyRange::bound(start, end, !include_start, !include_end))
+            }
             (Some(start), None) => Self::Scalar(KeyRange::lower_bound(start, !include_start)),
             (None, Some(end)) => Self::Scalar(KeyRange::upper_bound(end, !include_end)),
             (None, None) => Self::Unbounded,

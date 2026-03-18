@@ -202,7 +202,10 @@ fn hash_index_bounds<H: Hasher>(bounds: &IndexBounds, hasher: &mut H) {
     }
 }
 
-fn hash_scalar_key_range<H: Hasher>(range: &cynos_index::KeyRange<cynos_core::Value>, hasher: &mut H) {
+fn hash_scalar_key_range<H: Hasher>(
+    range: &cynos_index::KeyRange<cynos_core::Value>,
+    hasher: &mut H,
+) {
     match range {
         cynos_index::KeyRange::All => hasher.write(b"all"),
         cynos_index::KeyRange::Only(value) => {

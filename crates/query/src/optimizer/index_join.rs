@@ -178,6 +178,12 @@ impl<'a> IndexJoinPass<'a> {
                 right: Box::new(self.traverse(*right)),
             },
 
+            PhysicalPlan::Union { left, right, all } => PhysicalPlan::Union {
+                left: Box::new(self.traverse(*left)),
+                right: Box::new(self.traverse(*right)),
+                all,
+            },
+
             PhysicalPlan::NoOp { input } => PhysicalPlan::NoOp {
                 input: Box::new(self.traverse(*input)),
             },
@@ -369,6 +375,9 @@ impl<'a> IndexJoinPass<'a> {
                     / 10,
                 1,
             ),
+            PhysicalPlan::Union { left, right, .. } => self
+                .estimate_rows(left)
+                .saturating_add(self.estimate_rows(right)),
             PhysicalPlan::IndexNestedLoopJoin { outer, .. } => self.estimate_rows(outer),
             PhysicalPlan::Empty => 0,
         }
