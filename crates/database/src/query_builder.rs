@@ -846,6 +846,30 @@ impl SelectBuilder {
         SchemaLayout::new(columns, row_stride, null_mask_size)
     }
 
+    fn binary_output_layout(
+        &self,
+        table_name: &str,
+        schema: &Table,
+    ) -> Result<SchemaLayout, JsValue> {
+        if self.frozen_base.is_some()
+            || !self.joins.is_empty()
+            || !self.group_by_cols.is_empty()
+            || !self.aggregates.is_empty()
+        {
+            return Ok(self.describe_output()?.layout());
+        }
+
+        if let Some(cols) = self.parse_columns() {
+            Ok(self.create_projection_layout(&cols))
+        } else {
+            Ok(self
+                .schema_layout_cache
+                .borrow_mut()
+                .get_or_create_full(table_name, schema)
+                .clone())
+        }
+    }
+
     /// Gets column info for JOIN conditions, checking both the main table and the join table.
     /// Returns (table_name, column_index, data_type).
     ///
@@ -1501,10 +1525,6 @@ impl SelectBuilder {
     /// The layout can be cached by JS for repeated queries on the same table.
     #[wasm_bindgen(js_name = getSchemaLayout)]
     pub fn get_schema_layout(&self) -> Result<crate::binary_protocol::SchemaLayout, JsValue> {
-        if self.frozen_base.is_some() {
-            return Ok(self.describe_output()?.layout());
-        }
-
         let table_name = self
             .from_table
             .as_ref()
@@ -1516,17 +1536,7 @@ impl SelectBuilder {
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
         let schema = store.schema();
-
-        let layout = if let Some(cols) = self.parse_columns() {
-            self.create_projection_layout(&cols)
-        } else {
-            self.schema_layout_cache
-                .borrow_mut()
-                .get_or_create_full(table_name, schema)
-                .clone()
-        };
-
-        Ok(layout)
+        self.binary_output_layout(table_name, schema)
     }
 
     /// Executes the query and returns a binary result buffer.
@@ -1546,16 +1556,7 @@ impl SelectBuilder {
         // Build logical plan
         let plan = self.build_logical_plan(table_name);
         let schema = store.schema();
-        let layout = if self.frozen_base.is_some() {
-            self.describe_output()?.layout()
-        } else if let Some(cols) = self.parse_columns() {
-            self.create_projection_layout(&cols)
-        } else {
-            self.schema_layout_cache
-                .borrow_mut()
-                .get_or_create_full(table_name, schema)
-                .clone()
-        };
+        let layout = self.binary_output_layout(table_name, schema)?;
 
         // Compute plan fingerprint for caching
         let fingerprint = compute_plan_fingerprint(&plan);

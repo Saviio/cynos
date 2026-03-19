@@ -139,6 +139,41 @@ impl Value {
             DataType::Jsonb => Value::Null,
         }
     }
+
+    /// Returns true when two values compare equal under SQL-style join/filter semantics.
+    ///
+    /// This is intentionally more permissive than `PartialEq` for integer widths so
+    /// `Int32(42)` and `Int64(42)` can match in predicates and join keys while the
+    /// raw `Value` equality/hash semantics still preserve type identity for storage
+    /// keys, grouping, and index internals.
+    #[inline]
+    pub fn sql_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Int32(a), Value::Int64(b)) => (*a as i64) == *b,
+            (Value::Int64(a), Value::Int32(b)) => *a == (*b as i64),
+            _ => self == other,
+        }
+    }
+
+    /// Hashes a value under SQL-style join/filter semantics.
+    ///
+    /// This normalizes integer widths so `Int32(42)` and `Int64(42)` hash to the
+    /// same bucket when used as join keys, without changing the default `Hash`
+    /// implementation used by storage and grouping paths.
+    #[inline]
+    pub fn sql_hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Int32(value) => {
+                u8::MAX.hash(state);
+                (*value as i64).hash(state);
+            }
+            Value::Int64(value) => {
+                u8::MAX.hash(state);
+                value.hash(state);
+            }
+            _ => self.hash(state),
+        }
+    }
 }
 
 impl PartialEq for Value {
@@ -328,6 +363,22 @@ where
 mod tests {
     use super::*;
     use alloc::vec;
+    use core::hash::Hasher;
+
+    #[derive(Default)]
+    struct TestHasher(u64);
+
+    impl Hasher for TestHasher {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            for &byte in bytes {
+                self.0 = self.0.wrapping_mul(16777619).wrapping_add(byte as u64);
+            }
+        }
+    }
 
     #[test]
     fn test_value_type_check() {
@@ -359,6 +410,29 @@ mod tests {
         assert_ne!(Value::Int32(42), Value::Int64(42));
         assert_eq!(Value::Null, Value::Null);
         assert_eq!(Value::String("test".into()), Value::String("test".into()));
+    }
+
+    #[test]
+    fn test_value_sql_equality_normalizes_integer_widths() {
+        assert!(Value::Int32(42).sql_eq(&Value::Int64(42)));
+        assert!(Value::Int64(42).sql_eq(&Value::Int32(42)));
+        assert!(!Value::Int32(42).sql_eq(&Value::Int64(7)));
+        assert!(!Value::Int32(42).sql_eq(&Value::Float64(42.0)));
+    }
+
+    #[test]
+    fn test_sql_value_ref_hash_normalizes_integer_widths() {
+        let left = Value::Int32(42);
+        let right = Value::Int64(42);
+
+        let mut left_hasher = TestHasher::default();
+        left.sql_hash(&mut left_hasher);
+
+        let mut right_hasher = TestHasher::default();
+        right.sql_hash(&mut right_hasher);
+
+        assert_eq!(left_hasher.finish(), right_hasher.finish());
+        assert!(left.sql_eq(&right));
     }
 
     #[test]

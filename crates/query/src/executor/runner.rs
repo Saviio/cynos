@@ -7,6 +7,7 @@
 use crate::ast::{AggregateFunc, BinaryOp, ColumnRef, Expr, SortOrder, UnaryOp};
 use crate::executor::{
     AggregateExecutor, LimitExecutor, Relation, RelationEntry, SharedTables, SortExecutor,
+    SqlValueRef,
 };
 use crate::planner::{IndexBounds, PhysicalPlan};
 use alloc::boxed::Box;
@@ -4376,8 +4377,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
     #[inline]
     fn eval_binary_op_bool(&self, op: BinaryOp, left: &Value, right: &Value) -> bool {
         match op {
-            BinaryOp::Eq => left == right,
-            BinaryOp::Ne => left != right,
+            BinaryOp::Eq => left.sql_eq(right),
+            BinaryOp::Ne => !left.sql_eq(right),
             BinaryOp::Lt => left < right,
             BinaryOp::Le => left <= right,
             BinaryOp::Gt => left > right,
@@ -4453,13 +4454,16 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         let layout = Self::join_output_layout(left, right, output_tables);
         let shared_tables = Self::shared_tables_from_layout(&layout);
 
-        let mut hash_table: hashbrown::HashMap<&Value, Vec<u32>> =
+        let mut hash_table: hashbrown::HashMap<SqlValueRef<'_>, Vec<u32>> =
             hashbrown::HashMap::with_capacity(build_rel.len());
 
         for (index, entry) in build_rel.entries.iter().enumerate() {
             if let Some(key_value) = entry.get_field(build_key_idx) {
                 if !key_value.is_null() {
-                    hash_table.entry(key_value).or_default().push(index as u32);
+                    hash_table
+                        .entry(SqlValueRef::new(key_value))
+                        .or_default()
+                        .push(index as u32);
                 }
             }
         }
@@ -4468,7 +4472,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             let mut matched = false;
             if let Some(key_value) = probe_entry.get_field(probe_key_idx) {
                 if !key_value.is_null() {
-                    if let Some(build_indices) = hash_table.get(key_value) {
+                    if let Some(build_indices) = hash_table.get(&SqlValueRef::new(key_value)) {
                         matched = true;
                         for &build_index in build_indices {
                             let build_entry = &build_rel.entries[build_index as usize];
@@ -5485,8 +5489,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         }
 
         match op {
-            BinaryOp::Eq => Value::Boolean(left == right),
-            BinaryOp::Ne => Value::Boolean(left != right),
+            BinaryOp::Eq => Value::Boolean(left.sql_eq(right)),
+            BinaryOp::Ne => Value::Boolean(!left.sql_eq(right)),
             BinaryOp::Lt => Value::Boolean(left < right),
             BinaryOp::Le => Value::Boolean(left <= right),
             BinaryOp::Gt => Value::Boolean(left > right),
@@ -6908,6 +6912,59 @@ mod tests {
         ds
     }
 
+    fn create_cross_width_join_data_source() -> InMemoryDataSource {
+        let mut ds = InMemoryDataSource::new();
+
+        let users = vec![
+            Row::new(
+                1,
+                vec![
+                    Value::Int64(1),
+                    Value::String("Alice".into()),
+                    Value::Int32(10),
+                ],
+            ),
+            Row::new(
+                2,
+                vec![
+                    Value::Int64(2),
+                    Value::String("Bob".into()),
+                    Value::Int32(20),
+                ],
+            ),
+            Row::new(
+                3,
+                vec![
+                    Value::Int64(3),
+                    Value::String("Charlie".into()),
+                    Value::Int32(10),
+                ],
+            ),
+        ];
+        ds.add_table("users_mixed", users, 3);
+
+        let depts = vec![
+            Row::new(
+                10,
+                vec![Value::Int64(10), Value::String("Engineering".into())],
+            ),
+            Row::new(20, vec![Value::Int64(20), Value::String("Sales".into())]),
+        ];
+        ds.add_table("departments_mixed", depts, 2);
+
+        ds
+    }
+
+    fn create_cross_width_filter_data_source() -> InMemoryDataSource {
+        let mut ds = InMemoryDataSource::new();
+        let rows = vec![
+            Row::new(1, vec![Value::Int32(10), Value::Int64(10)]),
+            Row::new(2, vec![Value::Int32(20), Value::Int64(30)]),
+        ];
+        ds.add_table("mixed_numeric", rows, 2);
+        ds
+    }
+
     fn relation_snapshot(relation: Relation) -> Vec<(u64, u64, Vec<Value>)> {
         relation
             .entries
@@ -7502,6 +7559,47 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_join_matches_across_integer_widths() {
+        let ds = create_cross_width_join_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("users_mixed"),
+            PhysicalPlan::table_scan("departments_mixed"),
+            Expr::eq(
+                Expr::column("users_mixed", "dept_id", 2),
+                Expr::column("departments_mixed", "id", 0),
+            ),
+            JoinType::Inner,
+        );
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.tables(), &["users_mixed", "departments_mixed"]);
+    }
+
+    #[test]
+    fn test_filter_column_equality_matches_across_integer_widths() {
+        let ds = create_cross_width_filter_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let plan = PhysicalPlan::filter(
+            PhysicalPlan::table_scan("mixed_numeric"),
+            Expr::eq(
+                Expr::column("mixed_numeric", "lhs", 0),
+                Expr::column("mixed_numeric", "rhs", 1),
+            ),
+        );
+        let result = runner.execute(&plan).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.entries[0].row.values(),
+            &[Value::Int32(10), Value::Int64(10)]
+        );
+    }
+
+    #[test]
     fn test_index_nested_loop_join_preserves_logical_output_order() {
         let ds = create_test_data_source();
         let runner = PhysicalPlanRunner::new(&ds);
@@ -7584,6 +7682,28 @@ mod tests {
         );
 
         assert_full_execution_artifact_matches(&plan);
+    }
+
+    #[test]
+    fn test_full_execution_artifact_matches_hash_join_across_integer_widths() {
+        let ds = create_cross_width_join_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("users_mixed"),
+            PhysicalPlan::table_scan("departments_mixed"),
+            Expr::eq(
+                Expr::column("users_mixed", "dept_id", 2),
+                Expr::column("departments_mixed", "id", 0),
+            ),
+            JoinType::Inner,
+        );
+
+        let expected = relation_snapshot(runner.execute(&plan).unwrap());
+        let artifact = runner.compile_execution_artifact_with_data_source(&plan);
+        let actual = relation_snapshot(runner.execute_with_artifact(&plan, &artifact).unwrap());
+        assert_eq!(actual, expected);
+        assert_eq!(actual.len(), 3);
     }
 
     #[test]

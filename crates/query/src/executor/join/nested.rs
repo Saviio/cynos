@@ -63,7 +63,7 @@ impl NestedLoopJoin {
 
     /// Executes the nested loop join with equality comparison.
     pub fn execute(&self, left: Relation, right: Relation) -> Relation {
-        self.execute_with_predicate(left, right, |l, r| l == r)
+        self.execute_with_predicate(left, right, |l, r| l.sql_eq(r))
     }
 
     /// Executes the nested loop join with a custom predicate.

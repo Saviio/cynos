@@ -1,0 +1,13 @@
+{
+  "name": "@cynos/scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "engine:compare": "node ./engine_compare.mjs"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.4.0",
+    "rxdb": "^16.21.1",
+    "sql.js": "^1.14.1"
+  }
+}

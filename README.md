@@ -3,6 +3,8 @@
 
 > Warning: Cynos is still under active development and is not production-ready. APIs, crate boundaries, and performance characteristics may change.
 
+Cynos is an embedded in-memory relational engine built for low-latency live queries, incremental maintenance, and efficient WASM/JS delivery.
+
 Cynos is a Rust workspace for an in-memory relational engine, a rule/heuristic query planner, incremental dataflow, reactive subscriptions, and a WASM-backed JavaScript/TypeScript package.
 
 The public JS package lives in `js/packages/core` as `@cynos/core`. The Rust crates are organized so the lower layers stay reusable and mostly `#![no_std]`, while the host-facing WASM and benchmark crates depend on a full runtime.
@@ -19,6 +21,54 @@ The public JS package lives in `js/packages/core` as `@cynos/core`. The Rust cra
 - Binary query results via `execBinary()` + `getSchemaLayout()` + `ResultSet` for low-overhead WASM-to-JS transfer.
 - JSONB building blocks including a compact binary codec, a JSONPath subset parser/evaluator, JSONB operators, and extraction helpers for GIN indexing.
 - Journaled in-memory transactions with commit/rollback APIs.
+
+## Advantages
+
+Cynos is designed for embedded, query-heavy applications where the hot working set lives in memory and live queries are part of the runtime, not layered on later.
+
+That gives it a different design target from SQLite, RxDB, and PGlite:
+
+| Compared with | Better known for | Cynos is typically stronger when... |
+| --- | --- | --- |
+| SQLite | Durable embedded SQL storage, broad compatibility, and tiny operational footprint | the data is already memory-resident and engine-native live queries or low-overhead WASM result delivery matter more than persistence |
+| RxDB | Local-first sync, reactive document collections, `RxQuery`, query cache, and EventReduce-based updates | the workload needs relational joins, aggregates, JSONB-style querying, and reactive delivery from one execution engine |
+| PGlite | PostgreSQL compatibility in WASM with ecosystem reuse | a tighter embedded execution path and purpose-built reactive APIs matter more than PostgreSQL compatibility |
+
+Core advantages:
+
+- Live queries are first-class: `observe()` / `changes()` return full current results, while `trace()` returns DBSP-style `{ added, removed }` deltas.
+- Hot paths are compiled and cached: physical plans, execution artifacts, fused single-table fast paths, and row-local reactive patching reduce repeat-query overhead.
+- The WASM/JS boundary is optimized too: `execBinary()` plus `SchemaLayout` can avoid most JS object materialization cost on larger results.
+- The workspace stays modular: storage, planner, indexes, JSONB, incremental dataflow, and host bindings are separated, with lower layers kept largely `no_std + alloc` friendly.
+
+Representative recent local measurements, on Node.js + WASM with 10K-row / 10K-document datasets, are shown below as workload-specific reference points rather than universal claims:
+
+| Workload | Cynos | Representative comparison | What it suggests |
+| --- | ---: | ---: | --- |
+| Relational join (`users JOIN departments ... LIMIT 1000`) | `5.82 ms` | PGlite `8.25 ms` | Cynos can be competitive on embedded relational execution, not only on live-query APIs |
+| Wide scan (`LIMIT 5000`) via plain `exec()` vs `execBinary()` | `17.42 ms` -> `0.823 ms` engine-side / `2.66 ms` with decode | same Cynos query, different transport path | Binary delivery is one of Cynos's clearest advantages in WASM embeddings |
+| Live update latency | `changes(): 0.52 ms`, `trace(): 0.043 ms` | PGlite live query `3.52 ms` | Cynos is especially strong when live queries are part of the hot path |
+| JSONB compound filter with and without metadata index | `0.425 ms` vs `16.65 ms` | `39.14x` speedup from the same Cynos workload | JSONB performance depends materially on index design, and Cynos can benefit strongly when indexed well |
+| Approximate compressed runtime assets used in the local harness | `~315 KiB gzip` | sql.js `~340 KiB gzip`; PGlite core+live `~4.85 MiB gzip` | Cynos stays relatively compact for a relational + reactive WASM runtime, especially relative to a PostgreSQL-compatible stack |
+
+A few important caveats to keep the comparison fair:
+
+- In the same local harness, SQLite (`sql.js`) remained faster on very small point lookups, scalar JSON reads, and some aggregate-heavy paths.
+- RxDB remained faster on warm cached document reads; Cynos's advantage is the unified relational + JSONB + reactive engine, not cache-hit document lookup latency alone.
+- The compressed footprint row above compares the concrete runtime assets used in the local harness, not every possible bundle configuration; actual shipped size depends on packaging, tree-shaking, and which optional features are included.
+- PGlite remains the better fit when PostgreSQL compatibility and ecosystem reuse are the primary requirements.
+
+Best fit:
+
+- in-memory dashboards, local analytics, collaborative views, and client-side derived state;
+- browser / edge / WASM applications where query latency and JS materialization cost both matter;
+- workloads that repeatedly execute the same query shapes and benefit from cached execution or incremental maintenance.
+
+Less ideal when durability, SQL compatibility, or sync ecosystem breadth matter more than in-memory reactive performance:
+
+- choose SQLite when durable embedded SQL storage is the main requirement;
+- choose RxDB when offline sync and document-centric replication are the main requirement;
+- choose PGlite when PostgreSQL compatibility in WASM is the main requirement.
 
 ## Repository Layout
 

@@ -1,33 +1,11 @@
 //! Hash Join implementation.
 
-use crate::executor::{Relation, RelationEntry, SharedTables};
+use crate::executor::{Relation, RelationEntry, SharedTables, SqlValueRef};
 use alloc::rc::Rc;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::hash::{Hash, Hasher};
 use cynos_core::{Row, Value};
 use hashbrown::HashMap;
-
-/// A wrapper around Value reference that implements Hash and Eq for use as HashMap key.
-/// This avoids cloning Value during hash table operations.
-#[derive(Clone, Copy)]
-struct ValueRef<'a>(&'a Value);
-
-impl<'a> Hash for ValueRef<'a> {
-    #[inline]
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl<'a> PartialEq for ValueRef<'a> {
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl<'a> Eq for ValueRef<'a> {}
 
 /// Hash Join executor.
 ///
@@ -94,14 +72,14 @@ impl HashJoin {
         };
 
         // Build phase: create hash table mapping key values to entry indices
-        let mut hash_table: HashMap<ValueRef<'_>, Vec<u32>> =
+        let mut hash_table: HashMap<SqlValueRef<'_>, Vec<u32>> =
             HashMap::with_capacity(build_rel.len());
 
         for (idx, entry) in build_rel.entries.iter().enumerate() {
             if let Some(key_value) = entry.get_field(build_key_idx) {
                 if !key_value.is_null() {
                     hash_table
-                        .entry(ValueRef(key_value))
+                        .entry(SqlValueRef::new(key_value))
                         .or_default()
                         .push(idx as u32);
                 }
@@ -143,7 +121,7 @@ impl HashJoin {
 
             if let Some(kv) = key_value {
                 if !kv.is_null() {
-                    if let Some(build_indices) = hash_table.get(&ValueRef(kv)) {
+                    if let Some(build_indices) = hash_table.get(&SqlValueRef::new(kv)) {
                         matched = true;
                         for &build_idx in build_indices {
                             let build_entry = &build_rel.entries[build_idx as usize];

@@ -10,6 +10,7 @@ mod relation;
 mod runner;
 mod scan;
 mod sort;
+mod sql_value_ref;
 
 pub use aggregate::AggregateExecutor;
 pub use filter::FilterExecutor;
@@ -24,3 +25,4 @@ pub use runner::{
 };
 pub use scan::{IndexScanExecutor, TableScanExecutor};
 pub use sort::SortExecutor;
+pub(crate) use sql_value_ref::SqlValueRef;

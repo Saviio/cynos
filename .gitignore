@@ -25,3 +25,4 @@ js/packages/*/dist
 js/packages/*/node_modules
 node_modules
 example/dist
+/tmp/

@@ -1459,6 +1459,39 @@ describe('4. JOIN 操作', () => {
       expect(result).toHaveLength(4); // Alice, Bob, Charlie, David
     });
 
+    it('应该匹配 Int32 外键和 Int64 主键', async () => {
+      const db = new Database('inner_join_mixed_width');
+
+      const employeesBuilder = db.createTable('employees')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+        .column('dept_id', JsDataType.Int32, null);
+      db.registerTable(employeesBuilder);
+
+      const departmentsBuilder = db.createTable('departments')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null);
+      db.registerTable(departmentsBuilder);
+
+      await db.insert('departments').values([
+        { id: 1, name: 'Engineering' },
+        { id: 2, name: 'Sales' },
+      ]).exec();
+      await db.insert('employees').values([
+        { id: 1, name: 'Alice', dept_id: 1 },
+        { id: 2, name: 'Bob', dept_id: 2 },
+      ]).exec();
+
+      const result = await execAndVerifyBinary(
+        db.select('*')
+          .from('employees')
+          .innerJoin('departments', col('dept_id').eq('id'))
+      );
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toHaveProperty('departments.id');
+    });
+
     it('应该正确合并两表的列', async () => {
       const db = createJoinTestDb('inner_join_2');
       await db.insert('departments').values(departments).exec();
