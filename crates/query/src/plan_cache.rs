@@ -8,9 +8,11 @@ use crate::ast::Expr;
 use crate::executor::{DataSource, InMemoryDataSource, PhysicalPlanRunner, PlanExecutionArtifact};
 use crate::planner::{IndexBounds, LogicalPlan, PhysicalPlan};
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::hash::Hasher;
+use cynos_core::{Row, RowId};
 
 /// A simple hasher for computing plan fingerprints.
 /// Uses FNV-1a algorithm which is fast and has good distribution.
@@ -447,6 +449,21 @@ impl CompiledPhysicalPlan {
     pub fn artifact(&self) -> &PlanExecutionArtifact {
         &self.artifact
     }
+
+    #[doc(hidden)]
+    pub fn reactive_patch_table(&self) -> Option<&str> {
+        self.artifact.reactive_patch_table()
+    }
+
+    #[doc(hidden)]
+    pub fn apply_reactive_patch(
+        &self,
+        current_rows: &mut Vec<Rc<Row>>,
+        changed_rows: &[(RowId, Option<Rc<Row>>)],
+    ) -> Option<bool> {
+        self.artifact
+            .apply_reactive_patch(current_rows, changed_rows)
+    }
 }
 
 /// Cache entry with access tracking for LRU eviction.
@@ -680,9 +697,10 @@ mod tests {
     use crate::ast::{Expr, JoinType};
     use crate::executor::{InMemoryDataSource, PhysicalPlanRunner};
     use alloc::boxed::Box;
+    use alloc::rc::Rc;
     use alloc::string::String;
     use alloc::vec;
-    use cynos_core::Value;
+    use cynos_core::{Row, Value};
 
     #[test]
     fn test_plan_fingerprint_same_plan() {
@@ -877,6 +895,155 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(2)));
+    }
+
+    #[test]
+    fn test_compiled_plan_reactive_patch_updates_single_table_filter() {
+        let plan = PhysicalPlan::filter(
+            PhysicalPlan::table_scan("users"),
+            Expr::gt(
+                Expr::column("users", "age", 1),
+                Expr::literal(Value::Int32(30)),
+            ),
+        );
+        let compiled = CompiledPhysicalPlan::new(plan);
+
+        let mut current_rows = vec![Rc::new(Row::new_with_version(
+            2,
+            1,
+            vec![Value::Int64(2), Value::Int32(35)],
+        ))];
+
+        let changed_rows = vec![
+            (
+                1,
+                Some(Rc::new(Row::new_with_version(
+                    1,
+                    2,
+                    vec![Value::Int64(1), Value::Int32(31)],
+                ))),
+            ),
+            (
+                2,
+                Some(Rc::new(Row::new_with_version(
+                    2,
+                    2,
+                    vec![Value::Int64(2), Value::Int32(29)],
+                ))),
+            ),
+            (
+                3,
+                Some(Rc::new(Row::new_with_version(
+                    3,
+                    2,
+                    vec![Value::Int64(3), Value::Int32(20)],
+                ))),
+            ),
+        ];
+
+        let changed = compiled
+            .apply_reactive_patch(&mut current_rows, &changed_rows)
+            .expect("single-table filter should support reactive patching");
+
+        assert!(changed);
+        assert_eq!(current_rows.len(), 1);
+        assert_eq!(current_rows[0].id(), 1);
+        assert_eq!(current_rows[0].version(), 2);
+        assert_eq!(current_rows[0].get(1), Some(&Value::Int32(31)));
+    }
+
+    #[test]
+    fn test_compiled_plan_reactive_patch_projects_rows() {
+        let plan = PhysicalPlan::project(
+            PhysicalPlan::filter(
+                PhysicalPlan::table_scan("users"),
+                Expr::gt(
+                    Expr::column("users", "age", 2),
+                    Expr::literal(Value::Int32(30)),
+                ),
+            ),
+            vec![Expr::column("users", "name", 1)],
+        );
+        let compiled = CompiledPhysicalPlan::new(plan);
+
+        let mut current_rows = vec![Rc::new(Row::new_with_version(
+            2,
+            1,
+            vec![Value::String("Bob".into())],
+        ))];
+
+        let changed_rows = vec![
+            (
+                1,
+                Some(Rc::new(Row::new_with_version(
+                    1,
+                    3,
+                    vec![
+                        Value::Int64(1),
+                        Value::String("Alice".into()),
+                        Value::Int32(31),
+                    ],
+                ))),
+            ),
+            (
+                2,
+                Some(Rc::new(Row::new_with_version(
+                    2,
+                    4,
+                    vec![
+                        Value::Int64(2),
+                        Value::String("Bobby".into()),
+                        Value::Int32(36),
+                    ],
+                ))),
+            ),
+        ];
+
+        let changed = compiled
+            .apply_reactive_patch(&mut current_rows, &changed_rows)
+            .expect("single-table project/filter should support reactive patching");
+
+        assert!(changed);
+        assert_eq!(current_rows.len(), 2);
+        assert_eq!(current_rows[0].id(), 1);
+        assert_eq!(current_rows[0].version(), 3);
+        assert_eq!(current_rows[0].values(), &[Value::String("Alice".into())]);
+        assert_eq!(current_rows[1].id(), 2);
+        assert_eq!(current_rows[1].version(), 4);
+        assert_eq!(current_rows[1].values(), &[Value::String("Bobby".into())]);
+    }
+
+    #[test]
+    fn test_compiled_plan_reactive_patch_skips_limit_pipeline() {
+        let plan = PhysicalPlan::limit(
+            PhysicalPlan::filter(
+                PhysicalPlan::table_scan("users"),
+                Expr::gt(
+                    Expr::column("users", "age", 1),
+                    Expr::literal(Value::Int32(30)),
+                ),
+            ),
+            10,
+            0,
+        );
+        let compiled = CompiledPhysicalPlan::new(plan);
+
+        let mut current_rows = Vec::new();
+        let changed_rows = vec![(
+            1,
+            Some(Rc::new(Row::new_with_version(
+                1,
+                1,
+                vec![Value::Int64(1), Value::Int32(31)],
+            ))),
+        )];
+
+        assert!(
+            compiled
+                .apply_reactive_patch(&mut current_rows, &changed_rows)
+                .is_none(),
+            "LIMIT pipelines should keep using the generic re-query path"
+        );
     }
 
     // ==================== Defect 2 Test: invalidate_table should be targeted ====================

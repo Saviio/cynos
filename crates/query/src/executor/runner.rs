@@ -603,6 +603,131 @@ pub struct PlanExecutionArtifact {
     kind: PlanExecutionArtifactKind,
 }
 
+impl PlanExecutionArtifact {
+    #[doc(hidden)]
+    pub fn reactive_patch_table(&self) -> Option<&str> {
+        match &self.kind {
+            PlanExecutionArtifactKind::SingleTablePipeline(pipeline)
+                if pipeline.limit.is_none() =>
+            {
+                Some(&pipeline.table)
+            }
+            PlanExecutionArtifactKind::FilteredTableScan { table, .. } => Some(table),
+            _ => None,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn apply_reactive_patch(
+        &self,
+        current_rows: &mut Vec<Rc<Row>>,
+        changed_rows: &[(u64, Option<Rc<Row>>)],
+    ) -> Option<bool> {
+        match &self.kind {
+            PlanExecutionArtifactKind::SingleTablePipeline(pipeline)
+                if pipeline.limit.is_none() =>
+            {
+                Some(Self::apply_single_table_pipeline_patch(
+                    pipeline,
+                    current_rows,
+                    changed_rows,
+                ))
+            }
+            PlanExecutionArtifactKind::FilteredTableScan { predicate, .. } => Some(
+                Self::apply_filtered_table_scan_patch(predicate, current_rows, changed_rows),
+            ),
+            _ => None,
+        }
+    }
+
+    fn apply_single_table_pipeline_patch(
+        pipeline: &CachedSingleTablePipeline,
+        current_rows: &mut Vec<Rc<Row>>,
+        changed_rows: &[(u64, Option<Rc<Row>>)],
+    ) -> bool {
+        let evaluator_ds = InMemoryDataSource::new();
+        let evaluator = PhysicalPlanRunner::new(&evaluator_ds);
+        let mut ordered_changes: Vec<_> = changed_rows.iter().collect();
+        ordered_changes.sort_unstable_by_key(|(row_id, _)| *row_id);
+
+        let mut changed = false;
+        for &(row_id, ref maybe_row) in &ordered_changes {
+            let projected = maybe_row
+                .as_ref()
+                .and_then(|row| evaluator.project_pipeline_row(pipeline, row));
+            changed |= Self::patch_row_by_id(current_rows, *row_id, projected);
+        }
+
+        changed
+    }
+
+    fn apply_filtered_table_scan_patch(
+        predicate: &CompiledRowPredicate,
+        current_rows: &mut Vec<Rc<Row>>,
+        changed_rows: &[(u64, Option<Rc<Row>>)],
+    ) -> bool {
+        let evaluator_ds = InMemoryDataSource::new();
+        let evaluator = PhysicalPlanRunner::new(&evaluator_ds);
+        let mut ordered_changes: Vec<_> = changed_rows.iter().collect();
+        ordered_changes.sort_unstable_by_key(|(row_id, _)| *row_id);
+
+        let mut changed = false;
+        for &(row_id, ref maybe_row) in &ordered_changes {
+            let projected = maybe_row.as_ref().and_then(|row| {
+                if matches!(
+                    evaluator.eval_compiled_row_predicate(row.as_ref(), predicate),
+                    PredicateValueState::Boolean(true)
+                ) {
+                    Some(Rc::clone(row))
+                } else {
+                    None
+                }
+            });
+            changed |= Self::patch_row_by_id(current_rows, *row_id, projected);
+        }
+
+        changed
+    }
+
+    fn patch_row_by_id(
+        current_rows: &mut Vec<Rc<Row>>,
+        row_id: u64,
+        next_row: Option<Rc<Row>>,
+    ) -> bool {
+        match current_rows.binary_search_by_key(&row_id, |row| row.id()) {
+            Ok(index) => match next_row {
+                Some(row) => {
+                    if Self::rows_equal(current_rows[index].as_ref(), row.as_ref()) {
+                        false
+                    } else {
+                        current_rows[index] = row;
+                        true
+                    }
+                }
+                None => {
+                    current_rows.remove(index);
+                    true
+                }
+            },
+            Err(index) => {
+                if let Some(row) = next_row {
+                    current_rows.insert(index, row);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn rows_equal(left: &Row, right: &Row) -> bool {
+        left.id() == right.id()
+            && left.version() == right.version()
+            && left.values() == right.values()
+    }
+}
+
 /// Error type for plan execution.
 #[derive(Clone, Debug)]
 pub enum ExecutionError {
@@ -2667,6 +2792,36 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 Ok(continue_scan)
             }
         }
+    }
+
+    fn project_pipeline_row(
+        &self,
+        pipeline: &CachedSingleTablePipeline,
+        row: &Rc<Row>,
+    ) -> Option<Rc<Row>> {
+        if !self.row_matches_filters(row.as_ref(), &pipeline.filters) {
+            return None;
+        }
+
+        Some(match &pipeline.projection {
+            CachedSingleTableProjection::Identity => Rc::clone(row),
+            CachedSingleTableProjection::Columns(indices) => Rc::new(Row::new_with_version(
+                row.id(),
+                row.version(),
+                indices
+                    .iter()
+                    .map(|&index| row.get(index).cloned().unwrap_or(Value::Null))
+                    .collect(),
+            )),
+            CachedSingleTableProjection::Exprs(exprs) => Rc::new(Row::new_with_version(
+                row.id(),
+                row.version(),
+                exprs
+                    .iter()
+                    .map(|expr| self.eval_row_expr(expr, row.as_ref()))
+                    .collect(),
+            )),
+        })
     }
 
     fn collect_cached_single_table_pipeline_rows(

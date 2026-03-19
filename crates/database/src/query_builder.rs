@@ -1293,8 +1293,10 @@ impl SelectBuilder {
         Ok(obj.into())
     }
 
-    /// Creates an observable query using re-query strategy.
-    /// When data changes, the cached physical plan is re-executed (no optimization overhead).
+    /// Creates an observable query using the cached execution path.
+    /// When data changes, the engine reuses the compiled plan and can apply
+    /// row-local patches for simple single-table pipelines instead of always
+    /// re-executing the full query.
     pub fn observe(&self) -> Result<JsObservableQuery, JsValue> {
         let table_name = self
             .from_table

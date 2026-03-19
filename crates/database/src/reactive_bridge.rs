@@ -32,7 +32,8 @@ use wasm_bindgen::prelude::*;
 /// A re-query based observable that re-executes the query on each change.
 /// This leverages the query optimizer and indexes for optimal performance.
 /// The physical plan and lowered execution artifact are cached to avoid repeated
-/// optimization and predicate lowering overhead.
+/// optimization and predicate lowering overhead. Simple single-table pipelines
+/// also use a row-local patch path to avoid full re-execution when possible.
 pub struct ReQueryObservable {
     /// The cached compiled plan to execute
     compiled_plan: CompiledPhysicalPlan,
@@ -116,12 +117,29 @@ impl ReQueryObservable {
     /// Skips re-query entirely if there are no subscribers.
     ///
     /// `changed_ids` contains the row IDs that were modified.
-    /// The current implementation keeps the parameter for API compatibility,
-    /// while result equality remains fully deterministic.
-    pub fn on_change(&mut self, _changed_ids: &HashSet<u64>) {
+    /// For simple single-table pipelines this enables a row-local fast path;
+    /// all other plans fall back to deterministic full-result comparison.
+    pub fn on_change(&mut self, changed_ids: &HashSet<u64>) {
         // Skip re-query if no subscribers - major optimization for unused observables
         if self.subscriptions.is_empty() {
             return;
+        }
+
+        if let Some(changed_rows) = self.collect_fast_path_rows(changed_ids) {
+            match self
+                .compiled_plan
+                .apply_reactive_patch(&mut self.result, &changed_rows)
+            {
+                Some(true) => {
+                    self.result_summary = QueryResultSummary::from_rows(&self.result);
+                    for (_, callback) in &self.subscriptions {
+                        callback(&self.result);
+                    }
+                    return;
+                }
+                Some(false) => return,
+                None => {}
+            }
         }
 
         // Re-execute the cached compiled plan (no optimization or lowering overhead)
@@ -148,6 +166,20 @@ impl ReQueryObservable {
                 // Query execution failed, keep old result
             }
         }
+    }
+
+    fn collect_fast_path_rows(
+        &self,
+        changed_ids: &HashSet<u64>,
+    ) -> Option<Vec<(u64, Option<Rc<Row>>)>> {
+        let table_name = self.compiled_plan.reactive_patch_table()?;
+        let cache = self.cache.borrow();
+        let store = cache.get_table(table_name)?;
+        let mut changed_rows = Vec::with_capacity(changed_ids.len());
+        for &row_id in changed_ids {
+            changed_rows.push((row_id, store.get(row_id)));
+        }
+        Some(changed_rows)
     }
 
     /// Compares two result sets using a precomputed summary captured during execution.
