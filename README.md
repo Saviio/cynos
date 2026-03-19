@@ -41,22 +41,25 @@ Core advantages:
 - The WASM/JS boundary is optimized too: `execBinary()` plus `SchemaLayout` can avoid most JS object materialization cost on larger results.
 - The workspace stays modular: storage, planner, indexes, JSONB, incremental dataflow, and host bindings are separated, with lower layers kept largely `no_std + alloc` friendly.
 
-Representative recent local measurements, on Node.js + WASM with 10K-row / 10K-document datasets, are shown below as workload-specific reference points rather than universal claims:
+Representative recent local measurements, on Node.js + WASM with both 10K and 100K row/document datasets, are shown below as workload-specific reference points rather than universal claims:
 
 | Workload | Cynos | Representative comparison | What it suggests |
 | --- | ---: | ---: | --- |
-| Relational join (`users JOIN departments ... LIMIT 1000`) | `5.82 ms` | PGlite `8.25 ms` | Cynos can be competitive on embedded relational execution, not only on live-query APIs |
-| Wide scan (`LIMIT 5000`) via plain `exec()` vs `execBinary()` | `17.42 ms` -> `0.823 ms` engine-side / `2.66 ms` with decode | same Cynos query, different transport path | Binary delivery is one of Cynos's clearest advantages in WASM embeddings |
-| Live update latency | `changes(): 0.52 ms`, `trace(): 0.043 ms` | PGlite live query `3.52 ms` | Cynos is especially strong when live queries are part of the hot path |
-| JSONB compound filter with and without metadata index | `0.425 ms` vs `16.65 ms` | `39.14x` speedup from the same Cynos workload | JSONB performance depends materially on index design, and Cynos can benefit strongly when indexed well |
+| Relational join (`users JOIN departments ... LIMIT 1000`) | `7.52 ms` at 10K, `11.49 ms` at 100K | PGlite `9.43 ms` at 10K, `10.38 ms` at 100K | Cynos is in the same practical range for embedded relational execution, not only for live-query APIs |
+| Wide scan (`LIMIT 5000`) via plain `exec()` vs `execBinary()` | `17.23 ms -> 1.27 ms` at 10K, `19.05 ms -> 1.11 ms` at 100K | same Cynos query, different transport path | Binary delivery remains one of Cynos's clearest advantages in WASM embeddings |
+| Live update latency | `changes(): 0.744 ms`, `trace(): 0.024 ms` at 10K; `changes(): 3.67 ms`, `trace(): 0.020 ms` at 100K | PGlite live query `3.90 ms` at 10K, `8.44 ms` at 100K | Cynos is especially strong when live queries are part of the hot path, and `trace()` stays close to constant here |
+| JSONB compound filter with and without metadata index | `0.613 ms` vs `16.84 ms` at 10K; `5.83 ms` vs `16.76 ms` at 100K | same Cynos workload | JSONB performance depends materially on index design; in this harness the current metadata index helps compound filters much more than it helps every JSON query shape |
 | Approximate compressed runtime assets used in the local harness | `~315 KiB gzip` | sql.js `~340 KiB gzip`; PGlite core+live `~4.85 MiB gzip` | Cynos stays relatively compact for a relational + reactive WASM runtime, especially relative to a PostgreSQL-compatible stack |
 
 A few important caveats to keep the comparison fair:
 
 - In the same local harness, SQLite (`sql.js`) remained faster on very small point lookups, scalar JSON reads, and some aggregate-heavy paths.
 - RxDB remained faster on warm cached document reads; Cynos's advantage is the unified relational + JSONB + reactive engine, not cache-hit document lookup latency alone.
+- On the current 100K document benchmark, Cynos's metadata index does not improve every JSON path query shape yet; the strongest benefit in this harness is on compound filters, which makes the benchmark useful as an optimizer/index-planning regression check.
 - The compressed footprint row above compares the concrete runtime assets used in the local harness, not every possible bundle configuration; actual shipped size depends on packaging, tree-shaking, and which optional features are included.
 - PGlite remains the better fit when PostgreSQL compatibility and ecosystem reuse are the primary requirements.
+
+The cross-engine WASM comparison harness that produced these numbers lives in `scripts/engine_compare.mjs` and currently runs both 10K and 100K scenarios.
 
 Best fit:
 
@@ -85,6 +88,7 @@ Less ideal when durability, SQL compatibility, or sync ecosystem breadth matter 
 | `crates/database` | WASM/JS-facing database API that stitches the other crates together |
 | `crates/perf` | Custom benchmark runner for the workspace |
 | `js/packages/core` | Published NPM package `@cynos/core` |
+| `scripts` | Cross-engine benchmark and comparison scripts |
 | `example` | Vite demo app for live queries, binary protocol, and performance experiments |
 
 ## Architecture Overview

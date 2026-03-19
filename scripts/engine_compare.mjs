@@ -74,14 +74,26 @@ const { getRxStorageMemory } = rxdbStorageMemoryModule;
 
 const SQLJS_WASM_DIR = path.dirname(resolveExternal('sql.js/dist/sql-wasm.js'));
 
-const USER_COUNT = 10_000;
 const DEPT_COUNT = 100;
-const DOC_COUNT = 10_000;
+const DEFAULT_DATASET_SIZES = [10_000, 100_000];
 const QUERY_REPEATS = 9;
 const WARMUP_ROUNDS = 5;
 const LIVE_UPDATES = 12;
 const LIVE_WARMUP_UPDATES = 3;
 const LIVE_TIMEOUT_MS = 2_000;
+const USER_BATCH_SIZE = 1_000;
+const DOC_BATCH_SIZE = 500;
+
+function parseDatasetSizes(raw) {
+  const values = String(raw ?? '')
+    .split(',')
+    .map((value) => Number.parseInt(value.trim(), 10))
+    .filter((value) => Number.isFinite(value) && value > 0);
+
+  return values.length > 0 ? values : DEFAULT_DATASET_SIZES;
+}
+
+const DATASET_SIZES = parseDatasetSizes(process.env.CYNOS_ENGINE_COMPARE_SIZES);
 
 function uniqueId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -141,15 +153,20 @@ function sqlString(value) {
   return `'${String(value).replace(/'/g, "''")}'`;
 }
 
-function makeUsers() {
+function formatCountLabel(count) {
+  if (count % 1000 === 0) return `${count / 1000}K`;
+  return count.toLocaleString();
+}
+
+function makeUsers(userCount, deptCount) {
   const tiers = ['bronze', 'silver', 'gold', 'platinum'];
   const cities = ['shanghai', 'beijing', 'shenzhen', 'hangzhou', 'chengdu'];
   const rows = [];
-  for (let i = 1; i <= USER_COUNT; i++) {
+  for (let i = 1; i <= userCount; i++) {
     rows.push({
       id: i,
       age: 20 + (i % 50),
-      dept_id: i % DEPT_COUNT,
+      dept_id: i % deptCount,
       score: Number(((i % 1000) / 10).toFixed(1)),
       active: i % 3 !== 0,
       tier: tiers[i % tiers.length],
@@ -160,10 +177,10 @@ function makeUsers() {
   return rows;
 }
 
-function makeDepartments() {
+function makeDepartments(deptCount) {
   const regions = ['east', 'north', 'south', 'west'];
   const rows = [];
-  for (let i = 0; i < DEPT_COUNT; i++) {
+  for (let i = 0; i < deptCount; i++) {
     rows.push({
       id: i,
       name: `dept_${i}`,
@@ -173,25 +190,25 @@ function makeDepartments() {
   return rows;
 }
 
-const USERS = makeUsers();
-const DEPARTMENTS = makeDepartments();
-const RX_USERS = USERS.map((row) => ({
-  id: String(row.id),
-  age: row.age,
-  deptId: row.dept_id,
-  score: row.score,
-  active: row.active,
-  tier: row.tier,
-  name: row.name,
-  city: row.city,
-}));
+function toRxUser(row) {
+  return {
+    id: String(row.id),
+    age: row.age,
+    deptId: row.dept_id,
+    score: row.score,
+    active: row.active,
+    tier: row.tier,
+    name: row.name,
+    city: row.city,
+  };
+}
 
-function makeDocuments() {
+function makeDocuments(docCount) {
   const categories = ['tech', 'business', 'science', 'health', 'sports'];
   const statuses = ['published', 'draft', 'archived'];
   const regions = ['apac', 'emea', 'amer'];
   const rows = [];
-  for (let i = 1; i <= DOC_COUNT; i++) {
+  for (let i = 1; i <= docCount; i++) {
     const category = categories[(i - 1) % categories.length];
     const status = statuses[(i - 1) % statuses.length];
     const priority = ((i - 1) % 5) + 1;
@@ -242,8 +259,45 @@ function makeMatchingDocument(id) {
   };
 }
 
-const DOCUMENTS = makeDocuments();
-const RX_DOCUMENTS = DOCUMENTS.map(toRxDocument);
+function makeLiveUserRow(id) {
+  return {
+    id,
+    age: 30,
+    dept_id: 42,
+    score: 88.8,
+    active: true,
+    tier: 'gold',
+    name: `live_${id}`,
+    city: 'shanghai',
+  };
+}
+
+const datasetCache = new Map();
+
+function getDatasetFixture(size) {
+  if (datasetCache.has(size)) {
+    return datasetCache.get(size);
+  }
+
+  const users = makeUsers(size, DEPT_COUNT);
+  const departments = makeDepartments(DEPT_COUNT);
+  const documents = makeDocuments(size);
+  const fixture = {
+    label: formatCountLabel(size),
+    userCount: size,
+    docCount: size,
+    deptCount: DEPT_COUNT,
+    pointLookupId: Math.max(1, Math.floor(size * 0.9)),
+    users,
+    departments,
+    rxUsers: users.map(toRxUser),
+    documents,
+    rxDocuments: documents.map(toRxDocument),
+  };
+
+  datasetCache.set(size, fixture);
+  return fixture;
+}
 
 let cynosReady;
 async function ensureCynosReady() {
@@ -282,7 +336,7 @@ async function benchmark(fn, { repeats = QUERY_REPEATS, warmup = WARMUP_ROUNDS }
   };
 }
 
-async function withCynos(fn) {
+async function withCynos(fixture, fn) {
   await ensureCynosReady();
   const db = new CynosDatabase(uniqueId('cmp_cynos'));
   const users = db.createTable('users')
@@ -302,8 +356,8 @@ async function withCynos(fn) {
     .column('region', JsDataType.String, null);
   db.registerTable(users);
   db.registerTable(departments);
-  await db.insert('users').values(USERS).exec();
-  await db.insert('departments').values(DEPARTMENTS).exec();
+  await db.insert('users').values(fixture.users).exec();
+  await db.insert('departments').values(fixture.departments).exec();
   try {
     return await fn(db);
   } finally {
@@ -311,7 +365,7 @@ async function withCynos(fn) {
   }
 }
 
-async function withPGlite(fn) {
+async function withPGlite(fixture, fn) {
   const db = new PGlite({ extensions: { live } });
   await db.exec(`
     create table users(
@@ -334,13 +388,13 @@ async function withPGlite(fn) {
   `);
 
   await db.exec('begin');
-  const deptValues = DEPARTMENTS
+  const deptValues = fixture.departments
     .map((row) => `(${row.id}, ${sqlString(row.name)}, ${sqlString(row.region)})`)
     .join(',');
   await db.exec(`insert into departments(id, name, region) values ${deptValues};`);
 
-  for (let start = 0; start < USERS.length; start += 1000) {
-    const batch = USERS.slice(start, start + 1000)
+  for (let start = 0; start < fixture.users.length; start += USER_BATCH_SIZE) {
+    const batch = fixture.users.slice(start, start + USER_BATCH_SIZE)
       .map((row) => `(${row.id}, ${row.age}, ${row.dept_id}, ${row.score}, ${row.active}, ${sqlString(row.tier)}, ${sqlString(row.name)}, ${sqlString(row.city)})`)
       .join(',');
     await db.exec(`insert into users(id, age, dept_id, score, active, tier, name, city) values ${batch};`);
@@ -354,7 +408,7 @@ async function withPGlite(fn) {
   }
 }
 
-async function withSqlite(fn) {
+async function withSqlite(fixture, fn) {
   const SQL = await ensureSqlJsReady();
   const db = new SQL.Database();
   db.run(`
@@ -378,14 +432,14 @@ async function withSqlite(fn) {
   `);
 
   const insertDept = db.prepare('insert into departments(id, name, region) values (?, ?, ?)');
-  for (const row of DEPARTMENTS) insertDept.run([row.id, row.name, row.region]);
+  for (const row of fixture.departments) insertDept.run([row.id, row.name, row.region]);
   insertDept.free();
 
   db.run('begin transaction');
   const insertUser = db.prepare(
     'insert into users(id, age, dept_id, score, active, tier, name, city) values (?, ?, ?, ?, ?, ?, ?, ?)',
   );
-  for (const row of USERS) {
+  for (const row of fixture.users) {
     insertUser.run([row.id, row.age, row.dept_id, row.score, row.active ? 1 : 0, row.tier, row.name, row.city]);
   }
   insertUser.free();
@@ -398,7 +452,7 @@ async function withSqlite(fn) {
   }
 }
 
-async function withRxdb(fn) {
+async function withRxdb(fixture, fn) {
   const db = await createRxDatabase({
     name: uniqueId('cmp_rxdb'),
     storage: getRxStorageMemory(),
@@ -424,7 +478,7 @@ async function withRxdb(fn) {
   };
 
   const { users } = await db.addCollections({ users: { schema } });
-  await users.bulkInsert(RX_USERS);
+  await users.bulkInsert(fixture.rxUsers);
 
   try {
     return await fn({ db, users });
@@ -433,7 +487,7 @@ async function withRxdb(fn) {
   }
 }
 
-async function withCynosDocuments(fn, { metadataIndex = true } = {}) {
+async function withCynosDocuments(fixture, fn, { metadataIndex = true } = {}) {
   await ensureCynosReady();
   const db = new CynosDatabase(uniqueId('cmp_cynos_docs'));
   let documents = db.createTable('documents')
@@ -446,7 +500,7 @@ async function withCynosDocuments(fn, { metadataIndex = true } = {}) {
     documents = documents.index('idx_documents_metadata', 'metadata');
   }
   db.registerTable(documents);
-  await db.insert('documents').values(DOCUMENTS).exec();
+  await db.insert('documents').values(fixture.documents).exec();
   try {
     return await fn(db);
   } finally {
@@ -454,7 +508,7 @@ async function withCynosDocuments(fn, { metadataIndex = true } = {}) {
   }
 }
 
-async function withPGliteDocuments(fn) {
+async function withPGliteDocuments(fixture, fn) {
   const db = new PGlite();
   await db.exec(`
     create table documents(
@@ -475,8 +529,8 @@ async function withPGliteDocuments(fn) {
   `);
 
   await db.exec('begin');
-  for (let start = 0; start < DOCUMENTS.length; start += 500) {
-    const batch = DOCUMENTS.slice(start, start + 500)
+  for (let start = 0; start < fixture.documents.length; start += DOC_BATCH_SIZE) {
+    const batch = fixture.documents.slice(start, start + DOC_BATCH_SIZE)
       .map((row) => `(${row.id}, ${sqlString(row.title)}, ${row.updated_at}, ${sqlString(JSON.stringify(row.metadata))}::jsonb)`)
       .join(',');
     await db.exec(`insert into documents(id, title, updated_at, metadata) values ${batch};`);
@@ -490,7 +544,7 @@ async function withPGliteDocuments(fn) {
   }
 }
 
-async function withSqliteDocuments(fn) {
+async function withSqliteDocuments(fixture, fn) {
   const SQL = await ensureSqlJsReady();
   const db = new SQL.Database();
   db.run(`
@@ -516,7 +570,7 @@ async function withSqliteDocuments(fn) {
   const stmt = db.prepare(
     'insert into documents(id, title, updated_at, metadata) values (?, ?, ?, ?)',
   );
-  for (const row of DOCUMENTS) {
+  for (const row of fixture.documents) {
     stmt.run([row.id, row.title, row.updated_at, JSON.stringify(row.metadata)]);
   }
   stmt.free();
@@ -529,7 +583,7 @@ async function withSqliteDocuments(fn) {
   }
 }
 
-async function withRxdbDocuments(fn) {
+async function withRxdbDocuments(fixture, fn) {
   const db = await createRxDatabase({
     name: uniqueId('cmp_rxdb_docs'),
     storage: getRxStorageMemory(),
@@ -571,7 +625,7 @@ async function withRxdbDocuments(fn) {
   };
 
   const { documents } = await db.addCollections({ documents: { schema } });
-  await documents.bulkInsert(RX_DOCUMENTS);
+  await documents.bulkInsert(fixture.rxDocuments);
 
   try {
     return await fn({ db, documents });
@@ -580,9 +634,9 @@ async function withRxdbDocuments(fn) {
   }
 }
 
-async function measureCynos() {
-  return withCynos(async (db) => {
-    const pointQuery = db.select('*').from('users').where(col('id').eq(9000));
+async function measureCynos(fixture) {
+  return withCynos(fixture, async (db) => {
+    const pointQuery = db.select('*').from('users').where(col('id').eq(fixture.pointLookupId));
     const filter100Query = db.select('*').from('users').where(col('age').gt(60)).limit(100);
     const scan5000Query = db.select('*').from('users').limit(5000);
     const orderedRange500Query = db
@@ -624,7 +678,7 @@ async function measureCynos() {
       : null;
     const aggregate = await benchmark(async () => {
       const rows = await aggregateQuery.exec();
-      if (rows.length !== DEPT_COUNT) throw new Error(`unexpected Cynos aggregate rows: ${rows.length}`);
+      if (rows.length !== fixture.deptCount) throw new Error(`unexpected Cynos aggregate rows: ${rows.length}`);
     });
 
     const filter100Layout = filter100Query.getSchemaLayout();
@@ -678,8 +732,8 @@ async function measureCynos() {
     const scan5000BinaryBytes = scanBuffer.len();
     scanBuffer.free();
 
-    const liveChanges = await measureCynosLive(db, 'changes', 1000);
-    const liveTrace = await measureCynosLive(db, 'trace', 2000);
+    const liveChanges = await measureCynosLive(db, fixture, 'changes', 1000);
+    const liveTrace = await measureCynosLive(db, fixture, 'trace', 2000);
 
     return {
       point,
@@ -704,7 +758,7 @@ async function measureCynos() {
   });
 }
 
-async function measureCynosLive(db, mode, baseOffset) {
+async function measureCynosLive(db, fixture, mode, baseOffset) {
   const query = db.select('*').from('users').where(col('dept_id').eq(42));
   const observable = mode === 'trace' ? query.trace() : query.changes();
 
@@ -735,17 +789,17 @@ async function measureCynosLive(db, mode, baseOffset) {
   }
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const id = USER_COUNT + baseOffset + i;
+    const id = fixture.userCount + baseOffset + i;
     const wait = nextUpdate();
-    await db.insert('users').values([{ id, age: 30, dept_id: 42, score: 88.8, active: true, tier: 'gold', name: `warm_${id}`, city: 'shanghai' }]).exec();
+    await db.insert('users').values([{ ...makeLiveUserRow(id), name: `warm_${id}` }]).exec();
     await withTimeout(wait, LIVE_TIMEOUT_MS, `Cynos ${mode} warmup update`);
   }
 
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const id = USER_COUNT + baseOffset + LIVE_WARMUP_UPDATES + i;
+    const id = fixture.userCount + baseOffset + LIVE_WARMUP_UPDATES + i;
     const wait = nextUpdate();
     const start = performance.now();
-    await db.insert('users').values([{ id, age: 30, dept_id: 42, score: 88.8, active: true, tier: 'gold', name: `live_${id}`, city: 'shanghai' }]).exec();
+    await db.insert('users').values([{ ...makeLiveUserRow(id), name: `live_${id}` }]).exec();
     await withTimeout(wait, LIVE_TIMEOUT_MS, `Cynos ${mode} update`);
     latencies.push(performance.now() - start);
   }
@@ -758,10 +812,10 @@ async function measureCynosLive(db, mode, baseOffset) {
   };
 }
 
-async function measurePGlite() {
-  return withPGlite(async (db) => {
+async function measurePGlite(fixture) {
+  return withPGlite(fixture, async (db) => {
     const point = await benchmark(async () => {
-      const result = await db.query('select * from users where id = $1', [9000]);
+      const result = await db.query('select * from users where id = $1', [fixture.pointLookupId]);
       if (result.rows.length !== 1) throw new Error(`unexpected PGlite point rows: ${result.rows.length}`);
     });
     const filter100 = await benchmark(async () => {
@@ -792,14 +846,14 @@ async function measurePGlite() {
     });
     const aggregate = await benchmark(async () => {
       const result = await db.query('select dept_id, count(*) as count from users group by dept_id');
-      if (result.rows.length !== DEPT_COUNT) throw new Error(`unexpected PGlite aggregate rows: ${result.rows.length}`);
+      if (result.rows.length !== fixture.deptCount) throw new Error(`unexpected PGlite aggregate rows: ${result.rows.length}`);
     });
-    const liveQuery = await measurePGliteLive(db);
+    const liveQuery = await measurePGliteLive(db, fixture);
     return { point, filter100, scan5000, orderedRange500, join1000, aggregate, liveQuery };
   });
 }
 
-async function measurePGliteLive(db) {
+async function measurePGliteLive(db, fixture) {
   const query = await db.live.incrementalQuery(
     'select * from users where dept_id = $1 order by id',
     [42],
@@ -821,7 +875,7 @@ async function measurePGliteLive(db) {
   });
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const id = USER_COUNT + 3000 + i;
+    const id = fixture.userCount + 3000 + i;
     const wait = nextUpdate();
     await db.query(
       'insert into users(id, age, dept_id, score, active, tier, name, city) values ($1, $2, $3, $4, $5, $6, $7, $8)',
@@ -831,7 +885,7 @@ async function measurePGliteLive(db) {
   }
 
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const id = USER_COUNT + 3000 + LIVE_WARMUP_UPDATES + i;
+    const id = fixture.userCount + 3000 + LIVE_WARMUP_UPDATES + i;
     const wait = nextUpdate();
     const start = performance.now();
     await db.query(
@@ -850,8 +904,8 @@ async function measurePGliteLive(db) {
   };
 }
 
-async function measureSqlite() {
-  return withSqlite(async (db) => {
+async function measureSqlite(fixture) {
+  return withSqlite(fixture, async (db) => {
     const pointStmt = db.prepare('select * from users where id = ?');
     const filterStmt = db.prepare('select * from users where age > ? limit 100');
     const scanStmt = db.prepare('select * from users limit 5000');
@@ -866,7 +920,7 @@ async function measureSqlite() {
     const aggStmt = db.prepare('select dept_id, count(*) as count from users group by dept_id');
 
     const point = await benchmark(async () => {
-      pointStmt.bind([9000]);
+      pointStmt.bind([fixture.pointLookupId]);
       const rows = [];
       while (pointStmt.step()) rows.push(pointStmt.getAsObject());
       pointStmt.reset();
@@ -918,7 +972,7 @@ async function measureSqlite() {
         count += 1;
       }
       aggStmt.reset();
-      if (count !== DEPT_COUNT) throw new Error(`unexpected SQLite aggregate rows: ${count}`);
+      if (count !== fixture.deptCount) throw new Error(`unexpected SQLite aggregate rows: ${count}`);
     });
 
     pointStmt.free();
@@ -931,10 +985,10 @@ async function measureSqlite() {
   });
 }
 
-async function measureRxdb() {
-  return withRxdb(async ({ users }) => {
+async function measureRxdb(fixture) {
+  return withRxdb(fixture, async ({ users }) => {
     const point = await benchmark(async () => {
-      const doc = await users.findOne('9000').exec();
+      const doc = await users.findOne(String(fixture.pointLookupId)).exec();
       if (!doc) throw new Error('RxDB point lookup failed');
     });
     const filter100 = await benchmark(async () => {
@@ -945,12 +999,12 @@ async function measureRxdb() {
       const docs = await users.find({ selector: {}, limit: 5000 }).exec();
       if (docs.length !== 5000) throw new Error(`unexpected RxDB scan docs: ${docs.length}`);
     });
-    const liveQuery = await measureRxdbLive(users);
+    const liveQuery = await measureRxdbLive(users, fixture);
     return { point, filter100, scan5000, liveQuery };
   });
 }
 
-async function measureRxdbLive(users) {
+async function measureRxdbLive(users, fixture) {
   const query = users.find({ selector: { deptId: { $eq: 42 } } });
   let expectInitial = true;
   let initialSeen = false;
@@ -976,14 +1030,14 @@ async function measureRxdbLive(users) {
   if (!initialSeen) expectInitial = false;
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const id = String(USER_COUNT + 4000 + i);
+    const id = String(fixture.userCount + 4000 + i);
     const wait = nextUpdate();
     await users.insert({ id, age: 30, deptId: 42, score: 88.8, active: true, tier: 'gold', name: `warm_${id}`, city: 'shanghai' });
     await withTimeout(wait, LIVE_TIMEOUT_MS, 'RxDB live warmup update');
   }
 
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const id = String(USER_COUNT + 4000 + LIVE_WARMUP_UPDATES + i);
+    const id = String(fixture.userCount + 4000 + LIVE_WARMUP_UPDATES + i);
     const wait = nextUpdate();
     const start = performance.now();
     await users.insert({ id, age: 30, deptId: 42, score: 88.8, active: true, tier: 'gold', name: `live_${id}`, city: 'shanghai' });
@@ -1058,12 +1112,12 @@ async function measureCynosDocumentQueries(db) {
   };
 }
 
-async function measureCynosDocuments() {
-  return withCynosDocuments(async (db) => {
+async function measureCynosDocuments(fixture) {
+  return withCynosDocuments(fixture, async (db) => {
     const documentQueries = await measureCynosDocumentQueries(db);
-    const mutationDriven = await measureCynosDocumentMutation(db);
-    const reactiveChanges = await measureCynosDocumentReactive(db, 'changes', 10_000);
-    const reactiveTrace = await measureCynosDocumentReactive(db, 'trace', 20_000);
+    const mutationDriven = await measureCynosDocumentMutation(db, fixture);
+    const reactiveChanges = await measureCynosDocumentReactive(db, fixture, 'changes', 10_000);
+    const reactiveTrace = await measureCynosDocumentReactive(db, fixture, 'trace', 20_000);
 
     return {
       ...documentQueries,
@@ -1082,8 +1136,9 @@ function pickCynosDocumentQueryMetrics(measurement) {
   };
 }
 
-async function measureCynosJsonIndexImpact(withIndexMeasurement) {
+async function measureCynosJsonIndexImpact(fixture, withIndexMeasurement) {
   const withoutIndex = await withCynosDocuments(
+    fixture,
     async (db) => measureCynosDocumentQueries(db),
     { metadataIndex: false },
   );
@@ -1094,7 +1149,7 @@ async function measureCynosJsonIndexImpact(withIndexMeasurement) {
   };
 }
 
-async function measureCynosDocumentMutation(db) {
+async function measureCynosDocumentMutation(db, fixture) {
   const query = db
     .select('*')
     .from('documents')
@@ -1107,7 +1162,7 @@ async function measureCynosDocumentMutation(db) {
     .limit(20);
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + 1_000 + i);
+    const row = makeMatchingDocument(fixture.docCount + 1_000 + i);
     await db.insert('documents').values([row]).exec();
     const result = await query.exec();
     if (result[0]?.updated_at !== row.updated_at) {
@@ -1117,7 +1172,7 @@ async function measureCynosDocumentMutation(db) {
 
   const samples = [];
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + 1_000 + LIVE_WARMUP_UPDATES + i);
+    const row = makeMatchingDocument(fixture.docCount + 1_000 + LIVE_WARMUP_UPDATES + i);
     const start = performance.now();
     await db.insert('documents').values([row]).exec();
     const result = await query.exec();
@@ -1134,7 +1189,7 @@ async function measureCynosDocumentMutation(db) {
   };
 }
 
-async function measureCynosDocumentReactive(db, mode, baseOffset) {
+async function measureCynosDocumentReactive(db, fixture, mode, baseOffset) {
   const query = db
     .select('*')
     .from('documents')
@@ -1171,14 +1226,14 @@ async function measureCynosDocumentReactive(db, mode, baseOffset) {
   }
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + baseOffset + i);
+    const row = makeMatchingDocument(fixture.docCount + baseOffset + i);
     const wait = nextUpdate();
     await db.insert('documents').values([row]).exec();
     await withTimeout(wait, LIVE_TIMEOUT_MS, `Cynos JSON ${mode} warmup update`);
   }
 
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + baseOffset + LIVE_WARMUP_UPDATES + i);
+    const row = makeMatchingDocument(fixture.docCount + baseOffset + LIVE_WARMUP_UPDATES + i);
     const wait = nextUpdate();
     const start = performance.now();
     await db.insert('documents').values([row]).exec();
@@ -1194,8 +1249,8 @@ async function measureCynosDocumentReactive(db, mode, baseOffset) {
   };
 }
 
-async function measureRxdbDocuments() {
-  return withRxdbDocuments(async ({ documents }) => {
+async function measureRxdbDocuments(fixture) {
+  return withRxdbDocuments(fixture, async ({ documents }) => {
     const jsonSingleQuery = {
       selector: { 'metadata.category': { $eq: 'tech' } },
       limit: 100,
@@ -1235,8 +1290,8 @@ async function measureRxdbDocuments() {
       if (docs.length !== complexSortedExpected) throw new Error(`unexpected RxDB JSON sorted docs: ${docs.length}`);
     });
 
-    const mutationDriven = await measureRxdbDocumentMutation(documents);
-    const reactiveQuery = await measureRxdbDocumentReactive(documents);
+    const mutationDriven = await measureRxdbDocumentMutation(documents, fixture);
+    const reactiveQuery = await measureRxdbDocumentReactive(documents, fixture);
 
     return {
       jsonSingle,
@@ -1248,8 +1303,8 @@ async function measureRxdbDocuments() {
   });
 }
 
-async function measurePGliteDocuments() {
-  return withPGliteDocuments(async (db) => {
+async function measurePGliteDocuments(fixture) {
+  return withPGliteDocuments(fixture, async (db) => {
     const jsonSingleSql = `
       select *
       from documents
@@ -1297,7 +1352,7 @@ async function measurePGliteDocuments() {
       }
     });
 
-    const mutationDriven = await measurePGliteDocumentMutation(db);
+    const mutationDriven = await measurePGliteDocumentMutation(db, fixture);
 
     return {
       jsonSingle,
@@ -1308,7 +1363,7 @@ async function measurePGliteDocuments() {
   });
 }
 
-async function measurePGliteDocumentMutation(db) {
+async function measurePGliteDocumentMutation(db, fixture) {
   const sql = `
     select *
     from documents
@@ -1320,7 +1375,7 @@ async function measurePGliteDocumentMutation(db) {
   `;
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + 7_000 + i);
+    const row = makeMatchingDocument(fixture.docCount + 7_000 + i);
     await db.query(
       'insert into documents(id, title, updated_at, metadata) values ($1, $2, $3, $4::jsonb)',
       [row.id, row.title, row.updated_at, JSON.stringify(row.metadata)],
@@ -1333,7 +1388,7 @@ async function measurePGliteDocumentMutation(db) {
 
   const samples = [];
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + 7_000 + LIVE_WARMUP_UPDATES + i);
+    const row = makeMatchingDocument(fixture.docCount + 7_000 + LIVE_WARMUP_UPDATES + i);
     const start = performance.now();
     await db.query(
       'insert into documents(id, title, updated_at, metadata) values ($1, $2, $3, $4::jsonb)',
@@ -1353,8 +1408,8 @@ async function measurePGliteDocumentMutation(db) {
   };
 }
 
-async function measureSqliteDocuments() {
-  return withSqliteDocuments(async (db) => {
+async function measureSqliteDocuments(fixture) {
+  return withSqliteDocuments(fixture, async (db) => {
     const jsonSingleStmt = db.prepare(`
       select *
       from documents
@@ -1396,7 +1451,7 @@ async function measureSqliteDocuments() {
       if (count !== complexSortedExpected) throw new Error(`unexpected SQLite JSON sorted rows: ${count}`);
     });
 
-    const mutationDriven = await measureSqliteDocumentMutation(db);
+    const mutationDriven = await measureSqliteDocumentMutation(db, fixture);
 
     jsonSingleStmt.free();
     jsonCompoundStmt.free();
@@ -1422,7 +1477,7 @@ function countSqliteRows(stmt, params) {
   return count;
 }
 
-async function measureSqliteDocumentMutation(db) {
+async function measureSqliteDocumentMutation(db, fixture) {
   const query = db.prepare(`
     select *
     from documents
@@ -1437,7 +1492,7 @@ async function measureSqliteDocumentMutation(db) {
   );
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + 9_000 + i);
+    const row = makeMatchingDocument(fixture.docCount + 9_000 + i);
     insert.run([row.id, row.title, row.updated_at, JSON.stringify(row.metadata)]);
     query.bind(['tech', 'published', 1]);
     if (!query.step()) {
@@ -1453,7 +1508,7 @@ async function measureSqliteDocumentMutation(db) {
 
   const samples = [];
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const row = makeMatchingDocument(DOC_COUNT + 9_000 + LIVE_WARMUP_UPDATES + i);
+    const row = makeMatchingDocument(fixture.docCount + 9_000 + LIVE_WARMUP_UPDATES + i);
     const start = performance.now();
     insert.run([row.id, row.title, row.updated_at, JSON.stringify(row.metadata)]);
     query.bind(['tech', 'published', 1]);
@@ -1479,7 +1534,7 @@ async function measureSqliteDocumentMutation(db) {
   };
 }
 
-async function measureRxdbDocumentMutation(documents) {
+async function measureRxdbDocumentMutation(documents, fixture) {
   const query = {
     selector: {
       'metadata.category': { $eq: 'tech' },
@@ -1491,7 +1546,7 @@ async function measureRxdbDocumentMutation(documents) {
   };
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const row = toRxDocument(makeMatchingDocument(DOC_COUNT + 3_000 + i));
+    const row = toRxDocument(makeMatchingDocument(fixture.docCount + 3_000 + i));
     await documents.insert(row);
     const result = await documents.find(query).exec();
     if (result[0]?.get('updatedAt') !== row.updatedAt) {
@@ -1501,7 +1556,7 @@ async function measureRxdbDocumentMutation(documents) {
 
   const samples = [];
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const row = toRxDocument(makeMatchingDocument(DOC_COUNT + 3_000 + LIVE_WARMUP_UPDATES + i));
+    const row = toRxDocument(makeMatchingDocument(fixture.docCount + 3_000 + LIVE_WARMUP_UPDATES + i));
     const start = performance.now();
     await documents.insert(row);
     const result = await documents.find(query).exec();
@@ -1518,7 +1573,7 @@ async function measureRxdbDocumentMutation(documents) {
   };
 }
 
-async function measureRxdbDocumentReactive(documents) {
+async function measureRxdbDocumentReactive(documents, fixture) {
   const query = documents.find({
     selector: {
       'metadata.category': { $eq: 'tech' },
@@ -1551,14 +1606,14 @@ async function measureRxdbDocumentReactive(documents) {
   if (!initialSeen) expectInitial = false;
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
-    const row = toRxDocument(makeMatchingDocument(DOC_COUNT + 5_000 + i));
+    const row = toRxDocument(makeMatchingDocument(fixture.docCount + 5_000 + i));
     const wait = nextUpdate();
     await documents.insert(row);
     await withTimeout(wait, LIVE_TIMEOUT_MS, 'RxDB JSON live warmup update');
   }
 
   for (let i = 0; i < LIVE_UPDATES; i++) {
-    const row = toRxDocument(makeMatchingDocument(DOC_COUNT + 5_000 + LIVE_WARMUP_UPDATES + i));
+    const row = toRxDocument(makeMatchingDocument(fixture.docCount + 5_000 + LIVE_WARMUP_UPDATES + i));
     const wait = nextUpdate();
     const start = performance.now();
     await documents.insert(row);
@@ -1574,7 +1629,7 @@ async function measureRxdbDocumentReactive(documents) {
   };
 }
 
-async function measureInsertTimes() {
+async function measureInsertTimes(fixture) {
   const cynos = await (async () => {
     await ensureCynosReady();
     const start = performance.now();
@@ -1589,7 +1644,7 @@ async function measureInsertTimes() {
       .column('name', JsDataType.String, null)
       .column('city', JsDataType.String, null);
     db.registerTable(users);
-    await db.insert('users').values(USERS).exec();
+    await db.insert('users').values(fixture.users).exec();
     const elapsed = performance.now() - start;
     if (typeof db.free === 'function') db.free();
     return elapsed;
@@ -1611,8 +1666,8 @@ async function measureInsertTimes() {
       );
     `);
     await db.exec('begin');
-    for (let offset = 0; offset < USERS.length; offset += 1000) {
-      const batch = USERS.slice(offset, offset + 1000)
+    for (let offset = 0; offset < fixture.users.length; offset += USER_BATCH_SIZE) {
+      const batch = fixture.users.slice(offset, offset + USER_BATCH_SIZE)
         .map((row) => `(${row.id}, ${row.age}, ${row.dept_id}, ${row.score}, ${row.active}, ${sqlString(row.tier)}, ${sqlString(row.name)}, ${sqlString(row.city)})`)
         .join(',');
       await db.exec(`insert into users(id, age, dept_id, score, active, tier, name, city) values ${batch};`);
@@ -1643,7 +1698,7 @@ async function measureInsertTimes() {
     const stmt = db.prepare(
       'insert into users(id, age, dept_id, score, active, tier, name, city) values (?, ?, ?, ?, ?, ?, ?, ?)',
     );
-    for (const row of USERS) {
+    for (const row of fixture.users) {
       stmt.run([row.id, row.age, row.dept_id, row.score, row.active ? 1 : 0, row.tier, row.name, row.city]);
     }
     stmt.free();
@@ -1677,7 +1732,7 @@ async function measureInsertTimes() {
       required: ['id', 'age', 'deptId', 'score', 'active', 'tier', 'name', 'city'],
     };
     const { users } = await db.addCollections({ users: { schema } });
-    await users.bulkInsert(RX_USERS);
+    await users.bulkInsert(fixture.rxUsers);
     const elapsed = performance.now() - start;
     await db.close();
     return elapsed;
@@ -1691,14 +1746,118 @@ async function packageVersion(packageJsonSpecifier) {
   return JSON.parse(raw).version;
 }
 
-function buildReport(results, versions) {
+function renderDatasetSection(lines, datasetRun) {
+  const {
+    fixture,
+    insert,
+    cynos,
+    cynosDocs,
+    cynosJsonIndex,
+    pglite,
+    pgliteDocs,
+    sqlite,
+    sqliteDocs,
+    rxdb,
+    rxdbDocs,
+  } = datasetRun;
+
+  const cynosJoinCell = cynos.join1000
+    ? fmtMs(cynos.join1000.median)
+    : `incorrect in current local build (${cynos.joinProbeRowCount} rows)`;
+  const cynosJsonIndexSingleSpeedup = cynosJsonIndex.withoutIndex.jsonSingle.median / cynosJsonIndex.withIndex.jsonSingle.median;
+  const cynosJsonIndexCompoundSpeedup = cynosJsonIndex.withoutIndex.jsonCompound.median / cynosJsonIndex.withIndex.jsonCompound.median;
+  const cynosJsonIndexComplexSpeedup = cynosJsonIndex.withoutIndex.complexSorted.median / cynosJsonIndex.withIndex.complexSorted.median;
+
+  lines.push(`## ${fixture.label} Dataset`);
+  lines.push('');
+  lines.push(`Dataset shape: ${fixture.userCount.toLocaleString()} users, ${fixture.deptCount} departments, ${fixture.docCount.toLocaleString()} documents.`);
+  lines.push('');
+  lines.push(`### Insert ${fixture.label} Rows`);
+  lines.push('');
+  lines.push('| Engine | Time |');
+  lines.push('| --- | ---: |');
+  lines.push(`| Cynos | ${fmtMs(insert.cynos)} |`);
+  lines.push(`| PGlite | ${fmtMs(insert.pglite)} |`);
+  lines.push(`| SQLite (sql.js) | ${fmtMs(insert.sqlite)} |`);
+  lines.push(`| RxDB | ${fmtMs(insert.rxdb)} |`);
+  lines.push('');
+  lines.push('### WASM Relational Engine Benchmarks');
+  lines.push('');
+  lines.push('| Benchmark | Cynos | PGlite | SQLite (sql.js) |');
+  lines.push('| --- | ---: | ---: | ---: |');
+  lines.push(`| Point lookup (` + '`id`' + ` near 90th percentile) | ${fmtMs(cynos.point.median)} | ${fmtMs(pglite.point.median)} | ${fmtMs(sqlite.point.median)} |`);
+  lines.push(`| Indexed filter (` + '`age > 60 LIMIT 100`' + `) | ${fmtMs(cynos.filter100.median)} | ${fmtMs(pglite.filter100.median)} | ${fmtMs(sqlite.filter100.median)} |`);
+  lines.push(`| Wide scan (` + '`SELECT * LIMIT 5000`' + `) | ${fmtMs(cynos.scan5000.median)} | ${fmtMs(pglite.scan5000.median)} | ${fmtMs(sqlite.scan5000.median)} |`);
+  lines.push(`| Ordered range (` + '`age BETWEEN 30 AND 40 ORDER BY id LIMIT 500`' + `) | ${fmtMs(cynos.orderedRange500.median)} | ${fmtMs(pglite.orderedRange500.median)} | ${fmtMs(sqlite.orderedRange500.median)} |`);
+  lines.push(`| Join (` + '`users JOIN departments WHERE age > 60 LIMIT 1000`' + `) | ${cynosJoinCell} | ${fmtMs(pglite.join1000.median)} | ${fmtMs(sqlite.join1000.median)} |`);
+  lines.push(`| Aggregate (` + '`GROUP BY dept_id COUNT(*)`' + `) | ${fmtMs(cynos.aggregate.median)} | ${fmtMs(pglite.aggregate.median)} | ${fmtMs(sqlite.aggregate.median)} |`);
+  if (!cynos.join1000) {
+    lines.push('');
+    lines.push(`Note: the current local Cynos JS/WASM build returned ${cynos.joinProbeRowCount} rows for the join workload, so I left the Cynos join cell as correctness-invalid instead of publishing a misleading timing.`);
+  }
+  lines.push('');
+  lines.push('### Cynos Transport Breakdown');
+  lines.push('');
+  lines.push('This section is where Cynos has a design-specific path that the others do not: `execBinary()` lets the engine return a compact WASM buffer instead of eagerly materializing JS objects.');
+  lines.push('');
+  lines.push('| Workload | `exec()` | `execBinary()` only | `execBinary()` + `toArray()` | Binary size | `exec()` vs binary-only | `exec()` vs binary+decode |');
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
+  lines.push(`| Point lookup (1 row) | ${fmtMs(cynos.point.median)} | ${fmtMs(cynos.pointBinaryOnly.median)} | ${fmtMs(cynos.pointBinaryDecode.median)} | ${fmtBytes(cynos.pointBinaryBytes)} | ${fmtX(cynos.point.median / cynos.pointBinaryOnly.median)} | ${fmtX(cynos.point.median / cynos.pointBinaryDecode.median)} |`);
+  lines.push(`| Indexed filter (100 rows) | ${fmtMs(cynos.filter100.median)} | ${fmtMs(cynos.filter100BinaryOnly.median)} | ${fmtMs(cynos.filter100BinaryDecode.median)} | ${fmtBytes(cynos.filter100BinaryBytes)} | ${fmtX(cynos.filter100.median / cynos.filter100BinaryOnly.median)} | ${fmtX(cynos.filter100.median / cynos.filter100BinaryDecode.median)} |`);
+  lines.push(`| Wide scan (5000 rows) | ${fmtMs(cynos.scan5000.median)} | ${fmtMs(cynos.scan5000BinaryOnly.median)} | ${fmtMs(cynos.scan5000BinaryDecode.median)} | ${fmtBytes(cynos.scan5000BinaryBytes)} | ${fmtX(cynos.scan5000.median / cynos.scan5000BinaryOnly.median)} | ${fmtX(cynos.scan5000.median / cynos.scan5000BinaryDecode.median)} |`);
+  lines.push('');
+  lines.push('### Reactive / Live Query Latency');
+  lines.push('');
+  lines.push('| Mode | Median latency |');
+  lines.push('| --- | ---: |');
+  lines.push(`| Cynos ` + '`changes()`' + ` | ${fmtMs(cynos.liveChanges.median)} |`);
+  lines.push(`| Cynos ` + '`trace()`' + ` | ${fmtMs(cynos.liveTrace.median)} |`);
+  lines.push(`| PGlite ` + '`live.incrementalQuery()`' + ` | ${fmtMs(pglite.liveQuery.median)} |`);
+  lines.push(`| RxDB ` + '`RxQuery.$`' + ` | ${fmtMs(rxdb.liveQuery.median)} |`);
+  lines.push(`| SQLite (sql.js) | N/A |`);
+  lines.push('');
+  lines.push('### RxDB Document / Reactive Reference');
+  lines.push('');
+  lines.push('| Benchmark | Cynos | RxDB |');
+  lines.push('| --- | ---: | ---: |');
+  lines.push(`| Point lookup | ${fmtMs(cynos.point.median)} | ${fmtMs(rxdb.point.median)} |`);
+  lines.push(`| Filter (` + '`age > 60 LIMIT 100`' + `) | ${fmtMs(cynos.filter100.median)} | ${fmtMs(rxdb.filter100.median)} |`);
+  lines.push(`| Wide scan (` + '`LIMIT 5000`' + `) | ${fmtMs(cynos.scan5000.median)} | ${fmtMs(rxdb.scan5000.median)} |`);
+  lines.push(`| Live query update | ${fmtMs(cynos.liveChanges.median)} | ${fmtMs(rxdb.liveQuery.median)} |`);
+  lines.push('');
+  lines.push('### JSON / Document Query Benchmarks');
+  lines.push('');
+  lines.push('This section uses a same-size document dataset with nested metadata. Cynos, PGlite, and SQLite run structured JSON predicates inside SQL/WASM engines; RxDB runs nested document selectors over its document store.');
+  lines.push('');
+  lines.push('| Benchmark | Cynos | PGlite | SQLite (sql.js) | RxDB |');
+  lines.push('| --- | ---: | ---: | ---: | ---: |');
+  lines.push(`| JSON filter (` + '`metadata.category = tech LIMIT 100`' + `) | ${fmtMs(cynosDocs.jsonSingle.median)} | ${fmtMs(pgliteDocs.jsonSingle.median)} | ${fmtMs(sqliteDocs.jsonSingle.median)} | ${fmtMs(rxdbDocs.jsonSingle.median)} |`);
+  lines.push(`| Compound JSON filter (` + '`category + status + priority`' + `) | ${fmtMs(cynosDocs.jsonCompound.median)} | ${fmtMs(pgliteDocs.jsonCompound.median)} | ${fmtMs(sqliteDocs.jsonCompound.median)} | ${fmtMs(rxdbDocs.jsonCompound.median)} |`);
+  lines.push(`| Complex doc query (` + '`category + status + priority ORDER BY updatedAt DESC LIMIT 20`' + `) | ${fmtMs(cynosDocs.complexSorted.median)} | ${fmtMs(pgliteDocs.complexSorted.median)} | ${fmtMs(sqliteDocs.complexSorted.median)} | ${fmtMs(rxdbDocs.complexSorted.median)} |`);
+  lines.push(`| Mutation-driven requery (` + '`insert + complex query`' + `) | ${fmtMs(cynosDocs.mutationDriven.median)} | ${fmtMs(pgliteDocs.mutationDriven.median)} | ${fmtMs(sqliteDocs.mutationDriven.median)} | ${fmtMs(rxdbDocs.mutationDriven.median)} |`);
+  lines.push('');
+  lines.push('### Cynos JSONB Index Impact');
+  lines.push('');
+  lines.push('This section isolates the Cynos `metadata` secondary index. Both sides keep the same document dataset and `updated_at` index; the only difference is whether the JSONB metadata index exists.');
+  lines.push('');
+  lines.push('| Benchmark | With metadata index | Without metadata index | Speedup |');
+  lines.push('| --- | ---: | ---: | ---: |');
+  lines.push(`| JSON filter (` + '`metadata.category = tech LIMIT 100`' + `) | ${fmtMs(cynosJsonIndex.withIndex.jsonSingle.median)} | ${fmtMs(cynosJsonIndex.withoutIndex.jsonSingle.median)} | ${fmtX(cynosJsonIndexSingleSpeedup)} |`);
+  lines.push(`| Compound JSON filter (` + '`category + status + priority`' + `) | ${fmtMs(cynosJsonIndex.withIndex.jsonCompound.median)} | ${fmtMs(cynosJsonIndex.withoutIndex.jsonCompound.median)} | ${fmtX(cynosJsonIndexCompoundSpeedup)} |`);
+  lines.push(`| Complex doc query (` + '`category + status + priority ORDER BY updated_at DESC LIMIT 20`' + `) | ${fmtMs(cynosJsonIndex.withIndex.complexSorted.median)} | ${fmtMs(cynosJsonIndex.withoutIndex.complexSorted.median)} | ${fmtX(cynosJsonIndexComplexSpeedup)} |`);
+  lines.push('');
+  lines.push('| Reactive complex document update | Cynos `changes()` | Cynos `trace()` | RxDB `RxQuery.$` |');
+  lines.push('| --- | ---: | ---: | ---: |');
+  lines.push(`| Insert matching doc into compound nested query | ${fmtMs(cynosDocs.reactiveChanges.median)} | ${fmtMs(cynosDocs.reactiveTrace.median)} | ${fmtMs(rxdbDocs.reactiveQuery.median)} |`);
+  lines.push('');
+}
+
+function buildReport(datasetRuns, versions) {
   const lines = [];
-  const cynosJoinCell = results.cynos.join1000
-    ? fmtMs(results.cynos.join1000.median)
-    : `incorrect in current local build (${results.cynos.joinProbeRowCount} rows)`;
-  const cynosJsonIndexSingleSpeedup = results.cynosJsonIndex.withoutIndex.jsonSingle.median / results.cynosJsonIndex.withIndex.jsonSingle.median;
-  const cynosJsonIndexCompoundSpeedup = results.cynosJsonIndex.withoutIndex.jsonCompound.median / results.cynosJsonIndex.withIndex.jsonCompound.median;
-  const cynosJsonIndexComplexSpeedup = results.cynosJsonIndex.withoutIndex.complexSorted.median / results.cynosJsonIndex.withIndex.complexSorted.median;
+  const sizeSummary = datasetRuns
+    .map((datasetRun) => datasetRun.fixture.label)
+    .join(', ');
+
   lines.push('# Temporary Engine Comparison');
   lines.push('');
   lines.push(`Generated on: ${new Date().toISOString()}`);
@@ -1707,8 +1866,8 @@ function buildReport(results, versions) {
   lines.push('');
   lines.push('## Method');
   lines.push('');
-  lines.push(`- Dataset: ${USER_COUNT.toLocaleString()} users, ${DEPT_COUNT} departments.`);
-  lines.push(`- Extra document dataset: ${DOC_COUNT.toLocaleString()} documents with nested metadata for Cynos, PGlite, SQLite JSON queries, plus RxDB nested-document comparisons.`);
+  lines.push(`- Dataset sizes in this run: ${sizeSummary}. Each size uses ${DEPT_COUNT} departments and a same-size nested-document dataset.`);
+  lines.push(`- Point lookup targets the 90th-percentile id for each size, so the lookup remains meaningful at both 10K and 100K scales.`);
   lines.push(`- User rows are intentionally wider than the first draft: integers + float + boolean + multiple strings, so JS/WASM result materialization cost shows up more clearly.`);
   lines.push('- Document rows intentionally use nested metadata, multi-predicate filters, sort+limit, and mutation-driven requery so the JSON section is not just measuring warm-cache steady-state reads.');
   lines.push('- JSON query indexes are enabled in the main document comparison for each engine where applicable; Cynos also gets a separate index on/off isolation section.');
@@ -1717,6 +1876,7 @@ function buildReport(results, versions) {
   lines.push('- Cynos is already measured as Node.js + WASM here, so the runtime is aligned with sql.js and PGlite.');
   lines.push('- RxDB is not a relational WASM SQL engine; it is shown separately as a JS document/reactive baseline, not as an apples-to-apples SQL engine peer.');
   lines.push('- RxDB repeated read numbers on an unchanged dataset are heavily shaped by its query cache and document cache, so treat them as app-layer cache-hit latency, not raw relational scan throughput.');
+  lines.push(`- Override dataset sizes with ` + '`CYNOS_ENGINE_COMPARE_SIZES=10000,100000`' + ` if you want a different mix.`);
   lines.push('');
   lines.push('## Versions');
   lines.push('');
@@ -1737,87 +1897,15 @@ function buildReport(results, versions) {
   lines.push('| Delta-first reactive path | Yes (`trace()`) | Partial (`live.changes`) | No | No comparable built-in delta stream |');
   lines.push('| Binary result transport | Yes (`execBinary()`) | No comparable engine-native path in this harness | No comparable engine-native path in this harness | No |');
   lines.push('');
-  lines.push('## Insert 10K Rows');
-  lines.push('');
-  lines.push('| Engine | Time |');
-  lines.push('| --- | ---: |');
-  lines.push(`| Cynos | ${fmtMs(results.insert.cynos)} |`);
-  lines.push(`| PGlite | ${fmtMs(results.insert.pglite)} |`);
-  lines.push(`| SQLite (sql.js) | ${fmtMs(results.insert.sqlite)} |`);
-  lines.push(`| RxDB | ${fmtMs(results.insert.rxdb)} |`);
-  lines.push('');
-  lines.push('## WASM Relational Engine Benchmarks');
-  lines.push('');
-  lines.push('| Benchmark | Cynos | PGlite | SQLite (sql.js) |');
-  lines.push('| --- | ---: | ---: | ---: |');
-  lines.push(`| Point lookup (` + '`id = 9000`' + `) | ${fmtMs(results.cynos.point.median)} | ${fmtMs(results.pglite.point.median)} | ${fmtMs(results.sqlite.point.median)} |`);
-  lines.push(`| Indexed filter (` + '`age > 60 LIMIT 100`' + `) | ${fmtMs(results.cynos.filter100.median)} | ${fmtMs(results.pglite.filter100.median)} | ${fmtMs(results.sqlite.filter100.median)} |`);
-  lines.push(`| Wide scan (` + '`SELECT * LIMIT 5000`' + `) | ${fmtMs(results.cynos.scan5000.median)} | ${fmtMs(results.pglite.scan5000.median)} | ${fmtMs(results.sqlite.scan5000.median)} |`);
-  lines.push(`| Ordered range (` + '`age BETWEEN 30 AND 40 ORDER BY id LIMIT 500`' + `) | ${fmtMs(results.cynos.orderedRange500.median)} | ${fmtMs(results.pglite.orderedRange500.median)} | ${fmtMs(results.sqlite.orderedRange500.median)} |`);
-  lines.push(`| Join (` + '`users JOIN departments WHERE age > 60 LIMIT 1000`' + `) | ${cynosJoinCell} | ${fmtMs(results.pglite.join1000.median)} | ${fmtMs(results.sqlite.join1000.median)} |`);
-  lines.push(`| Aggregate (` + '`GROUP BY dept_id COUNT(*)`' + `) | ${fmtMs(results.cynos.aggregate.median)} | ${fmtMs(results.pglite.aggregate.median)} | ${fmtMs(results.sqlite.aggregate.median)} |`);
-  if (!results.cynos.join1000) {
-    lines.push('');
-    lines.push(`Note: the current local Cynos JS/WASM build returned ${results.cynos.joinProbeRowCount} rows for the join workload, so I left the Cynos join cell as correctness-invalid instead of publishing a misleading timing.`);
+
+  for (const datasetRun of datasetRuns) {
+    renderDatasetSection(lines, datasetRun);
   }
-  lines.push('');
-  lines.push('## Cynos Transport Breakdown');
-  lines.push('');
-  lines.push('This section is where Cynos has a design-specific path that the others do not: `execBinary()` lets the engine return a compact WASM buffer instead of eagerly materializing JS objects.');
-  lines.push('');
-  lines.push('| Workload | `exec()` | `execBinary()` only | `execBinary()` + `toArray()` | Binary size | `exec()` vs binary-only | `exec()` vs binary+decode |');
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
-  lines.push(`| Point lookup (1 row) | ${fmtMs(results.cynos.point.median)} | ${fmtMs(results.cynos.pointBinaryOnly.median)} | ${fmtMs(results.cynos.pointBinaryDecode.median)} | ${fmtBytes(results.cynos.pointBinaryBytes)} | ${fmtX(results.cynos.point.median / results.cynos.pointBinaryOnly.median)} | ${fmtX(results.cynos.point.median / results.cynos.pointBinaryDecode.median)} |`);
-  lines.push(`| Indexed filter (100 rows) | ${fmtMs(results.cynos.filter100.median)} | ${fmtMs(results.cynos.filter100BinaryOnly.median)} | ${fmtMs(results.cynos.filter100BinaryDecode.median)} | ${fmtBytes(results.cynos.filter100BinaryBytes)} | ${fmtX(results.cynos.filter100.median / results.cynos.filter100BinaryOnly.median)} | ${fmtX(results.cynos.filter100.median / results.cynos.filter100BinaryDecode.median)} |`);
-  lines.push(`| Wide scan (5000 rows) | ${fmtMs(results.cynos.scan5000.median)} | ${fmtMs(results.cynos.scan5000BinaryOnly.median)} | ${fmtMs(results.cynos.scan5000BinaryDecode.median)} | ${fmtBytes(results.cynos.scan5000BinaryBytes)} | ${fmtX(results.cynos.scan5000.median / results.cynos.scan5000BinaryOnly.median)} | ${fmtX(results.cynos.scan5000.median / results.cynos.scan5000BinaryDecode.median)} |`);
-  lines.push('');
-  lines.push('## Reactive / Live Query Latency');
-  lines.push('');
-  lines.push('| Mode | Median latency |');
-  lines.push('| --- | ---: |');
-  lines.push(`| Cynos ` + '`changes()`' + ` | ${fmtMs(results.cynos.liveChanges.median)} |`);
-  lines.push(`| Cynos ` + '`trace()`' + ` | ${fmtMs(results.cynos.liveTrace.median)} |`);
-  lines.push(`| PGlite ` + '`live.incrementalQuery()`' + ` | ${fmtMs(results.pglite.liveQuery.median)} |`);
-  lines.push(`| RxDB ` + '`RxQuery.$`' + ` | ${fmtMs(results.rxdb.liveQuery.median)} |`);
-  lines.push(`| SQLite (sql.js) | N/A |`);
-  lines.push('');
-  lines.push('## RxDB Document / Reactive Reference');
-  lines.push('');
-  lines.push('| Benchmark | Cynos | RxDB |');
-  lines.push('| --- | ---: | ---: |');
-  lines.push(`| Point lookup | ${fmtMs(results.cynos.point.median)} | ${fmtMs(results.rxdb.point.median)} |`);
-  lines.push(`| Filter (` + '`age > 60 LIMIT 100`' + `) | ${fmtMs(results.cynos.filter100.median)} | ${fmtMs(results.rxdb.filter100.median)} |`);
-  lines.push(`| Wide scan (` + '`LIMIT 5000`' + `) | ${fmtMs(results.cynos.scan5000.median)} | ${fmtMs(results.rxdb.scan5000.median)} |`);
-  lines.push(`| Live query update | ${fmtMs(results.cynos.liveChanges.median)} | ${fmtMs(results.rxdb.liveQuery.median)} |`);
-  lines.push('');
-  lines.push('## JSON / Document Query Benchmarks');
-  lines.push('');
-  lines.push('This section uses a separate 10K-document dataset with nested metadata. Cynos, PGlite, and SQLite run structured JSON predicates inside SQL/WASM engines; RxDB runs nested document selectors over its document store.');
-  lines.push('');
-  lines.push('| Benchmark | Cynos | PGlite | SQLite (sql.js) | RxDB |');
-  lines.push('| --- | ---: | ---: | ---: | ---: |');
-  lines.push(`| JSON filter (` + '`metadata.category = tech LIMIT 100`' + `) | ${fmtMs(results.cynosDocs.jsonSingle.median)} | ${fmtMs(results.pgliteDocs.jsonSingle.median)} | ${fmtMs(results.sqliteDocs.jsonSingle.median)} | ${fmtMs(results.rxdbDocs.jsonSingle.median)} |`);
-  lines.push(`| Compound JSON filter (` + '`category + status + priority`' + `) | ${fmtMs(results.cynosDocs.jsonCompound.median)} | ${fmtMs(results.pgliteDocs.jsonCompound.median)} | ${fmtMs(results.sqliteDocs.jsonCompound.median)} | ${fmtMs(results.rxdbDocs.jsonCompound.median)} |`);
-  lines.push(`| Complex doc query (` + '`category + status + priority ORDER BY updatedAt DESC LIMIT 20`' + `) | ${fmtMs(results.cynosDocs.complexSorted.median)} | ${fmtMs(results.pgliteDocs.complexSorted.median)} | ${fmtMs(results.sqliteDocs.complexSorted.median)} | ${fmtMs(results.rxdbDocs.complexSorted.median)} |`);
-  lines.push(`| Mutation-driven requery (` + '`insert + complex query`' + `) | ${fmtMs(results.cynosDocs.mutationDriven.median)} | ${fmtMs(results.pgliteDocs.mutationDriven.median)} | ${fmtMs(results.sqliteDocs.mutationDriven.median)} | ${fmtMs(results.rxdbDocs.mutationDriven.median)} |`);
-  lines.push('');
-  lines.push('## Cynos JSONB Index Impact');
-  lines.push('');
-  lines.push('This section isolates the Cynos `metadata` secondary index. Both sides keep the same dataset and `updated_at` index; the only difference is whether the JSONB metadata index exists.');
-  lines.push('');
-  lines.push('| Benchmark | With metadata index | Without metadata index | Speedup |');
-  lines.push('| --- | ---: | ---: | ---: |');
-  lines.push(`| JSON filter (` + '`metadata.category = tech LIMIT 100`' + `) | ${fmtMs(results.cynosJsonIndex.withIndex.jsonSingle.median)} | ${fmtMs(results.cynosJsonIndex.withoutIndex.jsonSingle.median)} | ${fmtX(cynosJsonIndexSingleSpeedup)} |`);
-  lines.push(`| Compound JSON filter (` + '`category + status + priority`' + `) | ${fmtMs(results.cynosJsonIndex.withIndex.jsonCompound.median)} | ${fmtMs(results.cynosJsonIndex.withoutIndex.jsonCompound.median)} | ${fmtX(cynosJsonIndexCompoundSpeedup)} |`);
-  lines.push(`| Complex doc query (` + '`category + status + priority ORDER BY updated_at DESC LIMIT 20`' + `) | ${fmtMs(results.cynosJsonIndex.withIndex.complexSorted.median)} | ${fmtMs(results.cynosJsonIndex.withoutIndex.complexSorted.median)} | ${fmtX(cynosJsonIndexComplexSpeedup)} |`);
-  lines.push('');
-  lines.push('| Reactive complex document update | Cynos `changes()` | Cynos `trace()` | RxDB `RxQuery.$` |');
-  lines.push('| --- | ---: | ---: | ---: |');
-  lines.push(`| Insert matching doc into compound nested query | ${fmtMs(results.cynosDocs.reactiveChanges.median)} | ${fmtMs(results.cynosDocs.reactiveTrace.median)} | ${fmtMs(results.rxdbDocs.reactiveQuery.median)} |`);
-  lines.push('');
+
   lines.push('## What This Suggests');
   lines.push('');
-  lines.push('- Cynos is not trying to beat every mature SQL engine on every scalar query. In this harness, SQLite(sql.js) is still excellent on very small point lookups and aggregate-heavy paths.');
+  lines.push('- The 10K runs are useful as a fast sanity-check, but the 100K runs are usually the better guide for sustained scan, join, JSON, and reactive costs.');
+  lines.push('- Cynos is not trying to beat every mature SQL engine on every scalar query. In this harness, SQLite(sql.js) remains excellent on very small point lookups, scalar JSON reads, and some aggregate-heavy paths.');
   lines.push('- Cynos becomes more differentiated once you care about one engine doing joins, aggregates, structured JSON queries, and reactive updates together inside a compact embedded runtime.');
   lines.push('- `execBinary()` is the clearest Cynos-specific advantage in JS/WASM embeddings: when result sets get wider or larger, it cuts object materialization cost and can materially outperform plain `exec()`.');
   lines.push('- Relative to PGlite, Cynos trades SQL breadth and Postgres compatibility for a tighter app-runtime execution path and much cheaper live-query updates in this workload.');
@@ -1836,6 +1924,30 @@ function buildReport(results, versions) {
   return lines.join('\n');
 }
 
+async function runDatasetBenchmarks(fixture) {
+  console.error(`[${fixture.label}] measuring inserts`);
+  const insert = await measureInsertTimes(fixture);
+  console.error(`[${fixture.label}] measuring Cynos relational path`);
+  const cynos = await measureCynos(fixture);
+  console.error(`[${fixture.label}] measuring Cynos document path`);
+  const cynosDocs = await measureCynosDocuments(fixture);
+  console.error(`[${fixture.label}] measuring Cynos JSONB index impact`);
+  const cynosJsonIndex = await measureCynosJsonIndexImpact(fixture, cynosDocs);
+  console.error(`[${fixture.label}] measuring PGlite relational path`);
+  const pglite = await measurePGlite(fixture);
+  console.error(`[${fixture.label}] measuring PGlite document path`);
+  const pgliteDocs = await measurePGliteDocuments(fixture);
+  console.error(`[${fixture.label}] measuring SQLite relational path`);
+  const sqlite = await measureSqlite(fixture);
+  console.error(`[${fixture.label}] measuring SQLite document path`);
+  const sqliteDocs = await measureSqliteDocuments(fixture);
+  console.error(`[${fixture.label}] measuring RxDB relational/document baseline`);
+  const rxdb = await measureRxdb(fixture);
+  const rxdbDocs = await measureRxdbDocuments(fixture);
+
+  return { fixture, insert, cynos, cynosDocs, cynosJsonIndex, pglite, pgliteDocs, sqlite, sqliteDocs, rxdb, rxdbDocs };
+}
+
 async function main() {
   const versions = {
     pglite: await packageVersion('@electric-sql/pglite/package.json'),
@@ -1843,19 +1955,13 @@ async function main() {
     sqljs: await packageVersion('sql.js/package.json'),
   };
 
-  const insert = await measureInsertTimes();
-  const cynos = await measureCynos();
-  const cynosDocs = await measureCynosDocuments();
-  const cynosJsonIndex = await measureCynosJsonIndexImpact(cynosDocs);
-  const pglite = await measurePGlite();
-  const pgliteDocs = await measurePGliteDocuments();
-  const sqlite = await measureSqlite();
-  const sqliteDocs = await measureSqliteDocuments();
-  const rxdb = await measureRxdb();
-  const rxdbDocs = await measureRxdbDocuments();
+  const datasetRuns = [];
+  for (const size of DATASET_SIZES) {
+    const fixture = getDatasetFixture(size);
+    datasetRuns.push(await runDatasetBenchmarks(fixture));
+  }
 
-  const results = { insert, cynos, cynosDocs, cynosJsonIndex, pglite, pgliteDocs, sqlite, sqliteDocs, rxdb, rxdbDocs };
-  const report = buildReport(results, versions);
+  const report = buildReport(datasetRuns, versions);
   await fs.mkdir(TMP_DIR, { recursive: true });
   await fs.writeFile(REPORT_PATH, report, 'utf8');
   console.log(report);
