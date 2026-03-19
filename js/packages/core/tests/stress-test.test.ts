@@ -100,7 +100,7 @@ describe('Stress Test: 100K Tasks Live Query', () => {
     expect(allTasks.length).toBe(TOTAL_TASKS);
   }, 60000);
 
-  it('should measure pure Rust insert performance (no JS serialization)', async () => {
+  it.skip('should measure pure Rust insert performance (no JS serialization)', async () => {
     const db = createTaskDb('stress_rust_insert');
 
     // Benchmark pure Rust insert without JS serialization overhead

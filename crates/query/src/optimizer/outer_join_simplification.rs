@@ -58,6 +58,7 @@ impl OuterJoinSimplification {
                     right,
                     condition,
                     join_type,
+                    output_tables,
                 } = optimized_input
                 {
                     if let Some(new_join_type) =
@@ -69,6 +70,7 @@ impl OuterJoinSimplification {
                                 right,
                                 condition,
                                 join_type: new_join_type,
+                                output_tables: output_tables.clone(),
                             }),
                             predicate,
                         };
@@ -81,6 +83,7 @@ impl OuterJoinSimplification {
                             right,
                             condition,
                             join_type,
+                            output_tables,
                         }),
                         predicate,
                     };
@@ -102,11 +105,13 @@ impl OuterJoinSimplification {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => LogicalPlan::Join {
                 left: Box::new(self.simplify(*left)),
                 right: Box::new(self.simplify(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             LogicalPlan::Aggregate {
@@ -553,6 +558,7 @@ mod tests {
                     Expr::column("orders", "user_id", 0),
                 ),
                 join_type: JoinType::RightOuter,
+                output_tables: alloc::vec!["users".into(), "orders".into()],
             },
             Expr::eq(Expr::column("users", "active", 1), Expr::literal(true)),
         );

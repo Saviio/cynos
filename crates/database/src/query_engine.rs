@@ -801,6 +801,101 @@ mod tests {
         cache
     }
 
+    fn create_flipped_index_join_cache() -> TableCache {
+        let employees = TableBuilder::new("employees")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_column("dept_id", DataType::Int64)
+            .unwrap()
+            .add_column("salary", DataType::Int64)
+            .unwrap()
+            .add_index("idx_dept_id", &["dept_id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let departments = TableBuilder::new("departments")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_column("budget", DataType::Int64)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(employees).unwrap();
+        cache.create_table(departments).unwrap();
+
+        {
+            let departments_store = cache.get_table_mut("departments").unwrap();
+            departments_store
+                .insert(Row::new(
+                    1,
+                    alloc::vec![
+                        Value::Int64(1),
+                        Value::String("Engineering".into()),
+                        Value::Int64(1_000_000),
+                    ],
+                ))
+                .unwrap();
+            departments_store
+                .insert(Row::new(
+                    2,
+                    alloc::vec![
+                        Value::Int64(2),
+                        Value::String("Sales".into()),
+                        Value::Int64(500_000),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        {
+            let employees_store = cache.get_table_mut("employees").unwrap();
+            for (row_id, row) in [
+                alloc::vec![
+                    Value::Int64(1),
+                    Value::String("Alice".into()),
+                    Value::Int64(1),
+                    Value::Int64(80_000),
+                ],
+                alloc::vec![
+                    Value::Int64(2),
+                    Value::String("Bob".into()),
+                    Value::Int64(1),
+                    Value::Int64(90_000),
+                ],
+                alloc::vec![
+                    Value::Int64(3),
+                    Value::String("Charlie".into()),
+                    Value::Int64(2),
+                    Value::Int64(70_000),
+                ],
+                alloc::vec![
+                    Value::Int64(4),
+                    Value::String("David".into()),
+                    Value::Int64(2),
+                    Value::Int64(75_000),
+                ],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                employees_store
+                    .insert(Row::new((10 + row_id) as u64, row))
+                    .unwrap();
+            }
+        }
+
+        cache
+    }
+
     #[test]
     fn test_table_cache_data_source() {
         // Basic test to ensure the module compiles
@@ -904,6 +999,54 @@ mod tests {
         let output = execute_compiled_physical_plan_with_summary(&cache, &compiled).unwrap();
 
         assert_eq!(output.summary, QueryResultSummary::from_rows(&output.rows));
+    }
+
+    #[test]
+    fn test_flipped_index_join_preserves_logical_left_row_layout() {
+        use cynos_query::ast::SortOrder;
+
+        let cache = create_flipped_index_join_cache();
+        let plan = LogicalPlan::sort(
+            LogicalPlan::inner_join(
+                LogicalPlan::scan("employees"),
+                LogicalPlan::scan("departments"),
+                AstExpr::eq(
+                    AstExpr::column("employees", "dept_id", 2),
+                    AstExpr::column("departments", "id", 0),
+                ),
+            ),
+            alloc::vec![(AstExpr::column("employees", "salary", 3), SortOrder::Desc)],
+        );
+
+        let physical = compile_plan(&cache, "employees", plan.clone());
+        assert!(matches!(physical, PhysicalPlan::Sort { .. }));
+
+        let expected = execute_physical_plan(&cache, &physical).unwrap();
+        assert_eq!(expected.len(), 4);
+        assert_eq!(expected[0].get(0), Some(&Value::Int64(2)));
+        assert_eq!(expected[0].get(3), Some(&Value::Int64(90_000)));
+        assert_eq!(expected[0].get(4), Some(&Value::Int64(1)));
+        assert_eq!(
+            expected[0].values(),
+            &[
+                Value::Int64(2),
+                Value::String("Bob".into()),
+                Value::Int64(1),
+                Value::Int64(90_000),
+                Value::Int64(1),
+                Value::String("Engineering".into()),
+                Value::Int64(1_000_000),
+            ]
+        );
+
+        let compiled = compile_cached_plan(&cache, "employees", plan);
+        let actual = execute_compiled_physical_plan(&cache, &compiled).unwrap();
+
+        let expected_snapshot: Vec<Vec<Value>> =
+            expected.iter().map(|row| row.values().to_vec()).collect();
+        let actual_snapshot: Vec<Vec<Value>> =
+            actual.iter().map(|row| row.values().to_vec()).collect();
+        assert_eq!(actual_snapshot, expected_snapshot);
     }
 
     #[test]

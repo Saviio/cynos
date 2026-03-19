@@ -11,7 +11,7 @@ beforeAll(async () => {
 });
 
 describe('GIN regression suite', () => {
-  it('falls back for nested JSON paths until GIN can index nested postings', async () => {
+  it('uses GIN for nested JSON path equality once nested postings are indexed', async () => {
     const db = new Database('gin_reg_nested_path');
     const builder = db.createTable('profiles')
       .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
@@ -46,7 +46,9 @@ describe('GIN regression suite', () => {
     const rows = await query.exec();
 
     expect(rows.map((row: any) => row.name).sort()).toEqual(['Alice', 'Cara']);
-    expect(String(plan.physical)).not.toContain('GinIndexScan');
+    expect(String(plan.physical)).toContain('GinIndexScan');
+    expect(String(plan.physical)).toContain('key: "address.city"');
+    expect(String(plan.physical)).toContain('query_type: "eq"');
   });
 
   it('preserves unhandled GIN predicates when eq is combined with exists', async () => {

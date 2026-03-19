@@ -31,6 +31,94 @@ pub struct CompileResult {
     pub table_ids: HashMap<String, TableId>,
 }
 
+#[derive(Clone)]
+struct CompileLayout {
+    tables: Vec<String>,
+    table_column_counts: Vec<usize>,
+}
+
+impl CompileLayout {
+    fn table(table: &str, column_count: usize) -> Self {
+        Self {
+            tables: alloc::vec![table.into()],
+            table_column_counts: alloc::vec![column_count],
+        }
+    }
+
+    fn projected(&self, output_column_count: usize) -> Self {
+        Self {
+            tables: self.tables.clone(),
+            table_column_counts: alloc::vec![output_column_count],
+        }
+    }
+
+    fn join(left: &Self, right: &Self, output_tables: &[String]) -> Self {
+        let mut table_column_counts = Vec::with_capacity(output_tables.len());
+        for table in output_tables {
+            if let Some(width) = left.table_width(table) {
+                table_column_counts.push(width);
+                continue;
+            }
+            if let Some(width) = right.table_width(table) {
+                table_column_counts.push(width);
+            }
+        }
+
+        Self {
+            tables: output_tables.to_vec(),
+            table_column_counts,
+        }
+    }
+
+    fn combined(left: &Self, right: &Self) -> Self {
+        let mut tables = left.tables.clone();
+        tables.extend(right.tables.iter().cloned());
+        Self::join(left, right, &tables)
+    }
+
+    fn contains_table(&self, table: &str) -> bool {
+        self.tables.iter().any(|candidate| candidate == table)
+    }
+
+    fn resolve_column_index(&self, table_name: &str, table_relative_index: usize) -> usize {
+        if table_name.is_empty() {
+            return table_relative_index;
+        }
+
+        let mut offset = 0usize;
+        for (index, table) in self.tables.iter().enumerate() {
+            if table == table_name {
+                return offset + table_relative_index;
+            }
+            offset += self.table_column_counts.get(index).copied().unwrap_or(0);
+        }
+
+        table_relative_index
+    }
+
+    fn table_width(&self, table_name: &str) -> Option<usize> {
+        self.tables
+            .iter()
+            .position(|table| table == table_name)
+            .and_then(|index| self.table_column_counts.get(index).copied())
+    }
+
+    fn projection_indices_for(&self, output_tables: &[String]) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for table in output_tables {
+            let start = self.resolve_column_index(table, 0);
+            let width = self.table_width(table).unwrap_or(0);
+            indices.extend(start..start.saturating_add(width));
+        }
+        indices
+    }
+}
+
+struct CompiledNode {
+    dataflow: DataflowNode,
+    layout: CompileLayout,
+}
+
 /// Compiles a PhysicalPlan into a DataflowNode for IVM.
 ///
 /// Returns None if the plan contains non-incrementalizable operators
@@ -38,15 +126,16 @@ pub struct CompileResult {
 pub fn compile_to_dataflow(
     plan: &PhysicalPlan,
     table_id_map: &HashMap<String, TableId>,
+    table_column_counts: &HashMap<String, usize>,
 ) -> Option<CompileResult> {
     if !plan.is_incrementalizable() {
         return None;
     }
 
     let mut table_ids = table_id_map.clone();
-    let dataflow = compile_node(plan, &mut table_ids)?;
+    let compiled = compile_node(plan, &mut table_ids, table_column_counts)?;
     Some(CompileResult {
-        dataflow,
+        dataflow: compiled.dataflow,
         table_ids,
     })
 }
@@ -54,7 +143,8 @@ pub fn compile_to_dataflow(
 fn compile_node(
     plan: &PhysicalPlan,
     table_ids: &mut HashMap<String, TableId>,
-) -> Option<DataflowNode> {
+    table_column_counts: &HashMap<String, usize>,
+) -> Option<CompiledNode> {
     match plan {
         // All scan types map to Source nodes
         PhysicalPlan::TableScan { table }
@@ -64,39 +154,57 @@ fn compile_node(
         | PhysicalPlan::GinIndexScan { table, .. }
         | PhysicalPlan::GinIndexScanMulti { table, .. } => {
             let table_id = get_or_assign_table_id(table, table_ids);
-            Some(DataflowNode::source(table_id))
+            let column_count = table_column_counts.get(table).copied()?;
+            Some(CompiledNode {
+                dataflow: DataflowNode::source(table_id),
+                layout: CompileLayout::table(table, column_count),
+            })
         }
 
         PhysicalPlan::Filter { input, predicate } => {
-            let input_node = compile_node(input, table_ids)?;
-            let pred_fn = compile_predicate(predicate);
-            Some(DataflowNode::Filter {
-                input: Box::new(input_node),
-                predicate: pred_fn,
+            let input_node = compile_node(input, table_ids, table_column_counts)?;
+            let bound_predicate = bind_expr_to_layout(predicate, &input_node.layout);
+            let pred_fn = compile_predicate(&bound_predicate);
+            Some(CompiledNode {
+                dataflow: DataflowNode::Filter {
+                    input: Box::new(input_node.dataflow),
+                    predicate: pred_fn,
+                },
+                layout: input_node.layout,
             })
         }
 
         PhysicalPlan::Project { input, columns } => {
-            let input_node = compile_node(input, table_ids)?;
+            let input_node = compile_node(input, table_ids, table_column_counts)?;
+            let bound_columns: Vec<Expr> = columns
+                .iter()
+                .map(|expr| bind_expr_to_layout(expr, &input_node.layout))
+                .collect();
             // Extract column indices from projection expressions
-            let col_indices: Vec<usize> = columns
+            let col_indices: Vec<usize> = bound_columns
                 .iter()
                 .filter_map(|expr| extract_column_index(expr))
                 .collect();
 
             if col_indices.len() == columns.len() {
                 // Pure column projection — use Project node
-                Some(DataflowNode::project(input_node, col_indices))
+                Some(CompiledNode {
+                    dataflow: DataflowNode::project(input_node.dataflow, col_indices),
+                    layout: input_node.layout.projected(columns.len()),
+                })
             } else {
                 // Has computed expressions — use Map node
-                let exprs = columns.clone();
-                Some(DataflowNode::Map {
-                    input: Box::new(input_node),
-                    mapper: Box::new(move |row: &Row| {
-                        let values: Vec<Value> =
-                            exprs.iter().map(|expr| eval_expr(expr, row)).collect();
-                        Row::dummy(values)
-                    }),
+                let exprs = bound_columns;
+                Some(CompiledNode {
+                    dataflow: DataflowNode::Map {
+                        input: Box::new(input_node.dataflow),
+                        mapper: Box::new(move |row: &Row| {
+                            let values: Vec<Value> =
+                                exprs.iter().map(|expr| eval_expr(expr, row)).collect();
+                            Row::dummy(values)
+                        }),
+                    },
+                    layout: input_node.layout.projected(columns.len()),
                 })
             }
         }
@@ -107,32 +215,36 @@ fn compile_node(
             right,
             condition,
             join_type,
+            output_tables,
         }
         | PhysicalPlan::SortMergeJoin {
             left,
             right,
             condition,
             join_type,
+            output_tables,
         }
         | PhysicalPlan::NestedLoopJoin {
             left,
             right,
             condition,
             join_type,
+            output_tables,
         } => {
-            let left_node = compile_node(left, table_ids)?;
-            let right_node = compile_node(right, table_ids)?;
+            let left_node = compile_node(left, table_ids, table_column_counts)?;
+            let right_node = compile_node(right, table_ids, table_column_counts)?;
             let ivm_join_type = convert_join_type(join_type);
-
-            let (left_key, right_key) = extract_join_keys(condition);
-
-            Some(DataflowNode::Join {
-                left: Box::new(left_node),
-                right: Box::new(right_node),
+            let (left_key, right_key) =
+                extract_join_keys(condition, &left_node.layout, &right_node.layout);
+            let raw_layout = CompileLayout::combined(&left_node.layout, &right_node.layout);
+            let join_node = DataflowNode::Join {
+                left: Box::new(left_node.dataflow),
+                right: Box::new(right_node.dataflow),
                 left_key,
                 right_key,
                 join_type: ivm_join_type,
-            })
+            };
+            Some(reorder_join_output(join_node, raw_layout, output_tables))
         }
 
         PhysicalPlan::IndexNestedLoopJoin {
@@ -140,33 +252,53 @@ fn compile_node(
             inner_table,
             condition,
             join_type,
+            outer_is_left,
+            output_tables,
             ..
         } => {
-            let outer_node = compile_node(outer, table_ids)?;
+            let outer_node = compile_node(outer, table_ids, table_column_counts)?;
             let inner_table_id = get_or_assign_table_id(inner_table, table_ids);
-            let inner_node = DataflowNode::source(inner_table_id);
+            let inner_column_count = table_column_counts.get(inner_table).copied()?;
+            let inner_layout = CompileLayout::table(inner_table, inner_column_count);
+            let inner_node = CompiledNode {
+                dataflow: DataflowNode::source(inner_table_id),
+                layout: inner_layout,
+            };
             let ivm_join_type = convert_join_type(join_type);
-            let (left_key, right_key) = extract_join_keys(condition);
+            let (left_node, right_node) = if *outer_is_left {
+                (outer_node, inner_node)
+            } else {
+                (inner_node, outer_node)
+            };
+            let (left_key, right_key) =
+                extract_join_keys(condition, &left_node.layout, &right_node.layout);
+            let raw_layout = CompileLayout::combined(&left_node.layout, &right_node.layout);
 
-            Some(DataflowNode::Join {
-                left: Box::new(outer_node),
-                right: Box::new(inner_node),
+            let join_node = DataflowNode::Join {
+                left: Box::new(left_node.dataflow),
+                right: Box::new(right_node.dataflow),
                 left_key,
                 right_key,
                 join_type: ivm_join_type,
-            })
+            };
+
+            Some(reorder_join_output(join_node, raw_layout, output_tables))
         }
 
         PhysicalPlan::CrossProduct { left, right } => {
-            let left_node = compile_node(left, table_ids)?;
-            let right_node = compile_node(right, table_ids)?;
+            let left_node = compile_node(left, table_ids, table_column_counts)?;
+            let right_node = compile_node(right, table_ids, table_column_counts)?;
+            let raw_layout = CompileLayout::combined(&left_node.layout, &right_node.layout);
             // Cross product = join with constant key (everything matches)
-            Some(DataflowNode::Join {
-                left: Box::new(left_node),
-                right: Box::new(right_node),
-                left_key: Box::new(|_| vec![Value::Int64(0)]),
-                right_key: Box::new(|_| vec![Value::Int64(0)]),
-                join_type: IvmJoinType::Inner,
+            Some(CompiledNode {
+                dataflow: DataflowNode::Join {
+                    left: Box::new(left_node.dataflow),
+                    right: Box::new(right_node.dataflow),
+                    left_key: Box::new(|_| vec![Value::Int64(0)]),
+                    right_key: Box::new(|_| vec![Value::Int64(0)]),
+                    join_type: IvmJoinType::Inner,
+                },
+                layout: raw_layout,
             })
         }
 
@@ -175,14 +307,22 @@ fn compile_node(
             group_by,
             aggregates,
         } => {
-            let input_node = compile_node(input, table_ids)?;
+            let input_node = compile_node(input, table_ids, table_column_counts)?;
+            let bound_group_by: Vec<Expr> = group_by
+                .iter()
+                .map(|expr| bind_expr_to_layout(expr, &input_node.layout))
+                .collect();
+            let bound_aggregates: Vec<(AggregateFunc, Expr)> = aggregates
+                .iter()
+                .map(|(func, expr)| (*func, bind_expr_to_layout(expr, &input_node.layout)))
+                .collect();
 
-            let group_by_indices: Vec<usize> = group_by
+            let group_by_indices: Vec<usize> = bound_group_by
                 .iter()
                 .filter_map(|expr| extract_column_index(expr))
                 .collect();
 
-            let functions: Vec<(usize, AggregateType)> = aggregates
+            let functions: Vec<(usize, AggregateType)> = bound_aggregates
                 .iter()
                 .filter_map(|(func, expr)| {
                     let col_idx = match expr {
@@ -196,15 +336,26 @@ fn compile_node(
                 })
                 .collect();
 
-            Some(DataflowNode::Aggregate {
-                input: Box::new(input_node),
-                group_by: group_by_indices,
-                functions,
+            Some(CompiledNode {
+                dataflow: DataflowNode::Aggregate {
+                    input: Box::new(input_node.dataflow),
+                    group_by: group_by_indices,
+                    functions,
+                },
+                layout: input_node
+                    .layout
+                    .projected(group_by.len().saturating_add(aggregates.len())),
             })
         }
 
-        PhysicalPlan::NoOp { input } => compile_node(input, table_ids),
-        PhysicalPlan::Empty => Some(DataflowNode::source(u32::MAX)), // sentinel
+        PhysicalPlan::NoOp { input } => compile_node(input, table_ids, table_column_counts),
+        PhysicalPlan::Empty => Some(CompiledNode {
+            dataflow: DataflowNode::source(u32::MAX),
+            layout: CompileLayout {
+                tables: Vec::new(),
+                table_column_counts: Vec::new(),
+            },
+        }),
 
         // Non-incrementalizable — should have been caught by is_incrementalizable()
         PhysicalPlan::Sort { .. }
@@ -366,57 +517,79 @@ fn as_f64(val: &Value) -> Option<f64> {
 // Join key extraction
 // ---------------------------------------------------------------------------
 
+fn reorder_join_output(
+    join_node: DataflowNode,
+    raw_layout: CompileLayout,
+    output_tables: &[String],
+) -> CompiledNode {
+    let desired_layout = CompileLayout::join(
+        &raw_layout,
+        &CompileLayout {
+            tables: Vec::new(),
+            table_column_counts: Vec::new(),
+        },
+        output_tables,
+    );
+    if raw_layout.tables == desired_layout.tables
+        && raw_layout.table_column_counts == desired_layout.table_column_counts
+    {
+        return CompiledNode {
+            dataflow: join_node,
+            layout: raw_layout,
+        };
+    }
+
+    let projection = raw_layout.projection_indices_for(output_tables);
+    CompiledNode {
+        dataflow: DataflowNode::project(join_node, projection),
+        layout: desired_layout,
+    }
+}
+
 /// Extracts left and right key extractor functions from a join condition.
 /// Handles equi-join conditions like `left.col = right.col`.
-fn extract_join_keys(condition: &Expr) -> (KeyExtractorFn, KeyExtractorFn) {
-    match condition {
-        Expr::BinaryOp {
-            left,
-            op: BinaryOp::Eq,
-            right,
-        } => {
-            let left_idx = extract_column_index(left).unwrap_or(0);
-            let right_idx = extract_column_index(right).unwrap_or(0);
-            (
-                Box::new(move |row: &Row| vec![row.get(left_idx).cloned().unwrap_or(Value::Null)]),
-                Box::new(move |row: &Row| vec![row.get(right_idx).cloned().unwrap_or(Value::Null)]),
-            )
-        }
-        Expr::BinaryOp {
-            op: BinaryOp::And, ..
-        } => {
-            // Compound join key: a.x = b.x AND a.y = b.y
-            let mut left_indices = Vec::new();
-            let mut right_indices = Vec::new();
-            collect_equi_join_keys(condition, &mut left_indices, &mut right_indices);
+fn extract_join_keys(
+    condition: &Expr,
+    left_layout: &CompileLayout,
+    right_layout: &CompileLayout,
+) -> (KeyExtractorFn, KeyExtractorFn) {
+    let mut left_indices = Vec::new();
+    let mut right_indices = Vec::new();
+    collect_equi_join_keys(
+        condition,
+        left_layout,
+        right_layout,
+        &mut left_indices,
+        &mut right_indices,
+    );
 
-            (
-                Box::new(move |row: &Row| {
-                    left_indices
-                        .iter()
-                        .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
-                        .collect()
-                }),
-                Box::new(move |row: &Row| {
-                    right_indices
-                        .iter()
-                        .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
-                        .collect()
-                }),
-            )
-        }
-        _ => {
-            // Fallback: use entire row as key (degenerate case)
-            (
-                Box::new(|row: &Row| row.values().to_vec()),
-                Box::new(|row: &Row| row.values().to_vec()),
-            )
-        }
+    if left_indices.is_empty() || right_indices.is_empty() {
+        return (
+            Box::new(|row: &Row| row.values().to_vec()),
+            Box::new(|row: &Row| row.values().to_vec()),
+        );
     }
+
+    (
+        Box::new(move |row: &Row| {
+            left_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
+                .collect()
+        }),
+        Box::new(move |row: &Row| {
+            right_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
+                .collect()
+        }),
+    )
 }
 
 fn collect_equi_join_keys(
     expr: &Expr,
+    left_layout: &CompileLayout,
+    right_layout: &CompileLayout,
     left_indices: &mut Vec<usize>,
     right_indices: &mut Vec<usize>,
 ) {
@@ -426,11 +599,24 @@ fn collect_equi_join_keys(
             op: BinaryOp::Eq,
             right,
         } => {
-            if let Some(li) = extract_column_index(left) {
-                left_indices.push(li);
-            }
-            if let Some(ri) = extract_column_index(right) {
-                right_indices.push(ri);
+            if let (Some(left_col), Some(right_col)) =
+                (extract_column_ref(left), extract_column_ref(right))
+            {
+                if left_layout.contains_table(&left_col.table)
+                    && right_layout.contains_table(&right_col.table)
+                {
+                    left_indices
+                        .push(left_layout.resolve_column_index(&left_col.table, left_col.index));
+                    right_indices
+                        .push(right_layout.resolve_column_index(&right_col.table, right_col.index));
+                } else if left_layout.contains_table(&right_col.table)
+                    && right_layout.contains_table(&left_col.table)
+                {
+                    left_indices
+                        .push(left_layout.resolve_column_index(&right_col.table, right_col.index));
+                    right_indices
+                        .push(right_layout.resolve_column_index(&left_col.table, left_col.index));
+                }
             }
         }
         Expr::BinaryOp {
@@ -438,8 +624,14 @@ fn collect_equi_join_keys(
             op: BinaryOp::And,
             right,
         } => {
-            collect_equi_join_keys(left, left_indices, right_indices);
-            collect_equi_join_keys(right, left_indices, right_indices);
+            collect_equi_join_keys(left, left_layout, right_layout, left_indices, right_indices);
+            collect_equi_join_keys(
+                right,
+                left_layout,
+                right_layout,
+                left_indices,
+                right_indices,
+            );
         }
         _ => {}
     }
@@ -449,9 +641,94 @@ fn collect_equi_join_keys(
 // Helpers
 // ---------------------------------------------------------------------------
 
+fn bind_expr_to_layout(expr: &Expr, layout: &CompileLayout) -> Expr {
+    match expr {
+        Expr::Column(col_ref) => Expr::column(
+            col_ref.table.clone(),
+            col_ref.column.clone(),
+            layout.resolve_column_index(&col_ref.table, col_ref.index),
+        ),
+        Expr::Literal(value) => Expr::Literal(value.clone()),
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(bind_expr_to_layout(left, layout)),
+            op: *op,
+            right: Box::new(bind_expr_to_layout(right, layout)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+        },
+        Expr::Function { name, args } => Expr::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|arg| bind_expr_to_layout(arg, layout))
+                .collect(),
+        },
+        Expr::Aggregate {
+            func,
+            expr,
+            distinct,
+        } => Expr::Aggregate {
+            func: *func,
+            expr: expr
+                .as_ref()
+                .map(|inner| Box::new(bind_expr_to_layout(inner, layout))),
+            distinct: *distinct,
+        },
+        Expr::Between { expr, low, high } => Expr::Between {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            low: Box::new(bind_expr_to_layout(low, layout)),
+            high: Box::new(bind_expr_to_layout(high, layout)),
+        },
+        Expr::NotBetween { expr, low, high } => Expr::NotBetween {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            low: Box::new(bind_expr_to_layout(low, layout)),
+            high: Box::new(bind_expr_to_layout(high, layout)),
+        },
+        Expr::In { expr, list } => Expr::In {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            list: list
+                .iter()
+                .map(|item| bind_expr_to_layout(item, layout))
+                .collect(),
+        },
+        Expr::NotIn { expr, list } => Expr::NotIn {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            list: list
+                .iter()
+                .map(|item| bind_expr_to_layout(item, layout))
+                .collect(),
+        },
+        Expr::Like { expr, pattern } => Expr::Like {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            pattern: pattern.clone(),
+        },
+        Expr::NotLike { expr, pattern } => Expr::NotLike {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            pattern: pattern.clone(),
+        },
+        Expr::Match { expr, pattern } => Expr::Match {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            pattern: pattern.clone(),
+        },
+        Expr::NotMatch { expr, pattern } => Expr::NotMatch {
+            expr: Box::new(bind_expr_to_layout(expr, layout)),
+            pattern: pattern.clone(),
+        },
+    }
+}
+
 fn extract_column_index(expr: &Expr) -> Option<usize> {
     match expr {
         Expr::Column(col_ref) => Some(col_ref.index),
+        _ => None,
+    }
+}
+
+fn extract_column_ref(expr: &Expr) -> Option<&cynos_query::ast::ColumnRef> {
+    match expr {
+        Expr::Column(col_ref) => Some(col_ref),
         _ => None,
     }
 }
@@ -487,13 +764,21 @@ mod tests {
     use super::*;
     use cynos_query::ast::Expr;
 
+    fn column_counts(entries: &[(&str, usize)]) -> HashMap<String, usize> {
+        entries
+            .iter()
+            .map(|(table, count)| ((*table).into(), *count))
+            .collect()
+    }
+
     #[test]
     fn test_compile_table_scan() {
         let plan = PhysicalPlan::table_scan("users");
         let mut table_ids = HashMap::new();
         table_ids.insert("users".into(), 1u32);
+        let table_column_counts = column_counts(&[("users", 2)]);
 
-        let result = compile_to_dataflow(&plan, &table_ids).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
         assert!(matches!(
             result.dataflow,
             DataflowNode::Source { table_id: 1 }
@@ -508,8 +793,9 @@ mod tests {
         );
         let mut table_ids = HashMap::new();
         table_ids.insert("users".into(), 1u32);
+        let table_column_counts = column_counts(&[("users", 2)]);
 
-        let result = compile_to_dataflow(&plan, &table_ids).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
         assert!(matches!(result.dataflow, DataflowNode::Filter { .. }));
     }
 
@@ -523,7 +809,8 @@ mod tests {
             )],
         );
         let table_ids = HashMap::new();
-        assert!(compile_to_dataflow(&plan, &table_ids).is_none());
+        let table_column_counts = column_counts(&[("users", 1)]);
+        assert!(compile_to_dataflow(&plan, &table_ids, &table_column_counts).is_none());
     }
 
     #[test]
@@ -541,13 +828,46 @@ mod tests {
         let mut table_ids = HashMap::new();
         table_ids.insert("employees".into(), 1u32);
         table_ids.insert("departments".into(), 2u32);
+        let table_column_counts = column_counts(&[("employees", 3), ("departments", 2)]);
 
-        let result = compile_to_dataflow(&plan, &table_ids).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
         match &result.dataflow {
             DataflowNode::Join { join_type, .. } => {
                 assert_eq!(*join_type, IvmJoinType::LeftOuter);
             }
             _ => panic!("Expected Join node"),
+        }
+    }
+
+    #[test]
+    fn test_compile_reordered_join_wraps_join_with_projection() {
+        use cynos_query::ast::JoinType;
+
+        let plan = PhysicalPlan::hash_join_with_output_tables(
+            PhysicalPlan::table_scan("departments"),
+            PhysicalPlan::table_scan("employees"),
+            Expr::eq(
+                Expr::column("employees", "dept_id", 1),
+                Expr::column("departments", "id", 0),
+            ),
+            JoinType::Inner,
+            alloc::vec!["employees".into(), "departments".into()],
+        );
+        let mut table_ids = HashMap::new();
+        table_ids.insert("employees".into(), 1u32);
+        table_ids.insert("departments".into(), 2u32);
+        let table_column_counts = column_counts(&[("employees", 2), ("departments", 2)]);
+
+        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        match &result.dataflow {
+            DataflowNode::Project { input, columns } => {
+                assert_eq!(columns, &[2, 3, 0, 1]);
+                assert!(matches!(input.as_ref(), DataflowNode::Join { .. }));
+            }
+            other => panic!(
+                "Expected Project over Join, got {:?}",
+                core::mem::discriminant(other)
+            ),
         }
     }
 
@@ -563,8 +883,9 @@ mod tests {
         );
         let mut table_ids = HashMap::new();
         table_ids.insert("orders".into(), 1u32);
+        let table_column_counts = column_counts(&[("orders", 3)]);
 
-        let result = compile_to_dataflow(&plan, &table_ids).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
         match &result.dataflow {
             DataflowNode::Aggregate {
                 group_by,
@@ -686,8 +1007,9 @@ mod tests {
         );
         let mut table_ids = HashMap::new();
         table_ids.insert("users".into(), 1u32);
+        let table_column_counts = column_counts(&[("users", 2)]);
 
-        let result = compile_to_dataflow(&plan, &table_ids).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
         let mut view = MaterializedView::new(result.dataflow);
 
         // Insert rows: id=1 (match), id=2 (no match), id=3 (match)
@@ -718,5 +1040,61 @@ mod tests {
         assert!(ids.contains(&1));
         assert!(ids.contains(&3));
         assert!(!ids.contains(&2));
+    }
+
+    #[test]
+    fn test_filter_over_reordered_join_uses_logical_output_layout() {
+        use cynos_incremental::{Delta, MaterializedView};
+        use cynos_query::ast::JoinType;
+
+        let join = PhysicalPlan::hash_join_with_output_tables(
+            PhysicalPlan::table_scan("departments"),
+            PhysicalPlan::table_scan("employees"),
+            Expr::eq(
+                Expr::column("employees", "dept_id", 1),
+                Expr::column("departments", "id", 0),
+            ),
+            JoinType::Inner,
+            alloc::vec!["employees".into(), "departments".into()],
+        );
+        let plan = PhysicalPlan::filter(
+            join,
+            Expr::eq(Expr::column("employees", "id", 0), Expr::literal(1i64)),
+        );
+
+        let mut table_ids = HashMap::new();
+        table_ids.insert("employees".into(), 1u32);
+        table_ids.insert("departments".into(), 2u32);
+        let table_column_counts = column_counts(&[("employees", 2), ("departments", 2)]);
+
+        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let mut view = MaterializedView::new(result.dataflow);
+
+        view.on_table_change(
+            1,
+            vec![
+                Delta::insert(Row::new(1, vec![Value::Int64(1), Value::Int64(10)])),
+                Delta::insert(Row::new(2, vec![Value::Int64(2), Value::Int64(20)])),
+            ],
+        );
+        view.on_table_change(
+            2,
+            vec![
+                Delta::insert(Row::new(
+                    10,
+                    vec![Value::Int64(10), Value::String("Engineering".into())],
+                )),
+                Delta::insert(Row::new(
+                    20,
+                    vec![Value::Int64(20), Value::String("Sales".into())],
+                )),
+            ],
+        );
+
+        let rows = view.result();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::Int64(1)));
+        assert_eq!(rows[0].get(2), Some(&Value::Int64(10)));
+        assert_eq!(rows[0].get(3), Some(&Value::String("Engineering".into())));
     }
 }

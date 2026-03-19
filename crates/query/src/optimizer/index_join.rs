@@ -49,6 +49,7 @@ impl<'a> IndexJoinPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left = self.traverse(*left);
                 let right = self.traverse(*right);
@@ -60,11 +61,12 @@ impl<'a> IndexJoinPass<'a> {
                         right: Box::new(right),
                         condition,
                         join_type,
+                        output_tables,
                     };
                 }
 
                 // Try to find an index on either side
-                if let Some((outer, inner_table, inner_index)) =
+                if let Some((outer, inner_table, inner_index, outer_is_left)) =
                     self.find_index_join_candidate(&left, &right, &condition)
                 {
                     return PhysicalPlan::IndexNestedLoopJoin {
@@ -73,6 +75,8 @@ impl<'a> IndexJoinPass<'a> {
                         inner_index,
                         condition,
                         join_type,
+                        outer_is_left,
+                        output_tables,
                     };
                 }
 
@@ -81,6 +85,7 @@ impl<'a> IndexJoinPass<'a> {
                     right: Box::new(right),
                     condition,
                     join_type,
+                    output_tables,
                 }
             }
 
@@ -90,6 +95,7 @@ impl<'a> IndexJoinPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left = self.traverse(*left);
                 let right = self.traverse(*right);
@@ -101,11 +107,12 @@ impl<'a> IndexJoinPass<'a> {
                         right: Box::new(right),
                         condition,
                         join_type,
+                        output_tables,
                     };
                 }
 
                 // Try to find an index on either side
-                if let Some((outer, inner_table, inner_index)) =
+                if let Some((outer, inner_table, inner_index, outer_is_left)) =
                     self.find_index_join_candidate(&left, &right, &condition)
                 {
                     return PhysicalPlan::IndexNestedLoopJoin {
@@ -114,6 +121,8 @@ impl<'a> IndexJoinPass<'a> {
                         inner_index,
                         condition,
                         join_type,
+                        outer_is_left,
+                        output_tables,
                     };
                 }
 
@@ -122,6 +131,7 @@ impl<'a> IndexJoinPass<'a> {
                     right: Box::new(right),
                     condition,
                     join_type,
+                    output_tables,
                 }
             }
 
@@ -141,11 +151,13 @@ impl<'a> IndexJoinPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => PhysicalPlan::SortMergeJoin {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             PhysicalPlan::HashAggregate {
@@ -219,21 +231,21 @@ impl<'a> IndexJoinPass<'a> {
         left: &PhysicalPlan,
         right: &PhysicalPlan,
         condition: &Expr,
-    ) -> Option<(PhysicalPlan, String, String)> {
+    ) -> Option<(PhysicalPlan, String, String, bool)> {
         // Extract join columns from the condition
         let (left_col, right_col) = self.extract_join_columns(condition)?;
 
         // Check if right side is a table scan with an index on the join column
         if let Some((table, index)) = self.get_indexed_table_scan(right, right_col) {
             if self.should_use_index_join(left, &table, &index) {
-                return Some((left.clone(), table, index.name.clone()));
+                return Some((left.clone(), table, index.name.clone(), true));
             }
         }
 
         // Check if left side is a table scan with an index on the join column
         if let Some((table, index)) = self.get_indexed_table_scan(left, left_col) {
             if self.should_use_index_join(right, &table, &index) {
-                return Some((right.clone(), table, index.name.clone()));
+                return Some((right.clone(), table, index.name.clone(), false));
             }
         }
 
@@ -426,12 +438,12 @@ mod tests {
         let pass = IndexJoinPass::new(&ctx);
 
         // Create: HashJoin(a.id = b.a_id, Scan(a), Scan(b))
-        let plan = PhysicalPlan::HashJoin {
-            left: Box::new(PhysicalPlan::table_scan("a")),
-            right: Box::new(PhysicalPlan::table_scan("b")),
-            condition: Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
-            join_type: JoinType::Inner,
-        };
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("a"),
+            PhysicalPlan::table_scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::Inner,
+        );
 
         let result = pass.optimize(plan);
 
@@ -449,16 +461,66 @@ mod tests {
     }
 
     #[test]
+    fn test_index_join_tracks_logical_left_when_outer_flips() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "employees",
+            TableStats {
+                row_count: 1_000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "idx_dept_id",
+                    alloc::vec!["dept_id".into()],
+                    false,
+                )],
+            },
+        );
+        ctx.register_table(
+            "departments",
+            TableStats {
+                row_count: 8,
+                is_sorted: false,
+                indexes: alloc::vec![],
+            },
+        );
+
+        let pass = IndexJoinPass::new(&ctx);
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("employees"),
+            PhysicalPlan::table_scan("departments"),
+            Expr::eq(
+                Expr::column("employees", "dept_id", 1),
+                Expr::column("departments", "id", 0),
+            ),
+            JoinType::Inner,
+        );
+
+        let result = pass.optimize(plan);
+
+        if let PhysicalPlan::IndexNestedLoopJoin {
+            inner_table,
+            outer_is_left,
+            ..
+        } = result
+        {
+            assert_eq!(inner_table, "employees");
+            assert!(!outer_is_left);
+        } else {
+            panic!("expected index nested loop join");
+        }
+    }
+
+    #[test]
     fn test_no_index_remains_hash_join() {
         let ctx = ExecutionContext::new(); // Empty context, no indexes
         let pass = IndexJoinPass::new(&ctx);
 
-        let plan = PhysicalPlan::HashJoin {
-            left: Box::new(PhysicalPlan::table_scan("a")),
-            right: Box::new(PhysicalPlan::table_scan("b")),
-            condition: Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
-            join_type: JoinType::Inner,
-        };
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("a"),
+            PhysicalPlan::table_scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::Inner,
+        );
 
         let result = pass.optimize(plan);
 
@@ -472,12 +534,12 @@ mod tests {
         let pass = IndexJoinPass::new(&ctx);
 
         // Left outer join should not be converted to index join
-        let plan = PhysicalPlan::HashJoin {
-            left: Box::new(PhysicalPlan::table_scan("a")),
-            right: Box::new(PhysicalPlan::table_scan("b")),
-            condition: Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
-            join_type: JoinType::LeftOuter,
-        };
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("a"),
+            PhysicalPlan::table_scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::LeftOuter,
+        );
 
         let result = pass.optimize(plan);
 
@@ -491,12 +553,12 @@ mod tests {
         let pass = IndexJoinPass::new(&ctx);
 
         // Range join should not be converted to index join
-        let plan = PhysicalPlan::HashJoin {
-            left: Box::new(PhysicalPlan::table_scan("a")),
-            right: Box::new(PhysicalPlan::table_scan("b")),
-            condition: Expr::gt(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
-            join_type: JoinType::Inner,
-        };
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("a"),
+            PhysicalPlan::table_scan("b"),
+            Expr::gt(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::Inner,
+        );
 
         let result = pass.optimize(plan);
 
@@ -510,19 +572,19 @@ mod tests {
         let pass = IndexJoinPass::new(&ctx);
 
         // Create nested join: HashJoin(HashJoin(a, b), c)
-        let inner_join = PhysicalPlan::HashJoin {
-            left: Box::new(PhysicalPlan::table_scan("a")),
-            right: Box::new(PhysicalPlan::table_scan("b")),
-            condition: Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
-            join_type: JoinType::Inner,
-        };
+        let inner_join = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("a"),
+            PhysicalPlan::table_scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::Inner,
+        );
 
-        let outer_join = PhysicalPlan::HashJoin {
-            left: Box::new(inner_join),
-            right: Box::new(PhysicalPlan::table_scan("c")),
-            condition: Expr::eq(Expr::column("b", "id", 0), Expr::column("c", "b_id", 0)),
-            join_type: JoinType::Inner,
-        };
+        let outer_join = PhysicalPlan::hash_join(
+            inner_join,
+            PhysicalPlan::table_scan("c"),
+            Expr::eq(Expr::column("b", "id", 0), Expr::column("c", "b_id", 0)),
+            JoinType::Inner,
+        );
 
         let result = pass.optimize(outer_join);
 
@@ -559,15 +621,15 @@ mod tests {
         );
 
         let pass = IndexJoinPass::new(&ctx);
-        let plan = PhysicalPlan::HashJoin {
-            left: Box::new(PhysicalPlan::table_scan("big_outer")),
-            right: Box::new(PhysicalPlan::table_scan("small_inner")),
-            condition: Expr::eq(
+        let plan = PhysicalPlan::hash_join(
+            PhysicalPlan::table_scan("big_outer"),
+            PhysicalPlan::table_scan("small_inner"),
+            Expr::eq(
                 Expr::column("big_outer", "id", 0),
                 Expr::column("small_inner", "outer_id", 0),
             ),
-            join_type: JoinType::Inner,
-        };
+            JoinType::Inner,
+        );
 
         let result = pass.optimize(plan);
         assert!(matches!(result, PhysicalPlan::HashJoin { .. }));

@@ -130,6 +130,7 @@ impl<'a> GetRowCountPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let (left_opt, _) = self.traverse(*left);
                 let (right_opt, _) = self.traverse(*right);
@@ -139,6 +140,7 @@ impl<'a> GetRowCountPass<'a> {
                         right: Box::new(right_opt),
                         condition,
                         join_type,
+                        output_tables,
                     },
                     None,
                 )
@@ -149,6 +151,7 @@ impl<'a> GetRowCountPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let (left_opt, _) = self.traverse(*left);
                 let (right_opt, _) = self.traverse(*right);
@@ -158,6 +161,7 @@ impl<'a> GetRowCountPass<'a> {
                         right: Box::new(right_opt),
                         condition,
                         join_type,
+                        output_tables,
                     },
                     None,
                 )
@@ -168,6 +172,7 @@ impl<'a> GetRowCountPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let (left_opt, _) = self.traverse(*left);
                 let (right_opt, _) = self.traverse(*right);
@@ -177,6 +182,7 @@ impl<'a> GetRowCountPass<'a> {
                         right: Box::new(right_opt),
                         condition,
                         join_type,
+                        output_tables,
                     },
                     None,
                 )
@@ -188,6 +194,8 @@ impl<'a> GetRowCountPass<'a> {
                 inner_index,
                 condition,
                 join_type,
+                outer_is_left,
+                output_tables,
             } => {
                 let (outer_opt, _) = self.traverse(*outer);
                 (
@@ -197,6 +205,8 @@ impl<'a> GetRowCountPass<'a> {
                         inner_index,
                         condition,
                         join_type,
+                        outer_is_left,
+                        output_tables,
                     },
                     None,
                 )

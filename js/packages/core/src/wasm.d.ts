@@ -700,8 +700,10 @@ export class SelectBuilder {
      */
     min(column: string): SelectBuilder;
     /**
-     * Creates an observable query using re-query strategy.
-     * When data changes, the cached physical plan is re-executed (no optimization overhead).
+     * Creates an observable query using the cached execution path.
+     * When data changes, the engine reuses the compiled plan and can apply
+     * row-local patches for simple single-table pipelines instead of always
+     * re-executing the full query.
      */
     observe(): JsObservableQuery;
     /**
@@ -949,10 +951,10 @@ export interface InitOutput {
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
     readonly __wasm_bindgen_func_elem_75: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1664: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_4300: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1671: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_688: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_1984: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_4747: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_1991: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_929: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

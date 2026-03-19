@@ -136,11 +136,122 @@ impl RowAccessor for &[Value] {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JoinInputSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug)]
+struct JoinOutputSegment {
+    side: JoinInputSide,
+    source_offset: usize,
+    width: usize,
+}
+
+#[derive(Clone, Debug)]
+struct JoinOutputLayout {
+    tables: Vec<String>,
+    table_column_counts: Vec<usize>,
+    segments: Vec<JoinOutputSegment>,
+    total_width: usize,
+}
+
+impl JoinOutputLayout {
+    fn from_sources(
+        left_tables: &[String],
+        left_counts: &[usize],
+        right_tables: &[String],
+        right_counts: &[usize],
+        output_tables: &[String],
+    ) -> Self {
+        let mut tables = Vec::with_capacity(output_tables.len());
+        let mut table_column_counts = Vec::with_capacity(output_tables.len());
+        let mut segments = Vec::with_capacity(output_tables.len());
+        let mut total_width = 0usize;
+
+        for table in output_tables {
+            if let Some((source_offset, width)) =
+                Self::find_segment(left_tables, left_counts, table)
+            {
+                tables.push(table.clone());
+                table_column_counts.push(width);
+                segments.push(JoinOutputSegment {
+                    side: JoinInputSide::Left,
+                    source_offset,
+                    width,
+                });
+                total_width += width;
+                continue;
+            }
+
+            if let Some((source_offset, width)) =
+                Self::find_segment(right_tables, right_counts, table)
+            {
+                tables.push(table.clone());
+                table_column_counts.push(width);
+                segments.push(JoinOutputSegment {
+                    side: JoinInputSide::Right,
+                    source_offset,
+                    width,
+                });
+                total_width += width;
+            }
+        }
+
+        Self {
+            tables,
+            table_column_counts,
+            segments,
+            total_width,
+        }
+    }
+
+    fn from_relations(left: &Relation, right: &Relation, output_tables: &[String]) -> Self {
+        Self::from_sources(
+            left.tables(),
+            left.table_column_counts(),
+            right.tables(),
+            right.table_column_counts(),
+            output_tables,
+        )
+    }
+
+    fn from_meta(
+        left: &CompiledExecMeta,
+        right: &CompiledExecMeta,
+        output_tables: &[String],
+    ) -> Self {
+        Self::from_sources(
+            &left.tables,
+            &left.table_column_counts,
+            &right.tables,
+            &right.table_column_counts,
+            output_tables,
+        )
+    }
+
+    fn find_segment(
+        tables: &[String],
+        table_column_counts: &[usize],
+        target: &str,
+    ) -> Option<(usize, usize)> {
+        let mut offset = 0usize;
+        for (index, table) in tables.iter().enumerate() {
+            let width = table_column_counts.get(index).copied().unwrap_or(0);
+            if table == target {
+                return Some((offset, width));
+            }
+            offset += width;
+        }
+        None
+    }
+}
+
 struct JoinedRowView<'a> {
     left: Option<&'a RelationEntry>,
     right: Option<&'a RelationEntry>,
-    left_width: usize,
-    right_width: usize,
+    layout: &'a JoinOutputLayout,
 }
 
 impl<'a> JoinedRowView<'a> {
@@ -148,14 +259,12 @@ impl<'a> JoinedRowView<'a> {
     fn new(
         left: Option<&'a RelationEntry>,
         right: Option<&'a RelationEntry>,
-        left_width: usize,
-        right_width: usize,
+        layout: &'a JoinOutputLayout,
     ) -> Self {
         Self {
             left,
             right,
-            left_width,
-            right_width,
+            layout,
         }
     }
 
@@ -170,17 +279,25 @@ impl<'a> JoinedRowView<'a> {
     }
 
     fn materialize_row(&self) -> Rc<Row> {
-        let mut values = Vec::with_capacity(self.left_width + self.right_width);
-        if let Some(left) = self.left {
-            values.extend(left.row.values().iter().cloned());
-        } else {
-            values.resize(self.left_width, Value::Null);
-        }
+        let mut values = Vec::with_capacity(self.layout.total_width);
+        for segment in &self.layout.segments {
+            let source_entry = match segment.side {
+                JoinInputSide::Left => self.left,
+                JoinInputSide::Right => self.right,
+            };
 
-        if let Some(right) = self.right {
-            values.extend(right.row.values().iter().cloned());
-        } else {
-            values.resize(self.left_width + self.right_width, Value::Null);
+            if let Some(entry) = source_entry {
+                for index in 0..segment.width {
+                    values.push(
+                        entry
+                            .get_field(segment.source_offset + index)
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                }
+            } else {
+                values.resize(values.len() + segment.width, Value::Null);
+            }
         }
 
         Rc::new(Row::dummy_with_version(self.version(), values))
@@ -195,19 +312,23 @@ impl<'a> JoinedRowView<'a> {
 impl RowAccessor for JoinedRowView<'_> {
     #[inline]
     fn get_value(&self, index: usize) -> Option<&Value> {
-        if index < self.left_width {
-            return Some(match self.left {
-                Some(left) => left.get_field(index).unwrap_or(&NULL_VALUE),
-                None => &NULL_VALUE,
-            });
-        }
-
-        let right_index = index - self.left_width;
-        if right_index < self.right_width {
-            return Some(match self.right {
-                Some(right) => right.get_field(right_index).unwrap_or(&NULL_VALUE),
-                None => &NULL_VALUE,
-            });
+        let mut output_offset = 0usize;
+        for segment in &self.layout.segments {
+            let end = output_offset + segment.width;
+            if index < end {
+                let local_index = index - output_offset;
+                return Some(match segment.side {
+                    JoinInputSide::Left => self
+                        .left
+                        .and_then(|left| left.get_field(segment.source_offset + local_index))
+                        .unwrap_or(&NULL_VALUE),
+                    JoinInputSide::Right => self
+                        .right
+                        .and_then(|right| right.get_field(segment.source_offset + local_index))
+                        .unwrap_or(&NULL_VALUE),
+                });
+            }
+            output_offset = end;
         }
 
         None
@@ -558,6 +679,7 @@ enum CompiledExecPlanKind {
         inner_index: String,
         outer_key_idx: usize,
         join_type: crate::ast::JoinType,
+        outer_is_left: bool,
     },
     HashAggregate {
         input: Box<CompiledExecPlan>,
@@ -1255,6 +1377,21 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         }
     }
 
+    #[inline]
+    fn estimate_bounded_output_rows(
+        input_rows: Option<usize>,
+        limit: Option<usize>,
+        offset: usize,
+    ) -> Option<usize> {
+        input_rows.map(|rows| {
+            let remaining = rows.saturating_sub(offset);
+            match limit {
+                Some(limit) => remaining.min(limit),
+                None => remaining,
+            }
+        })
+    }
+
     fn compile_exec_plan(&self, plan: &PhysicalPlan) -> ExecutionResult<CompiledExecPlan> {
         let plan = Self::strip_noop(plan);
         match plan {
@@ -1277,22 +1414,22 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 limit,
                 offset,
                 reverse,
-            } => {
-                Ok(CompiledExecPlan {
-                    meta: self.compile_single_table_meta(table)?,
-                    estimated_rows: Some(limit.unwrap_or_else(|| {
-                        self.data_source.get_table_row_count(table).unwrap_or(0)
-                    })),
-                    kind: CompiledExecPlanKind::Source(CompiledSourcePlan::IndexScan {
-                        table: table.clone(),
-                        index: index.clone(),
-                        bounds: bounds.clone(),
-                        limit: *limit,
-                        offset: offset.unwrap_or(0),
-                        reverse: *reverse,
-                    }),
-                })
-            }
+            } => Ok(CompiledExecPlan {
+                meta: self.compile_single_table_meta(table)?,
+                estimated_rows: Self::estimate_bounded_output_rows(
+                    Some(self.data_source.get_table_row_count(table)?),
+                    *limit,
+                    offset.unwrap_or(0),
+                ),
+                kind: CompiledExecPlanKind::Source(CompiledSourcePlan::IndexScan {
+                    table: table.clone(),
+                    index: index.clone(),
+                    bounds: bounds.clone(),
+                    limit: *limit,
+                    offset: offset.unwrap_or(0),
+                    reverse: *reverse,
+                }),
+            }),
             PhysicalPlan::IndexGet {
                 table,
                 index,
@@ -1396,10 +1533,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 offset,
             } => {
                 let input = self.compile_exec_plan(input)?;
-                let estimated_rows = Some(match input.estimated_rows {
-                    Some(rows) => rows.saturating_sub(*offset).min(*limit),
-                    None => *limit,
-                });
+                let estimated_rows =
+                    Self::estimate_bounded_output_rows(input.estimated_rows, Some(*limit), *offset);
                 Ok(CompiledExecPlan {
                     meta: input.meta.clone(),
                     estimated_rows,
@@ -1438,12 +1573,13 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left = self.compile_exec_plan(left)?;
                 let right = self.compile_exec_plan(right)?;
                 let keys = Self::extract_join_keys_from_meta(condition, &left.meta, &right.meta)?;
                 Ok(CompiledExecPlan {
-                    meta: Self::compiled_join_meta(&left.meta, &right.meta),
+                    meta: Self::compiled_join_meta(&left.meta, &right.meta, output_tables),
                     estimated_rows: Self::estimate_join_output_rows(
                         left.estimated_rows,
                         right.estimated_rows,
@@ -1462,12 +1598,13 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left = self.compile_exec_plan(left)?;
                 let right = self.compile_exec_plan(right)?;
                 let keys = Self::extract_join_keys_from_meta(condition, &left.meta, &right.meta)?;
                 Ok(CompiledExecPlan {
-                    meta: Self::compiled_join_meta(&left.meta, &right.meta),
+                    meta: Self::compiled_join_meta(&left.meta, &right.meta, output_tables),
                     estimated_rows: Self::estimate_join_output_rows(
                         left.estimated_rows,
                         right.estimated_rows,
@@ -1486,10 +1623,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left = self.compile_exec_plan(left)?;
                 let right = self.compile_exec_plan(right)?;
-                let join_meta = Self::compiled_join_meta(&left.meta, &right.meta);
+                let join_meta = Self::compiled_join_meta(&left.meta, &right.meta, output_tables);
                 let bound_condition = Self::bind_expr_to_meta(condition, &join_meta);
                 Ok(CompiledExecPlan {
                     meta: join_meta,
@@ -1512,13 +1650,20 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 inner_index,
                 condition,
                 join_type,
+                outer_is_left,
+                output_tables,
             } => {
                 let outer = self.compile_exec_plan(outer)?;
                 let inner_meta = self.compile_single_table_meta(inner_table)?;
                 let outer_key_idx =
                     Self::extract_outer_key_index_from_meta(condition, &outer.meta)?;
                 Ok(CompiledExecPlan {
-                    meta: Self::compiled_join_meta(&outer.meta, &inner_meta),
+                    meta: Self::compiled_index_join_meta(
+                        &outer.meta,
+                        &inner_meta,
+                        *outer_is_left,
+                        output_tables,
+                    ),
                     estimated_rows: Self::estimate_index_join_output_rows(
                         outer.estimated_rows,
                         *join_type,
@@ -1529,6 +1674,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                         inner_index: inner_index.clone(),
                         outer_key_idx,
                         join_type: *join_type,
+                        outer_is_left: *outer_is_left,
                     },
                 })
             }
@@ -1571,7 +1717,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 let input = self.compile_exec_plan(input)?;
                 Ok(CompiledExecPlan {
                     meta: input.meta.clone(),
-                    estimated_rows: Some(*limit),
+                    estimated_rows: Self::estimate_bounded_output_rows(
+                        input.estimated_rows,
+                        Some(*limit),
+                        *offset,
+                    ),
                     kind: CompiledExecPlanKind::TopN {
                         input: Box::new(input),
                         order_by: order_by.clone(),
@@ -1583,8 +1733,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             PhysicalPlan::CrossProduct { left, right } => {
                 let left = self.compile_exec_plan(left)?;
                 let right = self.compile_exec_plan(right)?;
+                let mut output_tables = left.meta.tables.clone();
+                output_tables.extend(right.meta.tables.iter().cloned());
                 Ok(CompiledExecPlan {
-                    meta: Self::compiled_join_meta(&left.meta, &right.meta),
+                    meta: Self::compiled_join_meta(&left.meta, &right.meta, &output_tables),
                     estimated_rows: match (left.estimated_rows, right.estimated_rows) {
                         (Some(left_rows), Some(right_rows)) => {
                             Some(left_rows.saturating_mul(right_rows))
@@ -1615,14 +1767,26 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         CompiledExecMeta::new(input.tables.clone(), alloc::vec![output_column_count])
     }
 
-    fn compiled_join_meta(left: &CompiledExecMeta, right: &CompiledExecMeta) -> CompiledExecMeta {
-        let mut tables = left.tables.clone();
-        tables.extend(right.tables.iter().cloned());
+    fn compiled_join_meta(
+        left: &CompiledExecMeta,
+        right: &CompiledExecMeta,
+        output_tables: &[String],
+    ) -> CompiledExecMeta {
+        let layout = JoinOutputLayout::from_meta(left, right, output_tables);
+        CompiledExecMeta::new(layout.tables, layout.table_column_counts)
+    }
 
-        let mut table_column_counts = left.table_column_counts.clone();
-        table_column_counts.extend(right.table_column_counts.iter().copied());
-
-        CompiledExecMeta::new(tables, table_column_counts)
+    fn compiled_index_join_meta(
+        outer: &CompiledExecMeta,
+        inner: &CompiledExecMeta,
+        outer_is_left: bool,
+        output_tables: &[String],
+    ) -> CompiledExecMeta {
+        if outer_is_left {
+            Self::compiled_join_meta(outer, inner, output_tables)
+        } else {
+            Self::compiled_join_meta(inner, outer, output_tables)
+        }
     }
 
     fn estimate_join_output_rows(
@@ -1866,10 +2030,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left_rel = self.execute(left)?;
                 let right_rel = self.execute(right)?;
-                self.execute_hash_join(left_rel, right_rel, condition, *join_type)
+                self.execute_hash_join(left_rel, right_rel, condition, *join_type, output_tables)
             }
 
             PhysicalPlan::SortMergeJoin {
@@ -1877,10 +2042,17 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left_rel = self.execute(left)?;
                 let right_rel = self.execute(right)?;
-                self.execute_sort_merge_join(left_rel, right_rel, condition, *join_type)
+                self.execute_sort_merge_join(
+                    left_rel,
+                    right_rel,
+                    condition,
+                    *join_type,
+                    output_tables,
+                )
             }
 
             PhysicalPlan::NestedLoopJoin {
@@ -1888,10 +2060,17 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left_rel = self.execute(left)?;
                 let right_rel = self.execute(right)?;
-                self.execute_nested_loop_join(left_rel, right_rel, condition, *join_type)
+                self.execute_nested_loop_join(
+                    left_rel,
+                    right_rel,
+                    condition,
+                    *join_type,
+                    output_tables,
+                )
             }
 
             PhysicalPlan::IndexNestedLoopJoin {
@@ -1900,6 +2079,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 inner_index,
                 condition,
                 join_type,
+                outer_is_left,
+                output_tables,
             } => {
                 let outer_rel = self.execute(outer)?;
                 self.execute_index_nested_loop_join(
@@ -1908,6 +2089,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     inner_index,
                     condition,
                     *join_type,
+                    *outer_is_left,
+                    output_tables,
                 )
             }
 
@@ -2095,6 +2278,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     keys.left_key_idx,
                     keys.right_key_idx,
                     *join_type,
+                    &plan.meta.tables,
                     emit,
                 )
             }
@@ -2109,6 +2293,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 keys.left_key_idx,
                 keys.right_key_idx,
                 *join_type,
+                &plan.meta.tables,
                 emit,
             ),
             CompiledExecPlanKind::NestedLoopJoin {
@@ -2120,7 +2305,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 let left = self.execute_compiled_exec_plan(left)?;
                 let right = self.execute_compiled_exec_plan(right)?;
                 self.emit_nested_loop_join_entries_compiled(
-                    &left, &right, predicate, *join_type, emit,
+                    &left,
+                    &right,
+                    predicate,
+                    *join_type,
+                    &plan.meta.tables,
+                    emit,
                 )
             }
             CompiledExecPlanKind::IndexNestedLoopJoin {
@@ -2129,6 +2319,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 inner_index,
                 outer_key_idx,
                 join_type,
+                outer_is_left,
             } => {
                 let outer = self.execute_compiled_exec_plan(outer)?;
                 self.emit_index_nested_loop_join_entries_compiled(
@@ -2137,6 +2328,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                     inner_index,
                     *outer_key_idx,
                     *join_type,
+                    *outer_is_left,
+                    &plan.meta.tables,
                     emit,
                 )
             }
@@ -2434,29 +2627,61 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         Ok(true)
     }
 
-    #[inline]
-    fn relation_row_width(relation: &Relation) -> usize {
-        relation
-            .entries
-            .first()
-            .map(|entry| entry.row.len())
-            .unwrap_or_else(|| relation.table_column_counts().iter().sum())
-    }
-
-    fn combined_relation_metadata(left: &Relation, right: &Relation) -> (Vec<String>, Vec<usize>) {
-        let mut tables = left.tables().to_vec();
-        tables.extend(right.tables().iter().cloned());
-
-        let mut table_column_counts = left.table_column_counts().to_vec();
-        table_column_counts.extend(right.table_column_counts().iter().copied());
-
-        (tables, table_column_counts)
+    fn join_output_layout(
+        left: &Relation,
+        right: &Relation,
+        output_tables: &[String],
+    ) -> JoinOutputLayout {
+        JoinOutputLayout::from_relations(left, right, output_tables)
     }
 
     #[inline]
-    fn combined_shared_tables(left: &Relation, right: &Relation) -> SharedTables {
-        let (tables, _) = Self::combined_relation_metadata(left, right);
-        tables.into()
+    fn shared_tables_from_layout(layout: &JoinOutputLayout) -> SharedTables {
+        layout.tables.clone().into()
+    }
+
+    fn index_join_output_layout(
+        outer: &Relation,
+        inner_table: &str,
+        inner_col_count: usize,
+        outer_is_left: bool,
+        output_tables: &[String],
+    ) -> JoinOutputLayout {
+        let (left_tables, left_counts, right_tables, right_counts) = if outer_is_left {
+            (
+                outer.tables().to_vec(),
+                outer.table_column_counts().to_vec(),
+                alloc::vec![inner_table.into()],
+                alloc::vec![inner_col_count],
+            )
+        } else {
+            (
+                alloc::vec![inner_table.into()],
+                alloc::vec![inner_col_count],
+                outer.tables().to_vec(),
+                outer.table_column_counts().to_vec(),
+            )
+        };
+        JoinOutputLayout::from_sources(
+            &left_tables,
+            &left_counts,
+            &right_tables,
+            &right_counts,
+            output_tables,
+        )
+    }
+
+    fn index_nested_loop_view<'row>(
+        outer_entry: &'row RelationEntry,
+        inner_entry: Option<&'row RelationEntry>,
+        layout: &'row JoinOutputLayout,
+        outer_is_left: bool,
+    ) -> JoinedRowView<'row> {
+        if outer_is_left {
+            JoinedRowView::new(Some(outer_entry), inner_entry, layout)
+        } else {
+            JoinedRowView::new(inner_entry, Some(outer_entry), layout)
+        }
     }
 
     #[inline]
@@ -2544,10 +2769,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             CachedSingleTableProjection::Exprs(exprs) => exprs.len(),
         };
         let (tables, shared_tables) = Self::single_table_context(&pipeline.table);
-        let row_capacity = match pipeline.limit {
-            Some((limit, _)) => limit,
-            None => self.data_source.get_table_row_count(&pipeline.table)?,
-        };
+        let row_capacity = self.cached_single_table_pipeline_capacity(pipeline)?;
 
         if let Some((limit, _)) = pipeline.limit {
             if limit == 0 {
@@ -2828,15 +3050,24 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         &self,
         pipeline: &CachedSingleTablePipeline,
     ) -> ExecutionResult<Vec<Rc<Row>>> {
-        let mut rows = match pipeline.limit {
-            Some((limit, _)) => Vec::with_capacity(limit),
-            None => Vec::new(),
-        };
+        let mut rows = Vec::with_capacity(self.cached_single_table_pipeline_capacity(pipeline)?);
         self.execute_cached_single_table_pipeline_rows(pipeline, &mut |row| {
             rows.push(row);
             Ok(true)
         })?;
         Ok(rows)
+    }
+
+    fn cached_single_table_pipeline_capacity(
+        &self,
+        pipeline: &CachedSingleTablePipeline,
+    ) -> ExecutionResult<usize> {
+        let row_count = self.data_source.get_table_row_count(&pipeline.table)?;
+        let (limit, offset) = match pipeline.limit {
+            Some((limit, offset)) => (Some(limit), offset),
+            None => (None, 0),
+        };
+        Ok(Self::estimate_bounded_output_rows(Some(row_count), limit, offset).unwrap_or(0))
     }
 
     #[inline]
@@ -4204,6 +4435,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         left_key_idx: usize,
         right_key_idx: usize,
         join_type: crate::ast::JoinType,
+        output_tables: &[String],
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
         let is_outer = matches!(
@@ -4218,9 +4450,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             (right, left, right_key_idx, left_key_idx, false)
         };
 
-        let shared_tables = Self::combined_shared_tables(left, right);
-        let left_width = Self::relation_row_width(left);
-        let right_width = Self::relation_row_width(right);
+        let layout = Self::join_output_layout(left, right, output_tables);
+        let shared_tables = Self::shared_tables_from_layout(&layout);
 
         let mut hash_table: hashbrown::HashMap<&Value, Vec<u32>> =
             hashbrown::HashMap::with_capacity(build_rel.len());
@@ -4242,19 +4473,9 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                         for &build_index in build_indices {
                             let build_entry = &build_rel.entries[build_index as usize];
                             let view = if build_is_left {
-                                JoinedRowView::new(
-                                    Some(build_entry),
-                                    Some(probe_entry),
-                                    left_width,
-                                    right_width,
-                                )
+                                JoinedRowView::new(Some(build_entry), Some(probe_entry), &layout)
                             } else {
-                                JoinedRowView::new(
-                                    Some(probe_entry),
-                                    Some(build_entry),
-                                    left_width,
-                                    right_width,
-                                )
+                                JoinedRowView::new(Some(probe_entry), Some(build_entry), &layout)
                             };
                             if !self.emit_join_view(&view, &shared_tables, emit)? {
                                 return Ok(false);
@@ -4265,7 +4486,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }
 
             if is_outer && !matched {
-                let view = JoinedRowView::new(Some(probe_entry), None, left_width, right_width);
+                let view = JoinedRowView::new(Some(probe_entry), None, &layout);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
                 }
@@ -4282,6 +4503,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         left_key_idx: usize,
         right_key_idx: usize,
         join_type: crate::ast::JoinType,
+        output_tables: &[String],
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
         left.entries.sort_by(|a, b| {
@@ -4309,9 +4531,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             join_type,
             crate::ast::JoinType::LeftOuter | crate::ast::JoinType::FullOuter
         );
-        let shared_tables = Self::combined_shared_tables(&left, &right);
-        let left_width = Self::relation_row_width(&left);
-        let right_width = Self::relation_row_width(&right);
+        let layout = Self::join_output_layout(&left, &right, output_tables);
+        let shared_tables = Self::shared_tables_from_layout(&layout);
 
         let mut left_index = 0usize;
         let mut right_index = 0usize;
@@ -4321,7 +4542,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             let left_value = left_entry.get_field(left_key_idx);
             if left_value.map(|value| value.is_null()).unwrap_or(true) {
                 if is_outer {
-                    let view = JoinedRowView::new(Some(left_entry), None, left_width, right_width);
+                    let view = JoinedRowView::new(Some(left_entry), None, &layout);
                     if !self.emit_join_view(&view, &shared_tables, emit)? {
                         return Ok(false);
                     }
@@ -4357,12 +4578,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                 match left_value.cmp(right_value.unwrap()) {
                     Ordering::Equal => {
                         matched = true;
-                        let view = JoinedRowView::new(
-                            Some(left_entry),
-                            Some(right_entry),
-                            left_width,
-                            right_width,
-                        );
+                        let view = JoinedRowView::new(Some(left_entry), Some(right_entry), &layout);
                         if !self.emit_join_view(&view, &shared_tables, emit)? {
                             return Ok(false);
                         }
@@ -4374,7 +4590,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }
 
             if is_outer && !matched {
-                let view = JoinedRowView::new(Some(left_entry), None, left_width, right_width);
+                let view = JoinedRowView::new(Some(left_entry), None, &layout);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
                 }
@@ -4392,13 +4608,12 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         right: &Relation,
         condition: &Expr,
         join_type: crate::ast::JoinType,
+        output_tables: &[String],
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
-        let shared_tables = Self::combined_shared_tables(left, right);
-        let (tables, table_column_counts) = Self::combined_relation_metadata(left, right);
-        let ctx = EvalContext::new(&tables, &table_column_counts);
-        let left_width = Self::relation_row_width(left);
-        let right_width = Self::relation_row_width(right);
+        let layout = Self::join_output_layout(left, right, output_tables);
+        let shared_tables = Self::shared_tables_from_layout(&layout);
+        let ctx = EvalContext::new(&layout.tables, &layout.table_column_counts);
 
         let emit_unmatched_left = matches!(
             join_type,
@@ -4417,12 +4632,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         for left_entry in left.iter() {
             let mut matched = false;
             for (right_index, right_entry) in right.entries.iter().enumerate() {
-                let view = JoinedRowView::new(
-                    Some(left_entry),
-                    Some(right_entry),
-                    left_width,
-                    right_width,
-                );
+                let view = JoinedRowView::new(Some(left_entry), Some(right_entry), &layout);
                 if self.eval_predicate_accessor_ctx(condition, &view, Some(&ctx)) {
                     matched = true;
                     if track_right_matches {
@@ -4435,7 +4645,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }
 
             if emit_unmatched_left && !matched {
-                let view = JoinedRowView::new(Some(left_entry), None, left_width, right_width);
+                let view = JoinedRowView::new(Some(left_entry), None, &layout);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
                 }
@@ -4445,7 +4655,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         if track_right_matches {
             for (right_index, right_entry) in right.entries.iter().enumerate() {
                 if !right_matched[right_index] {
-                    let view = JoinedRowView::new(None, Some(right_entry), left_width, right_width);
+                    let view = JoinedRowView::new(None, Some(right_entry), &layout);
                     if !self.emit_join_view(&view, &shared_tables, emit)? {
                         return Ok(false);
                     }
@@ -4462,11 +4672,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         right: &Relation,
         predicate: &CompiledRowPredicate,
         join_type: crate::ast::JoinType,
+        output_tables: &[String],
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
-        let shared_tables = Self::combined_shared_tables(left, right);
-        let left_width = Self::relation_row_width(left);
-        let right_width = Self::relation_row_width(right);
+        let layout = Self::join_output_layout(left, right, output_tables);
+        let shared_tables = Self::shared_tables_from_layout(&layout);
 
         let emit_unmatched_left = matches!(
             join_type,
@@ -4485,12 +4695,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         for left_entry in left.iter() {
             let mut matched = false;
             for (right_index, right_entry) in right.entries.iter().enumerate() {
-                let view = JoinedRowView::new(
-                    Some(left_entry),
-                    Some(right_entry),
-                    left_width,
-                    right_width,
-                );
+                let view = JoinedRowView::new(Some(left_entry), Some(right_entry), &layout);
                 if matches!(
                     self.eval_compiled_predicate_accessor(&view, predicate),
                     PredicateValueState::Boolean(true)
@@ -4506,7 +4711,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }
 
             if emit_unmatched_left && !matched {
-                let view = JoinedRowView::new(Some(left_entry), None, left_width, right_width);
+                let view = JoinedRowView::new(Some(left_entry), None, &layout);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
                 }
@@ -4516,7 +4721,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         if track_right_matches {
             for (right_index, right_entry) in right.entries.iter().enumerate() {
                 if !right_matched[right_index] {
-                    let view = JoinedRowView::new(None, Some(right_entry), left_width, right_width);
+                    let view = JoinedRowView::new(None, Some(right_entry), &layout);
                     if !self.emit_join_view(&view, &shared_tables, emit)? {
                         return Ok(false);
                     }
@@ -4534,6 +4739,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         inner_index: &str,
         condition: &Expr,
         join_type: crate::ast::JoinType,
+        outer_is_left: bool,
+        output_tables: &[String],
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
         let is_outer = matches!(
@@ -4542,11 +4749,14 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         );
         let outer_key_idx = self.extract_outer_key_index(condition, outer)?;
         let inner_col_count = self.data_source.get_column_count(inner_table)?;
-
-        let mut tables = outer.tables().to_vec();
-        tables.push(inner_table.into());
-        let shared_tables: SharedTables = tables.into();
-        let outer_width = Self::relation_row_width(outer);
+        let layout = Self::index_join_output_layout(
+            outer,
+            inner_table,
+            inner_col_count,
+            outer_is_left,
+            output_tables,
+        );
+        let shared_tables = Self::shared_tables_from_layout(&layout);
 
         for outer_entry in outer.iter() {
             let mut matched = false;
@@ -4563,11 +4773,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                         |inner_row| {
                             let inner_entry =
                                 RelationEntry::from_row(Rc::clone(inner_row), inner_table);
-                            let view = JoinedRowView::new(
-                                Some(outer_entry),
+                            let view = Self::index_nested_loop_view(
+                                outer_entry,
                                 Some(&inner_entry),
-                                outer_width,
-                                inner_col_count,
+                                &layout,
+                                outer_is_left,
                             );
                             matched = true;
                             match self.emit_join_view(&view, &shared_tables, emit) {
@@ -4593,8 +4803,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }
 
             if is_outer && !matched {
-                let view =
-                    JoinedRowView::new(Some(outer_entry), None, outer_width, inner_col_count);
+                let view = Self::index_nested_loop_view(outer_entry, None, &layout, outer_is_left);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
                 }
@@ -4611,6 +4820,8 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         inner_index: &str,
         outer_key_idx: usize,
         join_type: crate::ast::JoinType,
+        outer_is_left: bool,
+        output_tables: &[String],
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
         let is_outer = matches!(
@@ -4618,11 +4829,14 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             crate::ast::JoinType::LeftOuter | crate::ast::JoinType::FullOuter
         );
         let inner_col_count = self.data_source.get_column_count(inner_table)?;
-
-        let mut tables = outer.tables().to_vec();
-        tables.push(inner_table.into());
-        let shared_tables: SharedTables = tables.into();
-        let outer_width = Self::relation_row_width(outer);
+        let layout = Self::index_join_output_layout(
+            outer,
+            inner_table,
+            inner_col_count,
+            outer_is_left,
+            output_tables,
+        );
+        let shared_tables = Self::shared_tables_from_layout(&layout);
 
         for outer_entry in outer.iter() {
             let mut matched = false;
@@ -4639,11 +4853,11 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
                         |inner_row| {
                             let inner_entry =
                                 RelationEntry::from_row(Rc::clone(inner_row), inner_table);
-                            let view = JoinedRowView::new(
-                                Some(outer_entry),
+                            let view = Self::index_nested_loop_view(
+                                outer_entry,
                                 Some(&inner_entry),
-                                outer_width,
-                                inner_col_count,
+                                &layout,
+                                outer_is_left,
                             );
                             matched = true;
                             match self.emit_join_view(&view, &shared_tables, emit) {
@@ -4669,8 +4883,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             }
 
             if is_outer && !matched {
-                let view =
-                    JoinedRowView::new(Some(outer_entry), None, outer_width, inner_col_count);
+                let view = Self::index_nested_loop_view(outer_entry, None, &layout, outer_is_left);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
                 }
@@ -4686,18 +4899,14 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         right: &Relation,
         emit: &mut dyn FnMut(RelationEntry) -> ExecutionResult<bool>,
     ) -> ExecutionResult<bool> {
-        let shared_tables = Self::combined_shared_tables(left, right);
-        let left_width = Self::relation_row_width(left);
-        let right_width = Self::relation_row_width(right);
+        let mut output_tables = left.tables().to_vec();
+        output_tables.extend(right.tables().iter().cloned());
+        let layout = Self::join_output_layout(left, right, &output_tables);
+        let shared_tables = Self::shared_tables_from_layout(&layout);
 
         for left_entry in left.iter() {
             for right_entry in right.iter() {
-                let view = JoinedRowView::new(
-                    Some(left_entry),
-                    Some(right_entry),
-                    left_width,
-                    right_width,
-                );
+                let view = JoinedRowView::new(Some(left_entry), Some(right_entry), &layout);
                 if !self.emit_join_view(&view, &shared_tables, emit)? {
                     return Ok(false);
                 }
@@ -4713,9 +4922,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         right: Relation,
         condition: &Expr,
         join_type: crate::ast::JoinType,
+        output_tables: &[String],
     ) -> ExecutionResult<Relation> {
         let (left_key_idx, right_key_idx) = self.extract_join_keys(condition, &left, &right)?;
-        let (tables, table_column_counts) = Self::combined_relation_metadata(&left, &right);
+        let layout = Self::join_output_layout(&left, &right, output_tables);
         let mut entries = Vec::new();
         self.emit_hash_join_entries(
             &left,
@@ -4723,12 +4933,17 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             left_key_idx,
             right_key_idx,
             join_type,
+            output_tables,
             &mut |entry| {
                 entries.push(entry);
                 Ok(true)
             },
         )?;
-        Ok(Relation::from_entries(entries, tables, table_column_counts))
+        Ok(Relation::from_entries(
+            entries,
+            layout.tables,
+            layout.table_column_counts,
+        ))
     }
 
     fn execute_sort_merge_join(
@@ -4737,9 +4952,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         right: Relation,
         condition: &Expr,
         join_type: crate::ast::JoinType,
+        output_tables: &[String],
     ) -> ExecutionResult<Relation> {
         let (left_key_idx, right_key_idx) = self.extract_join_keys(condition, &left, &right)?;
-        let (tables, table_column_counts) = Self::combined_relation_metadata(&left, &right);
+        let layout = Self::join_output_layout(&left, &right, output_tables);
         let mut entries = Vec::new();
         self.emit_sort_merge_join_entries(
             left,
@@ -4747,12 +4963,17 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             left_key_idx,
             right_key_idx,
             join_type,
+            output_tables,
             &mut |entry| {
                 entries.push(entry);
                 Ok(true)
             },
         )?;
-        Ok(Relation::from_entries(entries, tables, table_column_counts))
+        Ok(Relation::from_entries(
+            entries,
+            layout.tables,
+            layout.table_column_counts,
+        ))
     }
 
     fn execute_nested_loop_join(
@@ -4761,14 +4982,26 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         right: Relation,
         condition: &Expr,
         join_type: crate::ast::JoinType,
+        output_tables: &[String],
     ) -> ExecutionResult<Relation> {
-        let (tables, table_column_counts) = Self::combined_relation_metadata(&left, &right);
+        let layout = Self::join_output_layout(&left, &right, output_tables);
         let mut entries = Vec::new();
-        self.emit_nested_loop_join_entries(&left, &right, condition, join_type, &mut |entry| {
-            entries.push(entry);
-            Ok(true)
-        })?;
-        Ok(Relation::from_entries(entries, tables, table_column_counts))
+        self.emit_nested_loop_join_entries(
+            &left,
+            &right,
+            condition,
+            join_type,
+            output_tables,
+            &mut |entry| {
+                entries.push(entry);
+                Ok(true)
+            },
+        )?;
+        Ok(Relation::from_entries(
+            entries,
+            layout.tables,
+            layout.table_column_counts,
+        ))
     }
 
     fn execute_index_nested_loop_join(
@@ -4778,12 +5011,17 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         inner_index: &str,
         condition: &Expr,
         join_type: crate::ast::JoinType,
+        outer_is_left: bool,
+        output_tables: &[String],
     ) -> ExecutionResult<Relation> {
         let inner_col_count = self.data_source.get_column_count(inner_table)?;
-        let mut tables = outer.tables().to_vec();
-        tables.push(inner_table.into());
-        let mut table_column_counts = outer.table_column_counts().to_vec();
-        table_column_counts.push(inner_col_count);
+        let layout = Self::index_join_output_layout(
+            &outer,
+            inner_table,
+            inner_col_count,
+            outer_is_left,
+            output_tables,
+        );
 
         let mut entries = Vec::new();
         self.emit_index_nested_loop_join_entries(
@@ -4792,23 +5030,35 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             inner_index,
             condition,
             join_type,
+            outer_is_left,
+            output_tables,
             &mut |entry| {
                 entries.push(entry);
                 Ok(true)
             },
         )?;
 
-        Ok(Relation::from_entries(entries, tables, table_column_counts))
+        Ok(Relation::from_entries(
+            entries,
+            layout.tables,
+            layout.table_column_counts,
+        ))
     }
 
     fn execute_cross_product(&self, left: Relation, right: Relation) -> ExecutionResult<Relation> {
-        let (tables, table_column_counts) = Self::combined_relation_metadata(&left, &right);
+        let mut output_tables = left.tables().to_vec();
+        output_tables.extend(right.tables().iter().cloned());
+        let layout = Self::join_output_layout(&left, &right, &output_tables);
         let mut entries = Vec::new();
         self.emit_cross_product_entries(&left, &right, &mut |entry| {
             entries.push(entry);
             Ok(true)
         })?;
-        Ok(Relation::from_entries(entries, tables, table_column_counts))
+        Ok(Relation::from_entries(
+            entries,
+            layout.tables,
+            layout.table_column_counts,
+        ))
     }
 
     fn execute_union(
@@ -4965,10 +5215,10 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
             })
             .collect();
 
-        let k = limit + offset;
+        let k = limit.saturating_add(offset);
 
         // For small k or small input, just use sort
-        if k == 0 || input.len() <= k * 2 {
+        if k == 0 || input.len() <= k.saturating_mul(2) {
             let executor = SortExecutor::new(order_by_indices);
             let sorted = executor.execute(input);
             let limit_executor = LimitExecutor::new(limit, offset);
@@ -4976,7 +5226,7 @@ impl<'a, D: DataSource> PhysicalPlanRunner<'a, D> {
         }
 
         // Build heap with capacity k (using reference to avoid cloning order_by per entry)
-        let mut heap: BinaryHeap<TopNHeapEntry> = BinaryHeap::with_capacity(k + 1);
+        let mut heap: BinaryHeap<TopNHeapEntry> = BinaryHeap::with_capacity(k.saturating_add(1));
 
         for entry in input.into_iter() {
             let heap_entry = TopNHeapEntry {
@@ -7223,6 +7473,13 @@ mod tests {
     }
 
     #[test]
+    fn test_execution_artifact_matches_offset_beyond_input() {
+        let plan = PhysicalPlan::limit(PhysicalPlan::table_scan("users"), 1_000_000_000, 10);
+
+        assert_execution_artifact_matches(&plan);
+    }
+
+    #[test]
     fn test_hash_join() {
         let ds = create_test_data_source();
         let runner = PhysicalPlanRunner::new(&ds);
@@ -7242,6 +7499,76 @@ mod tests {
         // Alice and Charlie match Engineering (10), Bob matches Sales (20)
         assert_eq!(result.len(), 3);
         assert_eq!(result.tables(), &["users", "departments"]);
+    }
+
+    #[test]
+    fn test_index_nested_loop_join_preserves_logical_output_order() {
+        let ds = create_test_data_source();
+        let runner = PhysicalPlanRunner::new(&ds);
+
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            outer: Box::new(PhysicalPlan::table_scan("departments")),
+            inner_table: "users".into(),
+            inner_index: "idx_dept".into(),
+            condition: Expr::eq(
+                Expr::column("users", "dept_id", 2),
+                Expr::column("departments", "id", 0),
+            ),
+            join_type: JoinType::Inner,
+            outer_is_left: false,
+            output_tables: alloc::vec!["users".into(), "departments".into()],
+        };
+
+        let result = runner.execute(&plan).unwrap();
+        assert_eq!(result.tables(), &["users", "departments"]);
+        assert_eq!(
+            result.entries[0].row.values(),
+            &[
+                Value::Int64(1),
+                Value::String("Alice".into()),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::String("Engineering".into()),
+            ]
+        );
+        assert_eq!(
+            result.entries[1].row.values(),
+            &[
+                Value::Int64(3),
+                Value::String("Charlie".into()),
+                Value::Int64(10),
+                Value::Int64(10),
+                Value::String("Engineering".into()),
+            ]
+        );
+        assert_eq!(
+            result.entries[2].row.values(),
+            &[
+                Value::Int64(2),
+                Value::String("Bob".into()),
+                Value::Int64(20),
+                Value::Int64(20),
+                Value::String("Sales".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_full_execution_artifact_matches_index_nested_loop_join_logical_order() {
+        let plan = PhysicalPlan::IndexNestedLoopJoin {
+            outer: Box::new(PhysicalPlan::table_scan("departments")),
+            inner_table: "users".into(),
+            inner_index: "idx_dept".into(),
+            condition: Expr::eq(
+                Expr::column("users", "dept_id", 2),
+                Expr::column("departments", "id", 0),
+            ),
+            join_type: JoinType::Inner,
+            outer_is_left: false,
+            output_tables: alloc::vec!["users".into(), "departments".into()],
+        };
+
+        assert_full_execution_artifact_matches(&plan);
     }
 
     #[test]
@@ -7503,6 +7830,18 @@ mod tests {
             2,
             0,
         );
+
+        assert_full_execution_artifact_matches(&plan);
+    }
+
+    #[test]
+    fn test_full_execution_artifact_matches_topn_offset_beyond_input() {
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::table_scan("users")),
+            order_by: vec![(Expr::column("users", "id", 0), SortOrder::Asc)],
+            limit: 1_000_000_000,
+            offset: 10,
+        };
 
         assert_full_execution_artifact_matches(&plan);
     }

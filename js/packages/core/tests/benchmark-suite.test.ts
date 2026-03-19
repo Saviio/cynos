@@ -21,6 +21,9 @@ beforeAll(async () => {
   await init();
 });
 
+const hasBenchmarkRangeQuery =
+  typeof (Database as any).prototype?.benchmarkRangeQuery === 'function';
+
 // ============================================================================
 // 测试结果收集
 // ============================================================================
@@ -386,7 +389,7 @@ describe('2. 查询性能', () => {
     addResult('2. 查询性能', '范围查询 (90%选择度)', '耗时', formatTime(duration));
   }, 120000);
 
-  it('2.2.1 序列化开销分析', async () => {
+  it.runIf(hasBenchmarkRangeQuery)('2.2.1 序列化开销分析', async () => {
     const db = createNarrowDb('query_serialization_overhead');
     const size = 100000;
 

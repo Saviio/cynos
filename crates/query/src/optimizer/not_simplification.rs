@@ -38,11 +38,13 @@ impl NotSimplification {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => LogicalPlan::Join {
                 left: Box::new(self.simplify_plan(*left)),
                 right: Box::new(self.simplify_plan(*right)),
                 condition: self.simplify_expr(condition),
                 join_type,
+                output_tables,
             },
             LogicalPlan::Project { input, columns } => LogicalPlan::Project {
                 input: Box::new(self.simplify_plan(*input)),

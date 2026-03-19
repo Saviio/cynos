@@ -135,12 +135,16 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
             right,
             condition,
             join_type,
+            output_tables,
         } => {
             hasher.write(b"join");
             hash_logical_plan(left, hasher);
             hash_logical_plan(right, hasher);
             hash_expr(condition, hasher);
             hasher.write(&[*join_type as u8]);
+            for table in output_tables {
+                hasher.write(table.as_bytes());
+            }
         }
         LogicalPlan::Aggregate {
             input,
@@ -1089,6 +1093,7 @@ mod tests {
             right: Box::new(PhysicalPlan::table_scan("orders")),
             condition: Expr::Literal(Value::Boolean(true)),
             join_type: JoinType::Inner,
+            output_tables: alloc::vec!["users".into(), "orders".into()],
         };
 
         let products_plan = PhysicalPlan::table_scan("products");

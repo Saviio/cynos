@@ -231,11 +231,13 @@ impl IndexSelection {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => LogicalPlan::Join {
                 left: Box::new(self.select_indexes(*left)),
                 right: Box::new(self.select_indexes(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             LogicalPlan::Aggregate {

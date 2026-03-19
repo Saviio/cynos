@@ -14,6 +14,7 @@ use crate::optimizer::OptimizerPass;
 use crate::planner::LogicalPlan;
 use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 use hashbrown::HashSet;
 
 /// Predicate pushdown optimization.
@@ -47,11 +48,13 @@ impl PredicatePushdown {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => LogicalPlan::Join {
                 left: Box::new(self.pushdown(*left)),
                 right: Box::new(self.pushdown(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             LogicalPlan::Aggregate {
@@ -125,7 +128,15 @@ impl PredicatePushdown {
                 right,
                 condition,
                 join_type,
-            } => self.push_filter_into_join(*left, *right, condition, join_type, predicate),
+                output_tables,
+            } => self.push_filter_into_join(
+                *left,
+                *right,
+                condition,
+                join_type,
+                output_tables,
+                predicate,
+            ),
 
             // Can't push filter below aggregate
             LogicalPlan::Aggregate { .. } => LogicalPlan::Filter {
@@ -183,6 +194,7 @@ impl PredicatePushdown {
         right: LogicalPlan,
         condition: Expr,
         join_type: JoinType,
+        output_tables: Vec<String>,
         predicate: Expr,
     ) -> LogicalPlan {
         // Extract tables referenced by each side of the join
@@ -206,6 +218,7 @@ impl PredicatePushdown {
                         right: Box::new(right),
                         condition,
                         join_type,
+                        output_tables,
                     }
                 } else if refs_right && !refs_left {
                     // Push to right side
@@ -214,6 +227,7 @@ impl PredicatePushdown {
                         right: Box::new(self.try_push_filter(right, predicate)),
                         condition,
                         join_type,
+                        output_tables,
                     }
                 } else {
                     // References both sides or neither - keep above join
@@ -223,6 +237,7 @@ impl PredicatePushdown {
                             right: Box::new(right),
                             condition,
                             join_type,
+                            output_tables,
                         }),
                         predicate,
                     }
@@ -239,6 +254,7 @@ impl PredicatePushdown {
                         right: Box::new(right),
                         condition,
                         join_type,
+                        output_tables,
                     }
                 } else {
                     // Keep above join
@@ -248,6 +264,7 @@ impl PredicatePushdown {
                             right: Box::new(right),
                             condition,
                             join_type,
+                            output_tables,
                         }),
                         predicate,
                     }
@@ -264,6 +281,7 @@ impl PredicatePushdown {
                         right: Box::new(self.try_push_filter(right, predicate)),
                         condition,
                         join_type,
+                        output_tables,
                     }
                 } else {
                     LogicalPlan::Filter {
@@ -272,6 +290,7 @@ impl PredicatePushdown {
                             right: Box::new(right),
                             condition,
                             join_type,
+                            output_tables,
                         }),
                         predicate,
                     }
@@ -286,6 +305,7 @@ impl PredicatePushdown {
                         right: Box::new(right),
                         condition,
                         join_type,
+                        output_tables,
                     }),
                     predicate,
                 }

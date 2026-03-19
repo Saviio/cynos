@@ -189,6 +189,7 @@ impl Optimizer {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
                 let left_physical = self.logical_to_physical(*left);
                 let right_physical = self.logical_to_physical(*right);
@@ -197,21 +198,27 @@ impl Optimizer {
                 let algorithm = self.choose_join_algorithm(&condition);
 
                 match algorithm {
-                    JoinAlgorithm::Hash => {
-                        PhysicalPlan::hash_join(left_physical, right_physical, condition, join_type)
-                    }
-                    JoinAlgorithm::SortMerge => PhysicalPlan::sort_merge_join(
+                    JoinAlgorithm::Hash => PhysicalPlan::hash_join_with_output_tables(
                         left_physical,
                         right_physical,
                         condition,
                         join_type,
+                        output_tables,
+                    ),
+                    JoinAlgorithm::SortMerge => PhysicalPlan::sort_merge_join_with_output_tables(
+                        left_physical,
+                        right_physical,
+                        condition,
+                        join_type,
+                        output_tables,
                     ),
                     JoinAlgorithm::NestedLoop | JoinAlgorithm::IndexNestedLoop => {
-                        PhysicalPlan::nested_loop_join(
+                        PhysicalPlan::nested_loop_join_with_output_tables(
                             left_physical,
                             right_physical,
                             condition,
                             join_type,
+                            output_tables,
                         )
                     }
                 }

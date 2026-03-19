@@ -1436,10 +1436,18 @@ impl SelectBuilder {
             SchemaLayout::from_schemas(&schemas)
         };
         let physical_plan = compile_plan(&cache, table_name, logical_plan);
+        let mut table_column_counts = hashbrown::HashMap::new();
+        table_column_counts.insert(table_name.clone(), store.schema().columns().len());
+        for join in &self.joins {
+            let join_store = cache.get_table(&join.table).ok_or_else(|| {
+                JsValue::from_str(&alloc::format!("Join table not found: {}", join.table))
+            })?;
+            table_column_counts.insert(join.table.clone(), join_store.schema().columns().len());
+        }
 
         // Compile physical plan to dataflow — errors if not incrementalizable
         let table_id_map = self.table_id_map.borrow();
-        let compile_result = compile_to_dataflow(&physical_plan, &table_id_map)
+        let compile_result = compile_to_dataflow(&physical_plan, &table_id_map, &table_column_counts)
             .ok_or_else(|| JsValue::from_str(
                 "Query is not incrementalizable (contains ORDER BY, LIMIT, or other non-streamable operators). Use observe() instead."
             ))?;

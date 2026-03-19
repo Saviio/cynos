@@ -96,57 +96,45 @@ impl JoinReorder {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => {
-                // First, recursively optimize children
                 let optimized_left = self.reorder(*left);
                 let optimized_right = self.reorder(*right);
-
-                // Only reorder inner joins
-                if join_type != JoinType::Inner {
-                    return LogicalPlan::Join {
-                        left: Box::new(optimized_left),
-                        right: Box::new(optimized_right),
-                        condition,
-                        join_type,
-                    };
-                }
-
-                // Try to collect all tables and conditions from a chain of inner joins
-                let mut nodes = Vec::new();
-                let mut conditions = Vec::new();
-
-                self.collect_join_nodes(
-                    &LogicalPlan::Join {
-                        left: Box::new(optimized_left),
-                        right: Box::new(optimized_right),
-                        condition,
-                        join_type,
-                    },
-                    &mut nodes,
-                    &mut conditions,
+                let original_join = LogicalPlan::join_with_output_tables(
+                    optimized_left,
+                    optimized_right,
+                    condition,
+                    join_type,
+                    output_tables,
                 );
 
-                // If we only have 2 nodes, no reordering needed
+                if join_type != JoinType::Inner {
+                    return original_join;
+                }
+
+                let original_output_tables = original_join.output_tables();
+                let mut nodes = Vec::new();
+                let mut conditions = Vec::new();
+                self.collect_join_nodes(&original_join, &mut nodes, &mut conditions);
+
                 if nodes.len() <= 2 {
-                    // Reconstruct the original join
                     if nodes.len() == 2 && !conditions.is_empty() {
                         let (left_node, right_node) = self.order_two_nodes(nodes);
-                        return LogicalPlan::Join {
-                            left: Box::new(left_node.plan),
-                            right: Box::new(right_node.plan),
-                            condition: conditions.into_iter().next().unwrap().condition,
-                            join_type: JoinType::Inner,
-                        };
+                        return LogicalPlan::join_with_output_tables(
+                            left_node.plan,
+                            right_node.plan,
+                            conditions.into_iter().next().unwrap().condition,
+                            JoinType::Inner,
+                            original_output_tables,
+                        );
                     }
-                    // Fallback: return as-is if we can't process
                     if let Some(node) = nodes.into_iter().next() {
                         return node.plan;
                     }
                     return LogicalPlan::Empty;
                 }
 
-                // Apply greedy reordering
-                self.greedy_reorder(nodes, conditions)
+                self.greedy_reorder(nodes, conditions, &original_output_tables)
             }
 
             LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
@@ -219,6 +207,7 @@ impl JoinReorder {
                 right,
                 condition,
                 join_type: JoinType::Inner,
+                ..
             } => {
                 // Recursively collect from left and right
                 self.collect_join_nodes(left, nodes, conditions);
@@ -267,6 +256,7 @@ impl JoinReorder {
         &self,
         mut nodes: Vec<JoinNode>,
         conditions: Vec<JoinCondition>,
+        original_output_tables: &[String],
     ) -> LogicalPlan {
         if nodes.is_empty() {
             return LogicalPlan::Empty;
@@ -329,16 +319,18 @@ impl JoinReorder {
                 if let (Some(idx), Some(cond_idx)) = (found_idx, found_cond_idx) {
                     let next_node = nodes.remove(idx);
                     used_conditions[cond_idx] = true;
-
-                    let new_plan = LogicalPlan::Join {
-                        left: Box::new(result_node.plan),
-                        right: Box::new(next_node.plan),
-                        condition: conditions[cond_idx].condition.clone(),
-                        join_type: JoinType::Inner,
-                    };
-
                     let mut new_tables = result_node.tables;
                     new_tables.extend(next_node.tables);
+                    let output_tables =
+                        Self::filter_output_tables(original_output_tables, &new_tables);
+
+                    let new_plan = LogicalPlan::join_with_output_tables(
+                        result_node.plan,
+                        next_node.plan,
+                        conditions[cond_idx].condition.clone(),
+                        JoinType::Inner,
+                        output_tables.clone(),
+                    );
 
                     result_node = JoinNode {
                         plan: new_plan,
@@ -353,15 +345,16 @@ impl JoinReorder {
 
                 // No valid join condition found, use cross product as last resort
                 let next_node = nodes.remove(0);
-                let new_plan = LogicalPlan::Join {
-                    left: Box::new(result_node.plan),
-                    right: Box::new(next_node.plan),
-                    condition: Expr::literal(true),
-                    join_type: JoinType::Inner,
-                };
-
                 let mut new_tables = result_node.tables;
                 new_tables.extend(next_node.tables);
+                let output_tables = Self::filter_output_tables(original_output_tables, &new_tables);
+                let new_plan = LogicalPlan::join_with_output_tables(
+                    result_node.plan,
+                    next_node.plan,
+                    Expr::literal(true),
+                    JoinType::Inner,
+                    output_tables.clone(),
+                );
 
                 result_node = JoinNode {
                     plan: new_plan,
@@ -385,16 +378,17 @@ impl JoinReorder {
             };
 
             // Create the join
-            let new_plan = LogicalPlan::Join {
-                left: Box::new(result_node.plan),
-                right: Box::new(next_node.plan),
-                condition,
-                join_type: JoinType::Inner,
-            };
-
             // Update result node
             let mut new_tables = result_node.tables;
             new_tables.extend(next_node.tables);
+            let output_tables = Self::filter_output_tables(original_output_tables, &new_tables);
+            let new_plan = LogicalPlan::join_with_output_tables(
+                result_node.plan,
+                next_node.plan,
+                condition,
+                JoinType::Inner,
+                output_tables.clone(),
+            );
 
             result_node = JoinNode {
                 plan: new_plan,
@@ -599,6 +593,19 @@ impl JoinReorder {
         let product = left_card.saturating_mul(right_card);
         core::cmp::max(product / 10, 1)
     }
+
+    fn filter_output_tables(
+        original_output_tables: &[String],
+        included_tables: &[String],
+    ) -> Vec<String> {
+        let mut filtered = Vec::new();
+        for table in original_output_tables {
+            if included_tables.contains(table) {
+                filtered.push(table.clone());
+            }
+        }
+        filtered
+    }
 }
 
 #[cfg(test)]
@@ -643,12 +650,12 @@ mod tests {
     fn test_join_reorder_basic() {
         let pass = JoinReorder::new();
 
-        let plan = LogicalPlan::Join {
-            left: Box::new(LogicalPlan::scan("a")),
-            right: Box::new(LogicalPlan::scan("b")),
-            condition: Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
-            join_type: JoinType::Inner,
-        };
+        let plan = LogicalPlan::join(
+            LogicalPlan::scan("a"),
+            LogicalPlan::scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::Inner,
+        );
 
         let optimized = pass.optimize(plan);
         assert!(matches!(optimized, LogicalPlan::Join { .. }));
@@ -661,23 +668,23 @@ mod tests {
 
         // Create: large JOIN medium JOIN small
         // Should reorder to: small JOIN medium JOIN large
-        let plan = LogicalPlan::Join {
-            left: Box::new(LogicalPlan::Join {
-                left: Box::new(LogicalPlan::scan("large")),
-                right: Box::new(LogicalPlan::scan("medium")),
-                condition: Expr::eq(
+        let plan = LogicalPlan::join(
+            LogicalPlan::join(
+                LogicalPlan::scan("large"),
+                LogicalPlan::scan("medium"),
+                Expr::eq(
                     Expr::column("large", "id", 0),
                     Expr::column("medium", "large_id", 0),
                 ),
-                join_type: JoinType::Inner,
-            }),
-            right: Box::new(LogicalPlan::scan("small")),
-            condition: Expr::eq(
+                JoinType::Inner,
+            ),
+            LogicalPlan::scan("small"),
+            Expr::eq(
                 Expr::column("medium", "id", 0),
                 Expr::column("small", "medium_id", 0),
             ),
-            join_type: JoinType::Inner,
-        };
+            JoinType::Inner,
+        );
 
         let optimized = pass.optimize(plan);
 
@@ -693,12 +700,12 @@ mod tests {
         let pass = JoinReorder::new();
 
         // Left outer join should not be reordered
-        let plan = LogicalPlan::Join {
-            left: Box::new(LogicalPlan::scan("a")),
-            right: Box::new(LogicalPlan::scan("b")),
-            condition: Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
-            join_type: JoinType::LeftOuter,
-        };
+        let plan = LogicalPlan::join(
+            LogicalPlan::scan("a"),
+            LogicalPlan::scan("b"),
+            Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
+            JoinType::LeftOuter,
+        );
 
         let optimized = pass.optimize(plan);
 
@@ -715,23 +722,23 @@ mod tests {
         let pass = JoinReorder::with_context(ctx);
 
         // (a JOIN b) JOIN c
-        let plan = LogicalPlan::Join {
-            left: Box::new(LogicalPlan::Join {
-                left: Box::new(LogicalPlan::scan("large")),
-                right: Box::new(LogicalPlan::scan("small")),
-                condition: Expr::eq(
+        let plan = LogicalPlan::join(
+            LogicalPlan::join(
+                LogicalPlan::scan("large"),
+                LogicalPlan::scan("small"),
+                Expr::eq(
                     Expr::column("large", "id", 0),
                     Expr::column("small", "large_id", 0),
                 ),
-                join_type: JoinType::Inner,
-            }),
-            right: Box::new(LogicalPlan::scan("medium")),
-            condition: Expr::eq(
+                JoinType::Inner,
+            ),
+            LogicalPlan::scan("medium"),
+            Expr::eq(
                 Expr::column("small", "id", 0),
                 Expr::column("medium", "small_id", 0),
             ),
-            join_type: JoinType::Inner,
-        };
+            JoinType::Inner,
+        );
 
         let optimized = pass.optimize(plan);
         assert!(matches!(optimized, LogicalPlan::Join { .. }));
@@ -757,6 +764,7 @@ mod tests {
                 right: Box::new(LogicalPlan::scan("b")),
                 condition: Expr::eq(Expr::column("a", "id", 0), Expr::column("b", "a_id", 0)),
                 join_type: JoinType::Inner,
+                output_tables: alloc::vec!["a".into(), "b".into()],
             },
             Expr::gt(Expr::column("a", "value", 1), Expr::literal(100i64)),
         );

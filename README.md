@@ -10,11 +10,12 @@ The public JS package lives in `js/packages/core` as `@cynos/core`. The Rust cra
 ## What Exists Today
 
 - In-memory row storage with schema enforcement, primary-key lookups, secondary B+Tree indexes, and JSONB-oriented GIN indexes.
-- Rule/heuristic query planning with predicate pushdown, implicit join recognition, join reordering by row-count estimates, index selection, TopN pushdown, order-by-index rewriting, and limit/offset pushdown into scans.
+- Rule/heuristic query planning with predicate pushdown, implicit join recognition, join reordering by row-count estimates, index selection, TopN pushdown, order-by-index rewriting, limit/offset pushdown into scans, and cached compiled execution artifacts.
 - Reactive query APIs with three distinct modes:
-  - `observe()`: re-query, callback receives the full current result set when it changes.
-  - `changes()`: re-query, callback receives the full current result set immediately and on later changes.
+  - `observe()`: cached query execution, callback receives the full current result set when it changes.
+  - `changes()`: cached query execution, callback receives the full current result set immediately and on later changes.
   - `trace()`: incremental view maintenance (IVM), callback receives `{ added, removed }` deltas for incrementalizable queries.
+- Compiled single-table execution fast paths that can fuse scan/filter/project work and apply row-local reactive patches for simple subscriptions instead of always re-running the full query.
 - Binary query results via `execBinary()` + `getSchemaLayout()` + `ResultSet` for low-overhead WASM-to-JS transfer.
 - JSONB building blocks including a compact binary codec, a JSONPath subset parser/evaluator, JSONB operators, and extraction helpers for GIN indexing.
 - Journaled in-memory transactions with commit/rollback APIs.
@@ -55,15 +56,16 @@ Application code
 
 Operationally there are two query delivery paths:
 
-1. Re-query path:
+1. Cached execution path:
    - `SelectBuilder` produces a logical plan.
-   - `cynos-query` rewrites and lowers it to a physical plan.
-   - The physical plan runs against `cynos-storage`.
+   - `cynos-query` rewrites and lowers it to a physical plan plus a cached `PlanExecutionArtifact`.
+   - The compiled artifact runs against `cynos-storage`, using fused single-table fast paths where possible and a compiled executor elsewhere.
+   - `observe()` / `changes()` reuse that cached artifact. For simple single-table pipelines without blocking operators, the reactive layer can patch the current result in place from `changed_ids` instead of forcing a full re-execution.
    - Results are delivered either as JS objects or as a binary buffer decoded by `ResultSet`.
 2. Incremental path:
    - If `PhysicalPlan::is_incrementalizable()` is true, `cynos-database` lowers the plan into `cynos-incremental` dataflow.
    - `cynos-reactive` subscribes to the materialized view and emits row-level deltas.
-   - If the plan is not incrementalizable, callers should use the re-query APIs instead.
+   - If the plan is not incrementalizable, callers should use the cached execution APIs instead.
 
 Cross-cutting responsibilities:
 
@@ -117,8 +119,8 @@ Notes:
 
 | API | Callback payload | Best for | Notes |
 | --- | --- | --- | --- |
-| `observe()` | Full current result set | Imperative listeners that can fetch the initial state manually | No initial callback; call `getResult()` first if needed |
-| `changes()` | Full current result set | UI state updates such as React `setState` | Emits the initial result immediately |
+| `observe()` | Full current result set | Imperative listeners that can fetch the initial state manually | No initial callback; call `getResult()` first if needed. Uses cached execution artifacts and may patch simple single-table results in place |
+| `changes()` | Full current result set | UI state updates such as React `setState` | Emits the initial result immediately. Uses the same cached execution path as `observe()` |
 | `trace()` | `{ added, removed }` delta object | Incremental UIs or downstream consumers that want O(delta) updates | Only works for incrementalizable plans; `ORDER BY`, `LIMIT`, `OFFSET`, and other non-streamable operators fall back to `observe()`/`changes()` |
 
 ```ts
@@ -152,6 +154,8 @@ const stopTrace = trace.subscribe((delta) => {
 
 `trace()` is Cynos's DBSP-style incremental view maintenance path. It is not a separate query language; it reuses the normal planner pipeline and then lowers an eligible physical plan into a delta-oriented dataflow graph.
 
+`observe()` / `changes()` now cover an important middle ground: they still expose full-result semantics, but simple single-table subscriptions can avoid full re-query work by applying row-local patches through the cached execution artifact.
+
 How it works today:
 
 1. Build the normal logical plan from the query builder.
@@ -182,47 +186,48 @@ Cynos intentionally exposes two live-query families because they optimize for di
 
 | Strategy | API | Strengths | Tradeoffs | Good fit |
 | --- | --- | --- | --- | --- |
-| Re-query | `observe()` / `changes()` | Works with the full query surface, easy to consume, always delivers the full current state, naturally fits UI state setters | Re-executes the query and rematerializes the result when data changes; cost scales with query/result size | Dashboards, CRUD tables, queries with `ORDER BY` / `LIMIT`, simple app code, correctness-first integrations |
+| Cached full-result path | `observe()` / `changes()` | Works with the full query surface, easy to consume, always delivers the full current state, naturally fits UI state setters, and can use row-local patching for simple single-table subscriptions | Still ships full current results to subscribers; complex plans may still fall back to deterministic re-execution and full result comparison | Dashboards, CRUD tables, simple filtered lists, queries with `ORDER BY` / `LIMIT`, correctness-first integrations |
 | Incremental plan | `trace()` | Reuses the planned query shape but propagates deltas after bootstrap; lower steady-state cost on frequent writes; payload is small when output churn is small | Restricted to incrementalizable plans; consumer must apply `{ added, removed }`; less convenient for naive UI binding | High-frequency subscriptions, collaborative/live views, pipelines where the query is mostly filter/join/group-by without ordering/windowing |
 
 Practical guidance:
 
 - Use `changes()` when you want the simplest "always give me the current rows" API, especially in React/Vue-style state updates.
 - Use `observe()` when you want the same re-query semantics but prefer to fetch the initial state manually.
-- Use `trace()` when the query stays within the supported incremental subset and update frequency is high enough that full re-query work becomes the bottleneck.
-- If you need sorted, paginated, or otherwise non-streamable output, treat re-query as the default strategy.
+- Use `trace()` when the query stays within the supported incremental subset and update frequency is high enough that even the cached full-result path becomes the bottleneck, or when you explicitly want row-level deltas.
+- If you need sorted, paginated, or otherwise non-streamable output, treat the cached full-result path as the default strategy.
 
 ## Local Bench Snapshot
 
 To make this tradeoff less abstract, benchmarks were conducted natively at the Rust layer on a Mac mini M4, before cross-compilation to WASM. The absolute numbers will differ in WASM environments (browsers, runtimes), but the relative performance characteristics shown here reflect the underlying algorithmic tradeoffs.
 
 ```bash
-cargo run -p cynos-perf --release
+cargo bench -p cynos-database --bench requery_microbench
 ```
 
-The relevant `IVM vs RE-QUERY COMPARISON` scenarios in that run all reported equivalent results, then measured steady-state maintenance cost for the same logical workload:
+Recent `requery_microbench` runs show the current cached execution path behaves very differently depending on the query shape. The `observe()` / `changes()` APIs are still full-result APIs, but simple single-table subscriptions now use a row-local patch path instead of a forced full re-query on every change.
 
-| Scenario | Size | Re-query | IVM | Speedup |
-| --- | --- | --- | --- | --- |
-| Filter (`WHERE age > 30`) | 10K rows | `1.71 ms` | `516 ns` | `3322.8x` |
-| Inner join | 10K rows | `3.50 ms` | `3.20 us` | `1093.5x` |
-| Left outer join | 10K rows | `3.69 ms` | `2.56 us` | `1441.8x` |
-| `GROUP BY` + `COUNT` / `SUM` | 10K rows | `3.51 ms` | `1.50 us` | `2336.6x` |
-| `GROUP BY` + `MIN` / `MAX` | 10K rows | `3.61 ms` | `2.14 us` | `1686.1x` |
-| Filter + join | 10K rows | `3.27 ms` | `2.60 us` | `1254.5x` |
+| Scenario | 10K rows | 100K rows | Notes |
+| --- | --- | --- | --- |
+| `single_query_filter_execute` | `226.85 us` | `6.07 ms` | Compiled single-query execution |
+| `requery_observe_create` | `318.29 us` | `7.02 ms` | Initial snapshot + subscription setup |
+| `requery_on_change/result_changes` | `925 ns` | `1.27 us` | Simple single-table filter, row-local patch path |
+| `requery_on_change/result_unchanged` | `810 ns` | `812 ns` | Same shape, unchanged result |
+| `requery_on_change_filter_project_limit/result_changes` | `19.71 us` | `17.98 us` | `LIMIT` keeps this on the generic cached execution path |
+| `requery_on_change_compound_filter/result_changes` | `948 ns` | `1.31 us` | Compound single-table filter still benefits from row-local patching |
 
 What these numbers mean in practice:
 
-- On this machine, once a query is incrementalizable, the steady-state delta path is dramatically cheaper than re-running the whole query.
-- The speedup tends to grow with table size because the re-query path scales with the full plan/result maintenance cost, while the incremental path scales mostly with the touched delta and affected join/group state.
-- The benefit is especially visible for grouped live queries and join-heavy subscriptions, where the delta path avoids rebuilding the full result on each change.
+- Initial query execution still costs what you would expect for a compiled in-memory query over 10K / 100K rows.
+- Simple single-table live queries are now much cheaper on steady-state updates because the engine can patch only the touched rows into the current result.
+- Blocking operators such as `LIMIT` still matter: they can keep a subscription on the generic cached execution path even when the rest of the query is simple.
+- `trace()` remains the true delta-native API for joins, grouped subscriptions, and consumers that want `{ added, removed }` rather than a refreshed full result.
 
 Important caveats:
 
 - These are Rust-side harness numbers, not browser end-to-end UI timings.
-- The comparison is intentionally fair to re-query: it uses a pre-compiled physical plan, so optimizer overhead is already excluded.
-- The IVM side measures delta maintenance, but `trace()` still requires the consumer to apply `{ added, removed }` on the application side.
-- If your real UI needs sorted/paginated output, the query may not be incrementalizable at all, in which case the re-query APIs remain the right path.
+- The `requery_on_change` rows above are no longer measuring a forced full re-query for simple single-table plans; they measure the current reactive update path, which may use row-local patching.
+- The callback payload for `observe()` / `changes()` is still the full current result set even when the engine-side maintenance work is tiny.
+- If your real UI needs sorted/paginated output, or the query shape is multi-table / aggregate-heavy, the generic cached path or `trace()` may still be the better mental model than the single-table patch fast path.
 
 ## Complexity At A Glance
 
@@ -234,7 +239,8 @@ These are the typical asymptotics for the current implementation, not hard real-
 | B+Tree range scan | `O(log n + k)` | `k` is the number of returned row IDs |
 | Standalone hash-index lookup | Average `O(1)` | Implemented in `cynos-index`, but not the default secondary-index path in `RowStore` today |
 | GIN-style key lookup | Proportional to extracted keys + posting-list work | Best thought of as inverted-index style rather than a plain `O(1)` hash lookup |
-| `observe()` / `changes()` | Re-executes the query and materializes the current result | Cost scales with the full query path, not just the delta |
+| `observe()` / `changes()` simple single-table path | Roughly `O(changed_rows * per-row filter/project) + O(log r)` | Applies row-local patches into the current result when the plan is a patchable single-table pipeline |
+| `observe()` / `changes()` generic path | Re-executes the cached plan and compares/materializes the current result | Used for joins, aggregates, `LIMIT`, sorting, and any plan outside the patchable subset |
 | `trace()` | `O(Δoutput)` delivery after incremental compilation | Only for plans that can be lowered to incremental dataflow |
 | Incremental `COUNT` / `SUM` / `AVG` | `O(Δinput)` over affected groups | Maintains running aggregate state |
 | Incremental `MIN` / `MAX` | `O(log group_size)` per delta | Implemented with ordered multisets in `cynos-incremental` |

@@ -73,6 +73,7 @@ impl TopNPushdown {
                 {
                     // Push limit into IndexGet for early termination
                     // Note: offset is handled by skipping rows after IndexGet
+                    let pushed_limit = limit.saturating_add(offset);
                     if offset == 0 {
                         return PhysicalPlan::IndexGet {
                             table,
@@ -87,7 +88,7 @@ impl TopNPushdown {
                                 table,
                                 index,
                                 key,
-                                limit: Some(limit + offset),
+                                limit: Some(pushed_limit),
                             }),
                             limit,
                             offset,
@@ -106,11 +107,12 @@ impl TopNPushdown {
                 } = optimized_input
                 {
                     // Push limit into IndexScan for early termination
+                    let pushed_limit = limit.saturating_add(offset);
                     return PhysicalPlan::IndexScan {
                         table,
                         index,
                         bounds,
-                        limit: Some(limit + offset),
+                        limit: Some(pushed_limit),
                         offset: Some(offset),
                         reverse,
                     };
@@ -157,11 +159,13 @@ impl TopNPushdown {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => PhysicalPlan::HashJoin {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             PhysicalPlan::SortMergeJoin {
@@ -169,11 +173,13 @@ impl TopNPushdown {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => PhysicalPlan::SortMergeJoin {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             PhysicalPlan::NestedLoopJoin {
@@ -181,11 +187,13 @@ impl TopNPushdown {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => PhysicalPlan::NestedLoopJoin {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             PhysicalPlan::IndexNestedLoopJoin {
@@ -194,12 +202,16 @@ impl TopNPushdown {
                 inner_index,
                 condition,
                 join_type,
+                outer_is_left,
+                output_tables,
             } => PhysicalPlan::IndexNestedLoopJoin {
                 outer: Box::new(self.traverse(*outer)),
                 inner_table,
                 inner_index,
                 condition,
                 join_type,
+                outer_is_left,
+                output_tables,
             },
 
             PhysicalPlan::HashAggregate {
@@ -420,6 +432,7 @@ mod tests {
                 Expr::column("users", "id", 0),
             ),
             join_type: crate::ast::JoinType::Inner,
+            output_tables: alloc::vec!["orders".into(), "users".into()],
         };
 
         let result = pass.optimize(plan);

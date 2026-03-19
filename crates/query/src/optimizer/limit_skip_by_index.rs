@@ -105,11 +105,13 @@ impl<'a> LimitSkipByIndexPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => PhysicalPlan::HashJoin {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             PhysicalPlan::SortMergeJoin {
@@ -117,11 +119,13 @@ impl<'a> LimitSkipByIndexPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => PhysicalPlan::SortMergeJoin {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             PhysicalPlan::NestedLoopJoin {
@@ -129,11 +133,13 @@ impl<'a> LimitSkipByIndexPass<'a> {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => PhysicalPlan::NestedLoopJoin {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             PhysicalPlan::IndexNestedLoopJoin {
@@ -142,12 +148,16 @@ impl<'a> LimitSkipByIndexPass<'a> {
                 inner_index,
                 condition,
                 join_type,
+                outer_is_left,
+                output_tables,
             } => PhysicalPlan::IndexNestedLoopJoin {
                 outer: Box::new(self.traverse(*outer)),
                 inner_table,
                 inner_index,
                 condition,
                 join_type,
+                outer_is_left,
+                output_tables,
             },
 
             PhysicalPlan::HashAggregate {

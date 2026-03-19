@@ -45,12 +45,15 @@ impl ImplicitJoinsPass {
                 // Check if this is a join predicate over a cross product
                 if let LogicalPlan::CrossProduct { left, right } = &optimized_input {
                     if self.is_join_predicate(&predicate, left, right) {
+                        let mut output_tables = left.output_tables();
+                        output_tables.extend(right.output_tables());
                         // Convert to Join
                         return LogicalPlan::Join {
                             left: left.clone(),
                             right: right.clone(),
                             condition: predicate,
                             join_type: JoinType::Inner,
+                            output_tables,
                         };
                     }
                 }
@@ -77,11 +80,13 @@ impl ImplicitJoinsPass {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => LogicalPlan::Join {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             LogicalPlan::Aggregate {

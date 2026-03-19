@@ -96,6 +96,7 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         condition: Expr,
         join_type: JoinType,
+        output_tables: Vec<String>,
     },
 
     /// Sort-merge join.
@@ -104,6 +105,7 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         condition: Expr,
         join_type: JoinType,
+        output_tables: Vec<String>,
     },
 
     /// Nested loop join.
@@ -112,6 +114,7 @@ pub enum PhysicalPlan {
         right: Box<PhysicalPlan>,
         condition: Expr,
         join_type: JoinType,
+        output_tables: Vec<String>,
     },
 
     /// Index nested loop join.
@@ -121,6 +124,8 @@ pub enum PhysicalPlan {
         inner_index: String,
         condition: Expr,
         join_type: JoinType,
+        outer_is_left: bool,
+        output_tables: Vec<String>,
     },
 
     /// Hash aggregate.
@@ -346,11 +351,24 @@ impl PhysicalPlan {
         condition: Expr,
         join_type: JoinType,
     ) -> Self {
+        let output_tables = Self::combined_output_tables(&left, &right);
+        Self::hash_join_with_output_tables(left, right, condition, join_type, output_tables)
+    }
+
+    /// Creates a hash join plan with an explicit output table order.
+    pub fn hash_join_with_output_tables(
+        left: PhysicalPlan,
+        right: PhysicalPlan,
+        condition: Expr,
+        join_type: JoinType,
+        output_tables: Vec<String>,
+    ) -> Self {
         PhysicalPlan::HashJoin {
             left: Box::new(left),
             right: Box::new(right),
             condition,
             join_type,
+            output_tables,
         }
     }
 
@@ -361,11 +379,24 @@ impl PhysicalPlan {
         condition: Expr,
         join_type: JoinType,
     ) -> Self {
+        let output_tables = Self::combined_output_tables(&left, &right);
+        Self::sort_merge_join_with_output_tables(left, right, condition, join_type, output_tables)
+    }
+
+    /// Creates a sort-merge join plan with an explicit output table order.
+    pub fn sort_merge_join_with_output_tables(
+        left: PhysicalPlan,
+        right: PhysicalPlan,
+        condition: Expr,
+        join_type: JoinType,
+        output_tables: Vec<String>,
+    ) -> Self {
         PhysicalPlan::SortMergeJoin {
             left: Box::new(left),
             right: Box::new(right),
             condition,
             join_type,
+            output_tables,
         }
     }
 
@@ -376,11 +407,24 @@ impl PhysicalPlan {
         condition: Expr,
         join_type: JoinType,
     ) -> Self {
+        let output_tables = Self::combined_output_tables(&left, &right);
+        Self::nested_loop_join_with_output_tables(left, right, condition, join_type, output_tables)
+    }
+
+    /// Creates a nested loop join plan with an explicit output table order.
+    pub fn nested_loop_join_with_output_tables(
+        left: PhysicalPlan,
+        right: PhysicalPlan,
+        condition: Expr,
+        join_type: JoinType,
+        output_tables: Vec<String>,
+    ) -> Self {
         PhysicalPlan::NestedLoopJoin {
             left: Box::new(left),
             right: Box::new(right),
             condition,
             join_type,
+            output_tables,
         }
     }
 
@@ -435,6 +479,38 @@ impl PhysicalPlan {
             left: Box::new(left),
             right: Box::new(right),
             all,
+        }
+    }
+
+    fn combined_output_tables(left: &PhysicalPlan, right: &PhysicalPlan) -> Vec<String> {
+        let mut tables = left.output_tables();
+        tables.extend(right.output_tables());
+        tables
+    }
+
+    /// Returns the visible table order produced by this plan.
+    pub fn output_tables(&self) -> Vec<String> {
+        match self {
+            PhysicalPlan::TableScan { table }
+            | PhysicalPlan::IndexScan { table, .. }
+            | PhysicalPlan::IndexGet { table, .. }
+            | PhysicalPlan::IndexInGet { table, .. }
+            | PhysicalPlan::GinIndexScan { table, .. }
+            | PhysicalPlan::GinIndexScanMulti { table, .. } => alloc::vec![table.clone()],
+            PhysicalPlan::Filter { input, .. }
+            | PhysicalPlan::Project { input, .. }
+            | PhysicalPlan::HashAggregate { input, .. }
+            | PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::TopN { input, .. }
+            | PhysicalPlan::Limit { input, .. }
+            | PhysicalPlan::NoOp { input } => input.output_tables(),
+            PhysicalPlan::HashJoin { output_tables, .. }
+            | PhysicalPlan::SortMergeJoin { output_tables, .. }
+            | PhysicalPlan::NestedLoopJoin { output_tables, .. }
+            | PhysicalPlan::IndexNestedLoopJoin { output_tables, .. } => output_tables.clone(),
+            PhysicalPlan::CrossProduct { left, right }
+            | PhysicalPlan::Union { left, right, .. } => Self::combined_output_tables(left, right),
+            PhysicalPlan::Empty => Vec::new(),
         }
     }
 
@@ -510,12 +586,14 @@ impl PhysicalPlan {
                     tables.push(table.clone());
                 }
             }
-            PhysicalPlan::IndexNestedLoopJoin {
-                outer, inner_table, ..
-            } => {
-                outer.collect_tables_into(tables);
-                if !tables.contains(inner_table) {
-                    tables.push(inner_table.clone());
+            PhysicalPlan::HashJoin { output_tables, .. }
+            | PhysicalPlan::SortMergeJoin { output_tables, .. }
+            | PhysicalPlan::NestedLoopJoin { output_tables, .. }
+            | PhysicalPlan::IndexNestedLoopJoin { output_tables, .. } => {
+                for table in output_tables {
+                    if !tables.contains(table) {
+                        tables.push(table.clone());
+                    }
                 }
             }
             PhysicalPlan::Filter { input, .. }
@@ -527,10 +605,7 @@ impl PhysicalPlan {
             | PhysicalPlan::NoOp { input } => {
                 input.collect_tables_into(tables);
             }
-            PhysicalPlan::HashJoin { left, right, .. }
-            | PhysicalPlan::SortMergeJoin { left, right, .. }
-            | PhysicalPlan::NestedLoopJoin { left, right, .. }
-            | PhysicalPlan::CrossProduct { left, right }
+            PhysicalPlan::CrossProduct { left, right }
             | PhysicalPlan::Union { left, right, .. } => {
                 left.collect_tables_into(tables);
                 right.collect_tables_into(tables);

@@ -75,11 +75,13 @@ impl CrossProductPass {
                 right,
                 condition,
                 join_type,
+                output_tables,
             } => LogicalPlan::Join {
                 left: Box::new(self.traverse(*left)),
                 right: Box::new(self.traverse(*right)),
                 condition,
                 join_type,
+                output_tables,
             },
 
             LogicalPlan::Aggregate {

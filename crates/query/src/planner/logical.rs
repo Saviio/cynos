@@ -81,6 +81,7 @@ pub enum LogicalPlan {
         right: Box<LogicalPlan>,
         condition: Expr,
         join_type: JoinType,
+        output_tables: Vec<String>,
     },
 
     /// Aggregation (GROUP BY).
@@ -151,11 +152,24 @@ impl LogicalPlan {
         condition: Expr,
         join_type: JoinType,
     ) -> Self {
+        let output_tables = Self::combined_output_tables(&left, &right);
+        Self::join_with_output_tables(left, right, condition, join_type, output_tables)
+    }
+
+    /// Creates a join plan with an explicit output table order.
+    pub fn join_with_output_tables(
+        left: LogicalPlan,
+        right: LogicalPlan,
+        condition: Expr,
+        join_type: JoinType,
+        output_tables: Vec<String>,
+    ) -> Self {
         LogicalPlan::Join {
             left: Box::new(left),
             right: Box::new(right),
             condition,
             join_type,
+            output_tables,
         }
     }
 
@@ -216,6 +230,34 @@ impl LogicalPlan {
         }
     }
 
+    fn combined_output_tables(left: &LogicalPlan, right: &LogicalPlan) -> Vec<String> {
+        let mut tables = left.output_tables();
+        tables.extend(right.output_tables());
+        tables
+    }
+
+    /// Returns the visible table order produced by this plan.
+    pub fn output_tables(&self) -> Vec<String> {
+        match self {
+            LogicalPlan::Scan { table }
+            | LogicalPlan::IndexScan { table, .. }
+            | LogicalPlan::IndexGet { table, .. }
+            | LogicalPlan::IndexInGet { table, .. }
+            | LogicalPlan::GinIndexScan { table, .. }
+            | LogicalPlan::GinIndexScanMulti { table, .. } => alloc::vec![table.clone()],
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => input.output_tables(),
+            LogicalPlan::Join { output_tables, .. } => output_tables.clone(),
+            LogicalPlan::CrossProduct { left, right } | LogicalPlan::Union { left, right, .. } => {
+                Self::combined_output_tables(left, right)
+            }
+            LogicalPlan::Empty => Vec::new(),
+        }
+    }
+
     /// Returns the input plan(s) of this node.
     pub fn inputs(&self) -> Vec<&LogicalPlan> {
         match self {
@@ -261,9 +303,14 @@ impl LogicalPlan {
             | LogicalPlan::Aggregate { input, .. }
             | LogicalPlan::Sort { input, .. }
             | LogicalPlan::Limit { input, .. } => input.collect_tables_into(tables),
-            LogicalPlan::Join { left, right, .. }
-            | LogicalPlan::CrossProduct { left, right }
-            | LogicalPlan::Union { left, right, .. } => {
+            LogicalPlan::Join { output_tables, .. } => {
+                for table in output_tables {
+                    if !tables.contains(table) {
+                        tables.push(table.clone());
+                    }
+                }
+            }
+            LogicalPlan::CrossProduct { left, right } | LogicalPlan::Union { left, right, .. } => {
                 left.collect_tables_into(tables);
                 right.collect_tables_into(tables);
             }
