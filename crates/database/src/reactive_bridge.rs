@@ -13,7 +13,9 @@
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
 use crate::convert::{row_to_js, value_to_js};
-use crate::query_engine::execute_physical_plan;
+use crate::query_engine::{
+    execute_compiled_physical_plan_with_summary, CompiledPhysicalPlan, QueryResultSummary,
+};
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -22,7 +24,6 @@ use core::cell::RefCell;
 use cynos_core::schema::Table;
 use cynos_core::Row;
 use cynos_incremental::{Delta, TableId};
-use cynos_query::planner::PhysicalPlan;
 use cynos_reactive::ObservableQuery;
 use cynos_storage::TableCache;
 use hashbrown::{HashMap, HashSet};
@@ -30,41 +31,48 @@ use wasm_bindgen::prelude::*;
 
 /// A re-query based observable that re-executes the query on each change.
 /// This leverages the query optimizer and indexes for optimal performance.
-/// The physical plan is cached to avoid repeated optimization overhead.
+/// The physical plan and lowered execution artifact are cached to avoid repeated
+/// optimization and predicate lowering overhead.
 pub struct ReQueryObservable {
-    /// The cached physical plan to execute
-    physical_plan: PhysicalPlan,
+    /// The cached compiled plan to execute
+    compiled_plan: CompiledPhysicalPlan,
     /// Reference to the table cache
     cache: Rc<RefCell<TableCache>>,
     /// Current result set
     result: Vec<Rc<Row>>,
+    /// Summary of the current result set for fast equality checks
+    result_summary: QueryResultSummary,
     /// Subscription callbacks
     subscriptions: Vec<(usize, Box<dyn Fn(&[Rc<Row>]) + 'static>)>,
     /// Next subscription ID
     next_sub_id: usize,
-    /// Whether this is a JOIN query (results have DUMMY_ROW_ID)
-    is_join_query: bool,
 }
 
 impl ReQueryObservable {
     /// Creates a new re-query observable with a pre-compiled physical plan.
     pub fn new(
-        physical_plan: PhysicalPlan,
+        compiled_plan: CompiledPhysicalPlan,
         cache: Rc<RefCell<TableCache>>,
         initial_result: Vec<Rc<Row>>,
     ) -> Self {
-        // Detect JOIN query by checking if first row has dummy ID
-        let is_join_query = initial_result
-            .first()
-            .map(|r| r.is_dummy())
-            .unwrap_or(false);
+        let result_summary = QueryResultSummary::from_rows(&initial_result);
+        Self::new_with_summary(compiled_plan, cache, initial_result, result_summary)
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_summary(
+        compiled_plan: CompiledPhysicalPlan,
+        cache: Rc<RefCell<TableCache>>,
+        initial_result: Vec<Rc<Row>>,
+        result_summary: QueryResultSummary,
+    ) -> Self {
         Self {
-            physical_plan,
+            compiled_plan,
             cache,
             result: initial_result,
+            result_summary,
             subscriptions: Vec::new(),
             next_sub_id: 0,
-            is_join_query,
         }
     }
 
@@ -107,23 +115,29 @@ impl ReQueryObservable {
     /// Only notifies subscribers if the result actually changed.
     /// Skips re-query entirely if there are no subscribers.
     ///
-    /// `changed_ids` contains the row IDs that were modified - used to optimize
-    /// comparison by only checking these rows when the result set size is unchanged.
-    pub fn on_change(&mut self, changed_ids: &HashSet<u64>) {
+    /// `changed_ids` contains the row IDs that were modified.
+    /// The current implementation keeps the parameter for API compatibility,
+    /// while result equality remains fully deterministic.
+    pub fn on_change(&mut self, _changed_ids: &HashSet<u64>) {
         // Skip re-query if no subscribers - major optimization for unused observables
         if self.subscriptions.is_empty() {
             return;
         }
 
-        // Re-execute the cached physical plan (no optimization overhead)
+        // Re-execute the cached compiled plan (no optimization or lowering overhead)
         let cache = self.cache.borrow();
 
-        match execute_physical_plan(&cache, &self.physical_plan) {
-            Ok(new_result) => {
+        match execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan) {
+            Ok(output) => {
                 // Only notify if result changed
-                if !Self::results_equal(&self.result, &new_result, changed_ids, self.is_join_query)
-                {
-                    self.result = new_result;
+                if !Self::results_equal(
+                    &self.result_summary,
+                    &output.summary,
+                    &self.result,
+                    &output.rows,
+                ) {
+                    self.result = output.rows;
+                    self.result_summary = output.summary;
                     // Notify all subscribers
                     for (_, callback) in &self.subscriptions {
                         callback(&self.result);
@@ -136,57 +150,24 @@ impl ReQueryObservable {
         }
     }
 
-    /// Compares two result sets for equality using row versions.
-    /// This is O(n) where n is the number of rows, comparing only version numbers.
-    /// For single-table queries, can further optimize by only checking changed_ids.
+    /// Compares two result sets using a precomputed summary captured during execution.
+    /// This keeps the unchanged path O(1) after the query has already been re-executed.
     fn results_equal(
+        old_summary: &QueryResultSummary,
+        new_summary: &QueryResultSummary,
         old: &[Rc<Row>],
         new: &[Rc<Row>],
-        changed_ids: &HashSet<u64>,
-        is_join_query: bool,
     ) -> bool {
-        use cynos_core::DUMMY_ROW_ID;
-
-        // Different lengths means definitely changed
-        if old.len() != new.len() {
+        if old_summary != new_summary || old.len() != new.len() {
             return false;
         }
 
-        // Empty results are equal
-        if old.is_empty() {
-            return true;
-        }
-
-        // Check if this is an aggregate/join result (rows have DUMMY_ROW_ID)
-        let is_aggregate_result = old.first().map(|r| r.id() == DUMMY_ROW_ID).unwrap_or(false);
-
-        if is_join_query || is_aggregate_result {
-            // For JOIN/aggregate queries, compare versions (sum of source row versions)
-            // If any source row changed, the sum version will be different
-            for (old_row, new_row) in old.iter().zip(new.iter()) {
-                if old_row.version() != new_row.version() {
-                    return false;
-                }
-            }
-        } else {
-            // For single-table queries, use optimized comparison
-            // Compare row IDs first (fast path)
-            let ids_match = old.iter().zip(new.iter()).all(|(a, b)| a.id() == b.id());
-            if !ids_match {
-                return false;
-            }
-
-            // IDs match - only compare versions of changed rows
-            for (old_row, new_row) in old.iter().zip(new.iter()) {
-                if changed_ids.contains(&old_row.id()) {
-                    if old_row.version() != new_row.version() {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
+        old.iter().zip(new.iter()).all(|(old_row, new_row)| {
+            Rc::ptr_eq(old_row, new_row)
+                || (old_row.id() == new_row.id()
+                    && old_row.version() == new_row.version()
+                    && old_row.values() == new_row.values())
+        })
     }
 }
 
@@ -517,21 +498,6 @@ impl JsObservableQuery {
         }
     }
 
-    pub(crate) fn new_with_aggregates(
-        inner: Rc<RefCell<ReQueryObservable>>,
-        schema: Table,
-        aggregate_columns: Vec<String>,
-        binary_layout: SchemaLayout,
-    ) -> Self {
-        Self {
-            inner,
-            schema,
-            projected_columns: None,
-            binary_layout,
-            aggregate_columns: Some(aggregate_columns),
-        }
-    }
-
     /// Get the inner observable for creating JsChangesStream.
     pub(crate) fn inner(&self) -> Rc<RefCell<ReQueryObservable>> {
         self.inner.clone()
@@ -680,21 +646,6 @@ impl JsIvmObservableQuery {
             projected_columns: Some(projected_columns),
             binary_layout,
             aggregate_columns: None,
-        }
-    }
-
-    pub(crate) fn new_with_aggregates(
-        inner: Rc<RefCell<ObservableQuery>>,
-        schema: Table,
-        aggregate_columns: Vec<String>,
-        binary_layout: SchemaLayout,
-    ) -> Self {
-        Self {
-            inner,
-            schema,
-            projected_columns: None,
-            binary_layout,
-            aggregate_columns: Some(aggregate_columns),
         }
     }
 }
@@ -970,6 +921,7 @@ mod tests {
     use cynos_core::{DataType, Value};
     use cynos_query::ast::Expr;
     use cynos_query::executor::{InMemoryDataSource, PhysicalPlanRunner};
+    use cynos_query::planner::PhysicalPlan;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -1079,10 +1031,40 @@ mod tests {
             "Projection should preserve the source row version for reactive diffing",
         );
 
-        let changed_ids: HashSet<u64> = core::iter::once(1u64).collect();
+        let old_summary = QueryResultSummary::from_rows(&old_rows);
+        let new_summary = QueryResultSummary::from_rows(&new_rows);
         assert!(
-            !ReQueryObservable::results_equal(&old_rows, &new_rows, &changed_ids, false),
+            !ReQueryObservable::results_equal(&old_summary, &new_summary, &old_rows, &new_rows),
             "Projected value changed from Alice to Alicia, so live query comparison should detect a change",
+        );
+    }
+
+    #[test]
+    fn test_result_comparison_falls_back_to_exact_rows_when_summary_matches() {
+        let old_rows: Vec<Rc<Row>> = alloc::vec![Rc::new(Row::new_with_version(
+            1,
+            5,
+            alloc::vec![Value::String("Alice".into())],
+        ))];
+        let new_rows: Vec<Rc<Row>> = alloc::vec![Rc::new(Row::new_with_version(
+            1,
+            5,
+            alloc::vec![Value::String("Alicia".into())],
+        ))];
+
+        let colliding_summary = QueryResultSummary {
+            len: 1,
+            fingerprint: 42,
+        };
+
+        assert!(
+            !ReQueryObservable::results_equal(
+                &colliding_summary,
+                &colliding_summary,
+                &old_rows,
+                &new_rows,
+            ),
+            "Row comparison must remain deterministic even if two summaries collide",
         );
     }
 }

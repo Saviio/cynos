@@ -10,7 +10,10 @@ use crate::convert::{
 };
 use crate::dataflow_compiler::compile_to_dataflow;
 use crate::expr::{Expr, ExprInner};
-use crate::query_engine::{compile_plan, execute_physical_plan, execute_plan, explain_plan};
+use crate::query_engine::{
+    compile_cached_plan, compile_plan, execute_compiled_physical_plan,
+    execute_compiled_physical_plan_with_summary, execute_physical_plan, execute_plan, explain_plan,
+};
 use crate::reactive_bridge::{
     JsChangesStream, JsIvmObservableQuery, JsObservableQuery, QueryRegistry, ReQueryObservable,
 };
@@ -66,6 +69,33 @@ struct QueryOutput {
 impl QueryOutput {
     fn column_names(&self) -> Vec<String> {
         self.columns.iter().map(|col| col.name.clone()).collect()
+    }
+
+    fn resolve_column(&self, name: &str) -> Option<(usize, &OutputColumn)> {
+        if let Some((index, column)) = self
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.name == name)
+        {
+            return Some((index, column));
+        }
+
+        let simple_name = name.rsplit('.').next().unwrap_or(name);
+        let mut matches = self.columns.iter().enumerate().filter(|(_, column)| {
+            column
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(column.name.as_str())
+                == simple_name
+        });
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            None
+        } else {
+            Some(first)
+        }
     }
 
     fn layout(&self) -> SchemaLayout {
@@ -169,6 +199,29 @@ impl SelectBuilder {
                 .get_table(name)
                 .map(|s| s.schema().clone())
         })
+    }
+
+    fn output_schema_context(&self) -> Result<Table, JsValue> {
+        if let Some(base) = &self.frozen_base {
+            Ok(base.output.schema.clone())
+        } else {
+            self.representative_schema()
+        }
+    }
+
+    fn get_frozen_output_column_info(&self, col_name: &str) -> Option<(String, usize, DataType)> {
+        let base = self.frozen_base.as_ref()?;
+        base.output
+            .resolve_column(col_name)
+            .map(|(index, column)| (String::new(), index, column.data_type))
+    }
+
+    fn get_modifier_column_info(&self, col_name: &str) -> Option<(String, usize, DataType)> {
+        if self.frozen_base.is_some() {
+            self.get_frozen_output_column_info(col_name)
+        } else {
+            self.get_column_info_any_table(col_name)
+        }
     }
 
     /// Gets column info for any table (main table or joined tables).
@@ -349,7 +402,7 @@ impl SelectBuilder {
     /// Applies WHERE / GROUP BY / ORDER BY / LIMIT / projection clauses on top of a root plan.
     fn apply_query_modifiers(&self, mut plan: LogicalPlan) -> LogicalPlan {
         if let Some(ref predicate) = self.where_clause {
-            let get_col_info = |name: &str| self.get_column_info_any_table(name);
+            let get_col_info = |name: &str| self.get_modifier_column_info(name);
             let ast_predicate = predicate.to_ast_with_table(&get_col_info);
             plan = LogicalPlan::Filter {
                 input: Box::new(plan),
@@ -472,6 +525,10 @@ impl SelectBuilder {
     /// The absolute index will be computed at runtime based on actual table order.
     /// Supports table aliases.
     fn get_column_info_for_projection(&self, col_name: &str) -> Option<(String, usize, DataType)> {
+        if self.frozen_base.is_some() {
+            return self.get_frozen_output_column_info(col_name);
+        }
+
         // Check if column name is qualified (contains '.')
         let (target_table, target_col) = if let Some(dot_pos) = col_name.find('.') {
             (Some(&col_name[..dot_pos]), &col_name[dot_pos + 1..])
@@ -554,6 +611,22 @@ impl SelectBuilder {
     }
 
     fn build_projection_output(&self, column_names: &[String]) -> Result<QueryOutput, JsValue> {
+        if let Some(base) = &self.frozen_base {
+            let columns = column_names
+                .iter()
+                .filter_map(|column_name| {
+                    base.output
+                        .resolve_column(column_name)
+                        .map(|(_, column)| column.clone())
+                })
+                .collect();
+
+            return Ok(QueryOutput {
+                schema: base.output.schema.clone(),
+                columns,
+            });
+        }
+
         let normalized_names = Self::normalize_column_names(column_names);
         let columns: Vec<OutputColumn> = column_names
             .iter()
@@ -569,7 +642,7 @@ impl SelectBuilder {
             .collect();
 
         Ok(QueryOutput {
-            schema: self.representative_schema()?,
+            schema: self.output_schema_context()?,
             columns,
         })
     }
@@ -683,7 +756,7 @@ impl SelectBuilder {
             });
 
             return Ok(QueryOutput {
-                schema: self.representative_schema()?,
+                schema: self.output_schema_context()?,
                 columns: group_columns.chain(aggregate_columns).collect(),
             });
         }
@@ -1234,7 +1307,7 @@ impl SelectBuilder {
             .get_table(table_name)
             .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
 
-        // Build logical plan and compile to physical plan (cached for re-execution)
+        // Build logical plan and compile to a cached execution artifact for re-execution.
         let logical_plan = self.build_logical_plan(table_name);
         let output = self.describe_output()?;
         let output_columns = output.column_names();
@@ -1258,16 +1331,21 @@ impl SelectBuilder {
             }
             SchemaLayout::from_schemas(&schemas)
         };
-        let physical_plan = compile_plan(&cache, table_name, logical_plan.clone());
+        let compiled_plan = compile_cached_plan(&cache, table_name, logical_plan.clone());
 
-        // Get initial result using the compiled physical plan
-        let initial_rows = execute_physical_plan(&cache, &physical_plan)
+        // Get initial result using the compiled plan artifact.
+        let initial_output = execute_compiled_physical_plan_with_summary(&cache, &compiled_plan)
             .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
 
         drop(cache); // Release borrow
 
-        // Create re-query observable with cached physical plan
-        let observable = ReQueryObservable::new(physical_plan, cache_ref.clone(), initial_rows);
+        // Create re-query observable with cached compiled plan
+        let observable = ReQueryObservable::new_with_summary(
+            compiled_plan,
+            cache_ref.clone(),
+            initial_output.rows,
+            initial_output.summary,
+        );
         let observable_rc = Rc::new(RefCell::new(observable));
 
         {
@@ -1472,14 +1550,15 @@ impl SelectBuilder {
         // Compute plan fingerprint for caching
         let fingerprint = compute_plan_fingerprint(&plan);
 
-        // Get or compile physical plan (cached)
+        // Get or compile physical plan + execution artifact (cached)
         let rows = {
             let mut plan_cache = self.plan_cache.borrow_mut();
-            let physical_plan = plan_cache
-                .get_or_insert_with(fingerprint, || compile_plan(&cache, table_name, plan));
+            let compiled_plan = plan_cache.get_or_insert_compiled_with(fingerprint, || {
+                compile_cached_plan(&cache, table_name, plan)
+            });
 
-            // Execute the cached physical plan
-            execute_physical_plan(&cache, physical_plan)
+            // Execute the cached compiled plan
+            execute_compiled_physical_plan(&cache, compiled_plan)
                 .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?
         };
 
@@ -2417,11 +2496,212 @@ pub(crate) fn evaluate_predicate(predicate: &Expr, row: &Row, schema: &Table) ->
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::binary_protocol::SchemaLayoutCache;
+    use alloc::rc::Rc;
+    use core::cell::RefCell;
+    use cynos_core::schema::TableBuilder;
+    use cynos_core::{DataType, Row, Value};
+    use cynos_query::plan_cache::PlanCache;
+    use cynos_reactive::TableId;
+    use cynos_storage::TableCache;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
     use cynos_core::pattern_match;
+
+    struct TestSelectContext {
+        cache: Rc<RefCell<TableCache>>,
+        query_registry: Rc<RefCell<QueryRegistry>>,
+        table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+        schema_layout_cache: Rc<RefCell<SchemaLayoutCache>>,
+        plan_cache: Rc<RefCell<PlanCache>>,
+    }
+
+    impl TestSelectContext {
+        fn builder(&self) -> SelectBuilder {
+            self.builder_with_columns(JsValue::UNDEFINED)
+        }
+
+        fn builder_with_columns(&self, columns: JsValue) -> SelectBuilder {
+            SelectBuilder::new(
+                self.cache.clone(),
+                self.query_registry.clone(),
+                self.table_id_map.clone(),
+                self.schema_layout_cache.clone(),
+                self.plan_cache.clone(),
+                columns,
+            )
+        }
+    }
+
+    fn build_union_test_context() -> TestSelectContext {
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let orders = TableBuilder::new("orders")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("amount", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(users).unwrap();
+        cache.create_table(orders).unwrap();
+
+        {
+            let store = cache.get_table_mut("users").unwrap();
+            store
+                .insert(Row::new(
+                    1,
+                    vec![Value::Int64(1), Value::String("Alice".into())],
+                ))
+                .unwrap();
+            store
+                .insert(Row::new(
+                    2,
+                    vec![Value::Int64(2), Value::String("Bob".into())],
+                ))
+                .unwrap();
+            store
+                .insert(Row::new(
+                    3,
+                    vec![Value::Int64(3), Value::String("Charlie".into())],
+                ))
+                .unwrap();
+        }
+
+        {
+            let store = cache.get_table_mut("orders").unwrap();
+            store
+                .insert(Row::new(11, vec![Value::Int64(11), Value::Int64(150)]))
+                .unwrap();
+        }
+
+        let cache = Rc::new(RefCell::new(cache));
+        let query_registry = Rc::new(RefCell::new(QueryRegistry::new()));
+        query_registry
+            .borrow_mut()
+            .set_self_ref(query_registry.clone());
+
+        let table_id_map = Rc::new(RefCell::new(hashbrown::HashMap::new()));
+        table_id_map.borrow_mut().insert("users".into(), 1);
+        table_id_map.borrow_mut().insert("orders".into(), 2);
+
+        TestSelectContext {
+            cache,
+            query_registry,
+            table_id_map,
+            schema_layout_cache: Rc::new(RefCell::new(SchemaLayoutCache::new())),
+            plan_cache: Rc::new(RefCell::new(PlanCache::default_size())),
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn test_select_builder_union_executes_distinct() {
+        let ctx = build_union_test_context();
+        let left = ctx.builder().from("users");
+        let right = ctx.builder().from("users");
+
+        let union = left.union(&right).unwrap();
+        let plan = union.build_logical_plan("users");
+        assert!(matches!(plan, LogicalPlan::Union { all: false, .. }));
+
+        let cache = ctx.cache.borrow();
+        let rows = execute_plan(&cache, "users", plan).unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_select_builder_union_all_executes_with_duplicates() {
+        let ctx = build_union_test_context();
+        let left = ctx.builder().from("users");
+        let right = ctx.builder().from("users");
+
+        let union = left.union_all(&right).unwrap();
+        let plan = union.build_logical_plan("users");
+        assert!(matches!(plan, LogicalPlan::Union { all: true, .. }));
+
+        let cache = ctx.cache.borrow();
+        let rows = execute_plan(&cache, "users", plan).unwrap();
+        assert_eq!(rows.len(), 6);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_select_builder_union_where_resolves_against_union_output() {
+        let ctx = build_union_test_context();
+        let columns = js_sys::Array::new();
+        columns.push(&JsValue::from_str("name"));
+
+        let left = ctx
+            .builder_with_columns(columns.clone().into())
+            .from("users");
+        let right = ctx.builder_with_columns(columns.into()).from("users");
+
+        let filtered = left
+            .union_all(&right)
+            .unwrap()
+            .where_(&crate::expr::Column::new_simple("name").eq(&JsValue::from_str("Bob")));
+
+        let cache = ctx.cache.borrow();
+        let rows = execute_plan(&cache, "users", filtered.build_logical_plan("users")).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .all(|row| row.get(0) == Some(&Value::String("Bob".into()))));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_select_builder_union_order_by_resolves_against_union_output() {
+        let ctx = build_union_test_context();
+        let columns = js_sys::Array::new();
+        columns.push(&JsValue::from_str("name"));
+
+        let left = ctx
+            .builder_with_columns(columns.clone().into())
+            .from("users");
+        let right = ctx.builder_with_columns(columns.into()).from("users");
+
+        let ordered = left
+            .union(&right)
+            .unwrap()
+            .order_by("name", JsSortOrder::Desc)
+            .limit(1);
+
+        let cache = ctx.cache.borrow();
+        let rows = execute_plan(&cache, "users", ordered.build_logical_plan("users")).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::String("Charlie".into())));
+    }
+
+    #[wasm_bindgen_test]
+    fn test_select_builder_union_rejects_incompatible_outputs() {
+        let ctx = build_union_test_context();
+        let left = ctx.builder().from("users");
+        let right = ctx.builder().from("orders");
+
+        let error = match left.union(&right) {
+            Ok(_) => panic!("union should reject incompatible outputs"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.as_string().as_deref(),
+            Some("UNION operands must produce the same number of columns with matching types")
+        );
+    }
 
     #[wasm_bindgen_test]
     fn test_like_match_exact() {

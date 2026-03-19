@@ -7,10 +7,11 @@
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use cynos_core::{Row, Value};
+use cynos_core::{Row, Value, DUMMY_ROW_ID};
 use cynos_index::KeyRange;
 use cynos_query::context::{ExecutionContext, IndexInfo, QueryIndexType, TableStats};
 use cynos_query::executor::{DataSource, ExecutionError, ExecutionResult, PhysicalPlanRunner};
+pub use cynos_query::plan_cache::CompiledPhysicalPlan;
 use cynos_query::planner::{LogicalPlan, PhysicalPlan, QueryPlanner};
 use cynos_storage::TableCache;
 
@@ -31,6 +32,108 @@ pub struct TableCacheDataSource<'a> {
     cache: &'a TableCache,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct QueryResultSummary {
+    pub len: usize,
+    pub fingerprint: u64,
+}
+
+#[derive(Default)]
+struct QueryResultSummaryBuilder {
+    len: usize,
+    fingerprint: u64,
+}
+
+impl QueryResultSummary {
+    pub(crate) fn from_rows(rows: &[Rc<Row>]) -> Self {
+        let mut builder = QueryResultSummaryBuilder::default();
+        for row in rows {
+            builder.push(row.as_ref());
+        }
+        builder.finish()
+    }
+}
+
+impl QueryResultSummaryBuilder {
+    fn push(&mut self, row: &Row) {
+        self.len += 1;
+        self.mix_u64(row.id());
+        self.mix_u64(row.version());
+
+        if row.id() == DUMMY_ROW_ID {
+            self.mix_u64(row.values().len() as u64);
+            for value in row.values() {
+                self.mix_value(value);
+            }
+        }
+    }
+
+    fn finish(self) -> QueryResultSummary {
+        QueryResultSummary {
+            len: self.len,
+            fingerprint: self.fingerprint,
+        }
+    }
+
+    fn mix_u64(&mut self, value: u64) {
+        const PRIME: u64 = 0x9E37_79B1_85EB_CA87;
+        self.fingerprint ^= value.wrapping_add(PRIME).rotate_left(27);
+        self.fingerprint = self.fingerprint.wrapping_mul(PRIME);
+    }
+
+    fn mix_bytes(&mut self, bytes: &[u8]) {
+        self.mix_u64(bytes.len() as u64);
+        for &byte in bytes {
+            self.mix_u64(byte as u64);
+        }
+    }
+
+    fn mix_value(&mut self, value: &Value) {
+        match value {
+            Value::Null => self.mix_u64(0),
+            Value::Boolean(value) => {
+                self.mix_u64(1);
+                self.mix_u64(*value as u64);
+            }
+            Value::Int32(value) => {
+                self.mix_u64(2);
+                self.mix_u64(*value as u32 as u64);
+            }
+            Value::Int64(value) => {
+                self.mix_u64(3);
+                self.mix_u64(*value as u64);
+            }
+            Value::Float64(value) => {
+                self.mix_u64(4);
+                self.mix_u64(value.to_bits());
+            }
+            Value::String(value) => {
+                self.mix_u64(5);
+                self.mix_bytes(value.as_bytes());
+            }
+            Value::DateTime(value) => {
+                self.mix_u64(6);
+                self.mix_u64(*value as u64);
+            }
+            Value::Bytes(value) => {
+                self.mix_u64(7);
+                self.mix_bytes(value);
+            }
+            Value::Jsonb(value) => {
+                self.mix_u64(8);
+                self.mix_bytes(&value.0);
+            }
+        }
+    }
+}
+
+#[doc(hidden)]
+pub struct QueryExecutionOutput {
+    pub rows: Vec<Rc<Row>>,
+    pub summary: QueryResultSummary,
+}
+
 impl<'a> TableCacheDataSource<'a> {
     /// Creates a new data source from a TableCache reference.
     pub fn new(cache: &'a TableCache) -> Self {
@@ -46,6 +149,18 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
         // Rc::clone is cheap (just increment ref count)
         Ok(store.scan().collect())
+    }
+
+    fn visit_table_rows<F>(&self, table: &str, mut visitor: F) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        store.visit_rows(|row| visitor(row));
+        Ok(())
     }
 
     fn get_index_range(
@@ -121,6 +236,74 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         Ok(store.index_scan_composite_with_options(index, range, limit, offset, reverse))
     }
 
+    fn visit_index_range_with_limit<F>(
+        &self,
+        table: &str,
+        index: &str,
+        range_start: Option<&Value>,
+        range_end: Option<&Value>,
+        include_start: bool,
+        include_end: bool,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        let range = match (range_start, range_end) {
+            (Some(start), Some(end)) => Some(KeyRange::bound(
+                start.clone(),
+                end.clone(),
+                !include_start,
+                !include_end,
+            )),
+            (Some(start), None) => Some(KeyRange::lower_bound(start.clone(), !include_start)),
+            (None, Some(end)) => Some(KeyRange::upper_bound(end.clone(), !include_end)),
+            (None, None) => None,
+        };
+
+        store.visit_index_scan_with_options(index, range.as_ref(), limit, offset, reverse, |row| {
+            visitor(row)
+        });
+        Ok(())
+    }
+
+    fn visit_index_range_composite_with_limit<F>(
+        &self,
+        table: &str,
+        index: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        store.visit_index_scan_composite_with_options(
+            index,
+            range,
+            limit,
+            offset,
+            reverse,
+            |row| visitor(row),
+        );
+        Ok(())
+    }
+
     fn get_index_point(
         &self,
         table: &str,
@@ -156,12 +339,43 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         Ok(store.index_scan_with_limit(index, Some(&range), limit))
     }
 
+    fn visit_index_point_with_limit<F>(
+        &self,
+        table: &str,
+        index: &str,
+        key: &Value,
+        limit: Option<usize>,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        let range = KeyRange::only(key.clone());
+        store.visit_index_scan_with_options(index, Some(&range), limit, 0, false, |row| {
+            visitor(row)
+        });
+        Ok(())
+    }
+
     fn get_column_count(&self, table: &str) -> ExecutionResult<usize> {
         let store = self
             .cache
             .get_table(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
         Ok(store.schema().columns().len())
+    }
+
+    fn get_table_row_count(&self, table: &str) -> ExecutionResult<usize> {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+        Ok(store.len())
     }
 
     fn get_gin_index_rows(
@@ -179,6 +393,30 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         Ok(store.gin_index_get_by_key_value(index, key, value))
     }
 
+    fn visit_gin_index_rows<F>(
+        &self,
+        table: &str,
+        index: &str,
+        key: &str,
+        value: &str,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        for row in store.gin_index_get_by_key_value(index, key, value) {
+            if !visitor(&row) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn get_gin_index_rows_by_key(
         &self,
         table: &str,
@@ -193,6 +431,29 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
         Ok(store.gin_index_get_by_key(index, key))
     }
 
+    fn visit_gin_index_rows_by_key<F>(
+        &self,
+        table: &str,
+        index: &str,
+        key: &str,
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        for row in store.gin_index_get_by_key(index, key) {
+            if !visitor(&row) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     fn get_gin_index_rows_multi(
         &self,
         table: &str,
@@ -205,6 +466,29 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
         Ok(store.gin_index_get_by_key_values_all(index, pairs))
+    }
+
+    fn visit_gin_index_rows_multi<F>(
+        &self,
+        table: &str,
+        index: &str,
+        pairs: &[(&str, &str)],
+        mut visitor: F,
+    ) -> ExecutionResult<()>
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let store = self
+            .cache
+            .get_table(table)
+            .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
+
+        for row in store.gin_index_get_by_key_values_all(index, pairs) {
+            if !visitor(&row) {
+                break;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -308,13 +592,10 @@ fn execute_plan_internal(
     // Plan: logical optimization + physical conversion + physical optimization
     let physical_plan = planner.plan(plan);
 
-    // Execute
     let data_source = TableCacheDataSource::new(cache);
     let runner = PhysicalPlanRunner::new(&data_source);
-    let relation = runner.execute(&physical_plan)?;
-
-    // Extract rows from relation entries
-    Ok(relation.entries.into_iter().map(|e| e.row).collect())
+    let artifact = runner.compile_execution_artifact_with_data_source(&physical_plan);
+    runner.execute_with_artifact_row_vec(&physical_plan, &artifact)
 }
 
 /// Compiles a logical plan to a physical plan.
@@ -326,6 +607,17 @@ pub fn compile_plan(cache: &TableCache, table_name: &str, plan: LogicalPlan) -> 
     // Use unified QueryPlanner for complete optimization pipeline
     let planner = QueryPlanner::new(ctx);
     planner.plan(plan)
+}
+
+/// Compiles a logical plan and caches execution-time lowering artifacts for repeated execution.
+pub fn compile_cached_plan(
+    cache: &TableCache,
+    table_name: &str,
+    plan: LogicalPlan,
+) -> CompiledPhysicalPlan {
+    let physical_plan = compile_plan(cache, table_name, plan);
+    let data_source = TableCacheDataSource::new(cache);
+    CompiledPhysicalPlan::new_with_data_source(physical_plan, &data_source)
 }
 
 /// Query plan explanation result.
@@ -373,8 +665,67 @@ pub fn execute_physical_plan(
     let runner = PhysicalPlanRunner::new(&data_source);
     let relation = runner.execute(physical_plan)?;
 
-    // Extract rows from relation entries
-    Ok(relation.entries.into_iter().map(|e| e.row).collect())
+    Ok(relation
+        .entries
+        .into_iter()
+        .map(|entry| entry.row)
+        .collect())
+}
+
+pub fn execute_compiled_physical_plan(
+    cache: &TableCache,
+    compiled_plan: &CompiledPhysicalPlan,
+) -> ExecutionResult<Vec<Rc<Row>>> {
+    let data_source = TableCacheDataSource::new(cache);
+    let runner = PhysicalPlanRunner::new(&data_source);
+    runner.execute_with_artifact_row_vec(compiled_plan.physical_plan(), compiled_plan.artifact())
+}
+
+#[doc(hidden)]
+pub fn execute_physical_plan_with_summary(
+    cache: &TableCache,
+    physical_plan: &PhysicalPlan,
+) -> ExecutionResult<QueryExecutionOutput> {
+    let data_source = TableCacheDataSource::new(cache);
+    let runner = PhysicalPlanRunner::new(&data_source);
+    let relation = runner.execute(physical_plan)?;
+
+    let mut rows = Vec::with_capacity(relation.entries.len());
+    let mut summary = QueryResultSummaryBuilder::default();
+    for entry in relation.entries {
+        summary.push(entry.row.as_ref());
+        rows.push(entry.row);
+    }
+
+    Ok(QueryExecutionOutput {
+        rows,
+        summary: summary.finish(),
+    })
+}
+
+#[doc(hidden)]
+pub fn execute_compiled_physical_plan_with_summary(
+    cache: &TableCache,
+    compiled_plan: &CompiledPhysicalPlan,
+) -> ExecutionResult<QueryExecutionOutput> {
+    let data_source = TableCacheDataSource::new(cache);
+    let runner = PhysicalPlanRunner::new(&data_source);
+    let mut rows = Vec::new();
+    let mut summary = QueryResultSummaryBuilder::default();
+    runner.execute_with_artifact_rows(
+        compiled_plan.physical_plan(),
+        compiled_plan.artifact(),
+        |row| {
+            summary.push(row.as_ref());
+            rows.push(row);
+            Ok(true)
+        },
+    )?;
+
+    Ok(QueryExecutionOutput {
+        rows,
+        summary: summary.finish(),
+    })
 }
 
 #[cfg(test)]
@@ -491,6 +842,68 @@ mod tests {
         let physical = compile_plan(&cache, "users", plan);
 
         assert!(matches!(physical, PhysicalPlan::HashJoin { .. }));
+    }
+
+    #[test]
+    fn test_compiled_plan_matches_physical_plan_execution() {
+        let cache = create_join_test_cache();
+        let plan = LogicalPlan::filter(
+            LogicalPlan::scan("users"),
+            AstExpr::and(
+                AstExpr::gte(
+                    AstExpr::column("users", "id", 0),
+                    AstExpr::literal(Value::Int64(8)),
+                ),
+                AstExpr::not(AstExpr::eq(
+                    AstExpr::column("users", "name", 1),
+                    AstExpr::literal(Value::String("user_9".into())),
+                )),
+            ),
+        );
+
+        let physical = compile_plan(&cache, "users", plan.clone());
+        let compiled = compile_cached_plan(&cache, "users", plan);
+
+        let expected = execute_physical_plan(&cache, &physical).unwrap();
+        let actual = execute_compiled_physical_plan(&cache, &compiled).unwrap();
+
+        let expected_snapshot: Vec<(u64, u64, Vec<Value>)> = expected
+            .into_iter()
+            .map(|row| (row.id(), row.version(), row.values().to_vec()))
+            .collect();
+        let actual_snapshot: Vec<(u64, u64, Vec<Value>)> = actual
+            .into_iter()
+            .map(|row| (row.id(), row.version(), row.values().to_vec()))
+            .collect();
+
+        assert_eq!(actual_snapshot, expected_snapshot);
+    }
+
+    #[test]
+    fn test_compiled_plan_summary_matches_materialized_rows() {
+        let cache = create_join_test_cache();
+        let compiled = compile_cached_plan(
+            &cache,
+            "users",
+            LogicalPlan::limit(
+                LogicalPlan::project(
+                    LogicalPlan::filter(
+                        LogicalPlan::scan("users"),
+                        AstExpr::gte(
+                            AstExpr::column("users", "id", 0),
+                            AstExpr::literal(Value::Int64(8)),
+                        ),
+                    ),
+                    vec![AstExpr::column("users", "name", 1)],
+                ),
+                2,
+                0,
+            ),
+        );
+
+        let output = execute_compiled_physical_plan_with_summary(&cache, &compiled).unwrap();
+
+        assert_eq!(output.summary, QueryResultSummary::from_rows(&output.rows));
     }
 
     #[test]

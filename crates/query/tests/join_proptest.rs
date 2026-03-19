@@ -25,17 +25,6 @@ fn rows_strategy(max_rows: usize) -> impl Strategy<Value = Vec<Row>> {
     })
 }
 
-/// Strategy for generating rows with multiple columns.
-fn multi_column_rows_strategy(max_rows: usize) -> impl Strategy<Value = Vec<Row>> {
-    prop::collection::vec((value_strategy(), value_strategy()), 0..max_rows).prop_map(|values| {
-        values
-            .into_iter()
-            .enumerate()
-            .map(|(i, (k, v))| Row::new(i as u64, vec![Value::Int64(k), Value::Int64(v)]))
-            .collect()
-    })
-}
-
 /// Extracts the set of (left_key, right_key) pairs from join results.
 fn extract_key_pairs(result: &Relation, left_idx: usize, right_idx: usize) -> HashSet<(i64, i64)> {
     result

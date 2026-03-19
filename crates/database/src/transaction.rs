@@ -273,7 +273,6 @@ impl JsTransaction {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::database::Database;
     use crate::table::ColumnOptions;
     use crate::JsDataType;

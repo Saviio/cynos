@@ -20,6 +20,7 @@ pub use project::ProjectExecutor;
 pub use relation::{Relation, RelationEntry, SharedTables};
 pub use runner::{
     DataSource, ExecutionError, ExecutionResult, InMemoryDataSource, PhysicalPlanRunner,
+    PlanExecutionArtifact,
 };
 pub use scan::{IndexScanExecutor, TableScanExecutor};
 pub use sort::SortExecutor;

@@ -16,11 +16,17 @@ use cynos_index::{
 };
 use cynos_jsonb::{JsonbObject, JsonbValue as ParsedJsonbValue};
 
-/// Row storage backend: HashMap (O(1) lookup) or BTreeMap (O(log n) lookup).
+/// Row ID lookup backend: HashMap (O(1) lookup) or BTreeMap (O(log n) lookup).
 #[cfg(feature = "hash-store")]
-type RowMap = hashbrown::HashMap<RowId, Rc<Row>>;
+type RowMap = hashbrown::HashMap<RowId, usize>;
 #[cfg(not(feature = "hash-store"))]
-type RowMap = BTreeMap<RowId, Rc<Row>>;
+type RowMap = BTreeMap<RowId, usize>;
+
+#[derive(Clone)]
+struct RowSlot {
+    row_id: RowId,
+    row: Rc<Row>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum IndexKey {
@@ -148,6 +154,24 @@ pub trait IndexStore {
         limit: Option<usize>,
         skip: usize,
     ) -> Vec<RowId>;
+    /// Visits row IDs in a range without requiring a full intermediate `Vec<RowId>`.
+    /// Return `false` from the visitor to stop early.
+    fn visit_range<F>(
+        &self,
+        range: Option<&KeyRange<Value>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+        mut visitor: F,
+    ) where
+        F: FnMut(RowId) -> bool,
+    {
+        for row_id in self.get_range(range, reverse, limit, skip) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
+    }
     /// Returns all row IDs in the index.
     fn get_all(&self) -> Vec<RowId>;
 }
@@ -201,6 +225,19 @@ impl BTreeIndexStore {
         skip: usize,
     ) -> Vec<RowId> {
         self.inner.get_range(range, reverse, limit, skip)
+    }
+
+    fn visit_range_index_keys<F>(
+        &self,
+        range: Option<&KeyRange<IndexKey>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+        visitor: F,
+    ) where
+        F: FnMut(RowId) -> bool,
+    {
+        self.inner.visit_range(range, reverse, limit, skip, visitor);
     }
 }
 
@@ -263,6 +300,20 @@ impl IndexStore for BTreeIndexStore {
     fn get_all(&self) -> Vec<RowId> {
         self.get_range_index_keys(None, false, None, 0)
     }
+
+    fn visit_range<F>(
+        &self,
+        range: Option<&KeyRange<Value>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+        visitor: F,
+    ) where
+        F: FnMut(RowId) -> bool,
+    {
+        let range = IndexKey::from_scalar_range(range);
+        self.visit_range_index_keys(range.as_ref(), reverse, limit, skip, visitor);
+    }
 }
 
 /// Wrapper for HashIndex that implements IndexStore.
@@ -314,6 +365,23 @@ impl HashIndexStore {
         skip: usize,
     ) -> Vec<RowId> {
         self.inner.get_range(range, reverse, limit, skip)
+    }
+
+    fn visit_range_index_keys<F>(
+        &self,
+        range: Option<&KeyRange<IndexKey>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+        mut visitor: F,
+    ) where
+        F: FnMut(RowId) -> bool,
+    {
+        for row_id in self.get_range_index_keys(range, reverse, limit, skip) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
     }
 }
 
@@ -373,6 +441,23 @@ impl IndexStore for HashIndexStore {
 
     fn get_all(&self) -> Vec<RowId> {
         self.inner.get_all_row_ids()
+    }
+
+    fn visit_range<F>(
+        &self,
+        range: Option<&KeyRange<Value>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+        mut visitor: F,
+    ) where
+        F: FnMut(RowId) -> bool,
+    {
+        for row_id in self.get_range(range, reverse, limit, skip) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
     }
 }
 
@@ -435,16 +520,21 @@ impl SecondaryIndexStore {
         }
     }
 
-    fn get_range_index_keys(
+    fn visit_range_index_keys<F>(
         &self,
         range: Option<&KeyRange<IndexKey>>,
         reverse: bool,
         limit: Option<usize>,
         skip: usize,
-    ) -> Vec<RowId> {
+        visitor: F,
+    ) where
+        F: FnMut(RowId) -> bool,
+    {
         match self {
-            Self::BTree(index) => index.get_range_index_keys(range, reverse, limit, skip),
-            Self::Hash(index) => index.get_range_index_keys(range, reverse, limit, skip),
+            Self::BTree(index) => {
+                index.visit_range_index_keys(range, reverse, limit, skip, visitor)
+            }
+            Self::Hash(index) => index.visit_range_index_keys(range, reverse, limit, skip, visitor),
         }
     }
 }
@@ -471,7 +561,12 @@ fn composite_range_has_expected_arity(range: &KeyRange<Vec<Value>>, expected: us
 /// Row storage for a single table.
 pub struct RowStore {
     schema: Table,
+    /// Row ID -> slot index lookup for point access.
     rows: RowMap,
+    /// Dense row storage used by scans and row materialization.
+    row_slots: Vec<RowSlot>,
+    /// Slot indices maintained in row_id order for deterministic scans.
+    scan_order: Vec<usize>,
     row_id_index: BTreeIndexStore,
     primary_index: Option<BTreeIndexStore>,
     pk_columns: Vec<usize>,
@@ -489,6 +584,8 @@ impl RowStore {
         let mut store = Self {
             schema: schema.clone(),
             rows: RowMap::default(),
+            row_slots: Vec::new(),
+            scan_order: Vec::new(),
             row_id_index: BTreeIndexStore::new(true),
             primary_index: None,
             pk_columns: Vec::new(),
@@ -549,6 +646,72 @@ impl RowStore {
     /// Returns true if the store is empty.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
+    }
+
+    #[inline]
+    fn scan_position(&self, row_id: RowId) -> core::result::Result<usize, usize> {
+        self.scan_order
+            .binary_search_by_key(&row_id, |&slot_idx| self.row_slots[slot_idx].row_id)
+    }
+
+    #[inline]
+    fn row_ref_by_id(&self, row_id: RowId) -> Option<&Rc<Row>> {
+        self.rows
+            .get(&row_id)
+            .and_then(|&slot_idx| self.row_slots.get(slot_idx))
+            .map(|slot| &slot.row)
+    }
+
+    #[inline]
+    fn row_mut_by_id(&mut self, row_id: RowId) -> Option<&mut Rc<Row>> {
+        let slot_idx = *self.rows.get(&row_id)?;
+        self.row_slots.get_mut(slot_idx).map(|slot| &mut slot.row)
+    }
+
+    fn insert_row_slot(&mut self, row_id: RowId, row: Rc<Row>) {
+        let slot_idx = self.row_slots.len();
+        self.row_slots.push(RowSlot { row_id, row });
+        self.rows.insert(row_id, slot_idx);
+
+        let scan_pos = self.scan_position(row_id).unwrap_or_else(|pos| pos);
+        self.scan_order.insert(scan_pos, slot_idx);
+    }
+
+    fn replace_row_slot(&mut self, row_id: RowId, row: Rc<Row>) {
+        if let Some(slot) = self.row_mut_by_id(row_id) {
+            *slot = row;
+        }
+    }
+
+    fn remove_row_slot(&mut self, row_id: RowId) -> Option<Rc<Row>> {
+        let slot_idx = self.rows.remove(&row_id)?;
+        let removed_scan_pos = self.scan_position(row_id).ok();
+        let moved_slot_meta = if slot_idx + 1 < self.row_slots.len() {
+            let moved_row_id = self.row_slots.last()?.row_id;
+            let moved_scan_pos = self.scan_position(moved_row_id).ok();
+            Some((moved_row_id, moved_scan_pos))
+        } else {
+            None
+        };
+        if let Some(scan_pos) = removed_scan_pos {
+            self.scan_order.remove(scan_pos);
+        }
+
+        let removed_slot = self.row_slots.swap_remove(slot_idx);
+        if slot_idx < self.row_slots.len() {
+            let moved_row_id = self.row_slots[slot_idx].row_id;
+            self.rows.insert(moved_row_id, slot_idx);
+            if let Some((expected_row_id, Some(moved_pos))) = moved_slot_meta {
+                debug_assert_eq!(expected_row_id, moved_row_id);
+                let adjusted_pos = match removed_scan_pos {
+                    Some(removed_pos) if moved_pos > removed_pos => moved_pos - 1,
+                    _ => moved_pos,
+                };
+                self.scan_order[adjusted_pos] = slot_idx;
+            }
+        }
+
+        Some(removed_slot.row)
     }
 
     /// Inserts a row into the store.
@@ -620,7 +783,7 @@ impl RowStore {
             }
         }
 
-        self.rows.insert(row_id, Rc::new(row));
+        self.insert_row_slot(row_id, Rc::new(row));
         Ok(row_id)
     }
 
@@ -657,10 +820,9 @@ impl RowStore {
     /// Updates a row in the store.
     pub fn update(&mut self, row_id: RowId, new_row: Row) -> Result<()> {
         let old_row = self
-            .rows
-            .get(&row_id)
-            .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?
-            .clone();
+            .row_ref_by_id(row_id)
+            .cloned()
+            .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?;
 
         // Check primary key uniqueness if PK changed
         if !self.pk_columns.is_empty() {
@@ -735,15 +897,14 @@ impl RowStore {
             }
         }
 
-        self.rows.insert(row_id, Rc::new(new_row));
+        self.replace_row_slot(row_id, Rc::new(new_row));
         Ok(())
     }
 
     /// Deletes a row from the store.
     pub fn delete(&mut self, row_id: RowId) -> Result<Rc<Row>> {
         let row = self
-            .rows
-            .remove(&row_id)
+            .remove_row_slot(row_id)
             .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?;
 
         self.row_id_index
@@ -792,7 +953,7 @@ impl RowStore {
         // First pass: remove rows from the main storage and collect them
         let mut deleted_rows: Vec<Rc<Row>> = Vec::with_capacity(row_ids.len());
         for &row_id in row_ids {
-            if let Some(row) = self.rows.remove(&row_id) {
+            if let Some(row) = self.remove_row_slot(row_id) {
                 deleted_rows.push(row);
             }
         }
@@ -848,23 +1009,48 @@ impl RowStore {
 
     /// Gets a row by ID.
     pub fn get(&self, row_id: RowId) -> Option<Rc<Row>> {
-        self.rows.get(&row_id).cloned()
+        self.row_ref_by_id(row_id).cloned()
     }
 
     /// Gets a mutable reference to a row by ID (requires exclusive access).
     /// Note: This clones the Rc and returns a new Row if mutation is needed.
     pub fn get_mut(&mut self, row_id: RowId) -> Option<&mut Row> {
-        self.rows.get_mut(&row_id).map(|rc| Rc::make_mut(rc))
+        self.row_mut_by_id(row_id).map(Rc::make_mut)
     }
 
     /// Returns an iterator over all rows.
     pub fn scan(&self) -> impl Iterator<Item = Rc<Row>> + '_ {
-        self.rows.values().cloned()
+        self.scan_order
+            .iter()
+            .map(|&slot_idx| self.row_slots[slot_idx].row.clone())
+    }
+
+    /// Returns an iterator over row references without cloning the underlying `Rc`.
+    pub fn row_refs(&self) -> impl Iterator<Item = &Rc<Row>> + '_ {
+        self.scan_order
+            .iter()
+            .map(|&slot_idx| &self.row_slots[slot_idx].row)
+    }
+
+    /// Visits rows in storage order without cloning the underlying `Rc`.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_rows<F>(&self, mut visitor: F)
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        for row in self.row_refs() {
+            if !visitor(row) {
+                break;
+            }
+        }
     }
 
     /// Returns all row IDs.
     pub fn row_ids(&self) -> Vec<RowId> {
-        self.rows.keys().copied().collect()
+        self.scan_order
+            .iter()
+            .map(|&slot_idx| self.row_slots[slot_idx].row_id)
+            .collect()
     }
 
     /// Gets rows by primary key value.
@@ -883,7 +1069,7 @@ impl RowStore {
             pk_index
                 .get_index_key(&pk_key)
                 .iter()
-                .filter_map(|&id| self.rows.get(&id).cloned())
+                .filter_map(|&id| self.row_ref_by_id(id).cloned())
                 .collect()
         } else {
             Vec::new()
@@ -956,26 +1142,56 @@ impl RowStore {
         offset: usize,
         reverse: bool,
     ) -> Vec<Rc<Row>> {
+        let mut rows = Vec::new();
+        self.visit_index_scan_with_options(index_name, range, limit, offset, reverse, |row| {
+            rows.push(row.clone());
+            true
+        });
+        rows
+    }
+
+    /// Visits rows by index scan with limit, offset, and reverse option.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_index_scan_with_options<F>(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Value>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
         let Some(idx) = self.secondary_indices.get(index_name) else {
-            return Vec::new();
+            return;
         };
         let Some(columns) = self.index_columns.get(index_name) else {
-            return Vec::new();
+            return;
         };
 
-        let row_ids = if columns.len() == 1 {
+        if columns.len() == 1 {
             let normalized_range = IndexKey::from_scalar_range(range);
-            idx.get_range_index_keys(normalized_range.as_ref(), reverse, limit, offset)
+            idx.visit_range_index_keys(
+                normalized_range.as_ref(),
+                reverse,
+                limit,
+                offset,
+                |row_id| {
+                    let Some(row) = self.row_ref_by_id(row_id) else {
+                        return true;
+                    };
+                    visitor(row)
+                },
+            );
         } else if range.is_none() {
-            idx.get_range_index_keys(None, reverse, limit, offset)
-        } else {
-            Vec::new()
-        };
-
-        row_ids
-            .iter()
-            .filter_map(|&id| self.rows.get(&id).cloned())
-            .collect()
+            idx.visit_range_index_keys(None, reverse, limit, offset, |row_id| {
+                let Some(row) = self.row_ref_by_id(row_id) else {
+                    return true;
+                };
+                visitor(row)
+            });
+        }
     }
 
     /// Gets rows by composite index scan.
@@ -1018,33 +1234,69 @@ impl RowStore {
         offset: usize,
         reverse: bool,
     ) -> Vec<Rc<Row>> {
+        let mut rows = Vec::new();
+        self.visit_index_scan_composite_with_options(
+            index_name,
+            range,
+            limit,
+            offset,
+            reverse,
+            |row| {
+                rows.push(row.clone());
+                true
+            },
+        );
+        rows
+    }
+
+    /// Visits rows by composite index scan with tuple bounds, limit, offset, and reverse option.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_index_scan_composite_with_options<F>(
+        &self,
+        index_name: &str,
+        range: Option<&KeyRange<Vec<Value>>>,
+        limit: Option<usize>,
+        offset: usize,
+        reverse: bool,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
         let Some(idx) = self.secondary_indices.get(index_name) else {
-            return Vec::new();
+            return;
         };
         let Some(columns) = self.index_columns.get(index_name) else {
-            return Vec::new();
+            return;
         };
         if columns.len() <= 1 {
-            return Vec::new();
+            return;
         }
 
         let normalized_range = match range {
-            Some(range) if !composite_range_has_expected_arity(range, columns.len()) => {
-                return Vec::new()
-            }
+            Some(range) if !composite_range_has_expected_arity(range, columns.len()) => return,
             Some(range) => IndexKey::from_composite_range(Some(range)),
             None => None,
         };
 
-        idx.get_range_index_keys(normalized_range.as_ref(), reverse, limit, offset)
-            .iter()
-            .filter_map(|&id| self.rows.get(&id).cloned())
-            .collect()
+        idx.visit_range_index_keys(
+            normalized_range.as_ref(),
+            reverse,
+            limit,
+            offset,
+            |row_id| {
+                let Some(row) = self.row_ref_by_id(row_id) else {
+                    return true;
+                };
+                visitor(row)
+            },
+        );
     }
 
     /// Clears all rows and indices.
     pub fn clear(&mut self) {
         self.rows.clear();
+        self.row_slots.clear();
+        self.scan_order.clear();
         self.row_id_index.clear();
         if let Some(ref mut pk_index) = self.primary_index {
             pk_index.clear();
@@ -1061,7 +1313,7 @@ impl RowStore {
     pub fn get_many(&self, row_ids: &[RowId]) -> Vec<Option<Rc<Row>>> {
         row_ids
             .iter()
-            .map(|&id| self.rows.get(&id).cloned())
+            .map(|&id| self.row_ref_by_id(id).cloned())
             .collect()
     }
 
@@ -1153,8 +1405,7 @@ impl RowStore {
         new_row: Row,
     ) -> Result<(Delta<Row>, Delta<Row>)> {
         let old_row = self
-            .rows
-            .get(&row_id)
+            .row_ref_by_id(row_id)
             .ok_or_else(|| Error::not_found(self.schema.name(), Value::Int64(row_id as i64)))?
             .clone();
         let new_row_clone = new_row.clone();
@@ -1354,7 +1605,7 @@ impl RowStore {
             let row_ids = gin_idx.get_by_key_value(key, value);
             row_ids
                 .iter()
-                .filter_map(|&id| self.rows.get(&id).cloned())
+                .filter_map(|&id| self.row_ref_by_id(id).cloned())
                 .collect()
         } else {
             Vec::new()
@@ -1367,7 +1618,7 @@ impl RowStore {
             let row_ids = gin_idx.get_by_key(key);
             row_ids
                 .iter()
-                .filter_map(|&id| self.rows.get(&id).cloned())
+                .filter_map(|&id| self.row_ref_by_id(id).cloned())
                 .collect()
         } else {
             Vec::new()
@@ -1385,7 +1636,7 @@ impl RowStore {
             let row_ids = gin_idx.get_by_key_values_all(pairs);
             row_ids
                 .iter()
-                .filter_map(|&id| self.rows.get(&id).cloned())
+                .filter_map(|&id| self.row_ref_by_id(id).cloned())
                 .collect()
         } else {
             Vec::new()
@@ -1706,6 +1957,34 @@ mod tests {
             .unwrap();
         let rows: Vec<_> = store.scan().collect();
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn test_row_store_scan_preserves_row_id_order_after_delete() {
+        let mut store = RowStore::new(test_schema());
+        store
+            .insert(Row::new(
+                2,
+                vec![Value::Int64(2), Value::String("Bob".into())],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                1,
+                vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
+            .unwrap();
+        store
+            .insert(Row::new(
+                3,
+                vec![Value::Int64(3), Value::String("Charlie".into())],
+            ))
+            .unwrap();
+
+        store.delete(2).unwrap();
+
+        let row_ids: Vec<_> = store.scan().map(|row| row.id()).collect();
+        assert_eq!(row_ids, vec![1, 3]);
     }
 
     #[test]
@@ -2203,6 +2482,78 @@ mod tests {
         // New value should be in index
         let results = store.index_scan("idx_value", Some(&KeyRange::only(Value::Int64(200))));
         assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_visit_index_scan_matches_materialized_scan() {
+        let mut store = RowStore::new(test_schema_with_index());
+        for i in 1..=5 {
+            store
+                .insert(Row::new(
+                    i,
+                    vec![Value::Int64(i as i64), Value::Int64((i * 100) as i64)],
+                ))
+                .unwrap();
+        }
+
+        let range = KeyRange::bound(Value::Int64(200), Value::Int64(500), false, false);
+        let expected: Vec<_> = store
+            .index_scan_with_options("idx_value", Some(&range), Some(2), 1, true)
+            .into_iter()
+            .map(|row| row.id())
+            .collect();
+
+        let mut actual = Vec::new();
+        store.visit_index_scan_with_options("idx_value", Some(&range), Some(2), 1, true, |row| {
+            actual.push(row.id());
+            true
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_visit_composite_index_scan_matches_materialized_scan() {
+        let mut store = RowStore::new(test_schema_with_composite_index());
+        for (row_id, a, b) in [(1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20)] {
+            store
+                .insert(Row::new(
+                    row_id,
+                    vec![
+                        Value::Int64(row_id as i64),
+                        Value::Int64(a),
+                        Value::Int64(b),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        let range = KeyRange::bound(
+            vec![Value::Int64(1), Value::Int64(10)],
+            vec![Value::Int64(2), Value::Int64(20)],
+            false,
+            false,
+        );
+        let expected: Vec<_> = store
+            .index_scan_composite_with_options("idx_a_b", Some(&range), Some(3), 1, false)
+            .into_iter()
+            .map(|row| row.id())
+            .collect();
+
+        let mut actual = Vec::new();
+        store.visit_index_scan_composite_with_options(
+            "idx_a_b",
+            Some(&range),
+            Some(3),
+            1,
+            false,
+            |row| {
+                actual.push(row.id());
+                true
+            },
+        );
+
+        assert_eq!(actual, expected);
     }
 
     // === Delta integration tests ===

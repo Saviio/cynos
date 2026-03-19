@@ -358,12 +358,6 @@ mod tests {
         let right_col = ColumnRef::new("b", "a_id", 1);
         let pred = JoinPredicate::inner(left_col, right_col, EvalType::Eq);
 
-        let left_row = Row::new(1, vec![Value::Int64(10)]);
-        let right_row_match = Row::new(2, vec![Value::Int64(10)]);
-        let right_row_no_match = Row::new(3, vec![Value::Int64(20)]);
-
-        // For eval_rows, we pass separate rows
-        // Note: This test uses a simplified model where we check values at specific indices
         assert!(pred.is_equi_join());
     }
 

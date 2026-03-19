@@ -604,7 +604,7 @@ impl JoinReorder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{IndexInfo, TableStats};
+    use crate::context::TableStats;
 
     fn create_test_context() -> ExecutionContext {
         let mut ctx = ExecutionContext::new();

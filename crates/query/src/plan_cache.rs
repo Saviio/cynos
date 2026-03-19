@@ -5,6 +5,7 @@
 //! physical plan can be reused, skipping the optimization phase.
 
 use crate::ast::Expr;
+use crate::executor::{DataSource, InMemoryDataSource, PhysicalPlanRunner, PlanExecutionArtifact};
 use crate::planner::{IndexBounds, LogicalPlan, PhysicalPlan};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -411,16 +412,55 @@ fn hash_value<H: Hasher>(value: &cynos_core::Value, hasher: &mut H) {
 }
 
 /// Cache entry with access tracking for LRU eviction.
+#[derive(Clone)]
+pub struct CompiledPhysicalPlan {
+    physical_plan: PhysicalPlan,
+    artifact: PlanExecutionArtifact,
+}
+
+impl CompiledPhysicalPlan {
+    pub fn new(physical_plan: PhysicalPlan) -> Self {
+        let artifact =
+            PhysicalPlanRunner::<InMemoryDataSource>::compile_execution_artifact(&physical_plan);
+        Self {
+            physical_plan,
+            artifact,
+        }
+    }
+
+    pub fn new_with_data_source<D: DataSource>(
+        physical_plan: PhysicalPlan,
+        data_source: &D,
+    ) -> Self {
+        let artifact = PhysicalPlanRunner::new(data_source)
+            .compile_execution_artifact_with_data_source(&physical_plan);
+        Self {
+            physical_plan,
+            artifact,
+        }
+    }
+
+    pub fn physical_plan(&self) -> &PhysicalPlan {
+        &self.physical_plan
+    }
+
+    pub fn artifact(&self) -> &PlanExecutionArtifact {
+        &self.artifact
+    }
+}
+
+/// Cache entry with access tracking for LRU eviction.
 struct CacheEntry {
-    plan: PhysicalPlan,
+    plan: CompiledPhysicalPlan,
     last_access: u64,
     /// Tables referenced by this plan (for targeted invalidation).
     tables: Vec<String>,
 }
 
-/// LRU cache for compiled physical plans.
+/// LRU cache for compiled physical plans plus execution artifacts.
 ///
-/// The cache stores physical plans keyed by their logical plan fingerprint.
+/// The cache stores physical plans and their lowered execution artifacts keyed
+/// by logical plan fingerprint.
 /// When the cache is full, the least recently used entry is evicted.
 pub struct PlanCache {
     /// Cached plans indexed by fingerprint.
@@ -451,8 +491,8 @@ impl PlanCache {
         Self::new(64)
     }
 
-    /// Gets a cached plan by fingerprint, or returns None if not cached.
-    pub fn get(&mut self, fingerprint: u64) -> Option<&PhysicalPlan> {
+    /// Gets a cached compiled plan by fingerprint, or returns None if not cached.
+    pub fn get(&mut self, fingerprint: u64) -> Option<&CompiledPhysicalPlan> {
         self.access_counter += 1;
         if let Some(entry) = self.cache.get_mut(&fingerprint) {
             entry.last_access = self.access_counter;
@@ -464,16 +504,22 @@ impl PlanCache {
         }
     }
 
-    /// Inserts a plan into the cache.
+    /// Inserts a physical plan into the cache and compiles its execution artifact.
     /// If the cache is full, evicts the least recently used entry.
     pub fn insert(&mut self, fingerprint: u64, plan: PhysicalPlan) {
+        self.insert_compiled(fingerprint, CompiledPhysicalPlan::new(plan));
+    }
+
+    /// Inserts a precompiled plan into the cache.
+    /// If the cache is full, evicts the least recently used entry.
+    pub fn insert_compiled(&mut self, fingerprint: u64, plan: CompiledPhysicalPlan) {
         // Evict if necessary
         if self.cache.len() >= self.max_size {
             self.evict_lru();
         }
 
         self.access_counter += 1;
-        let tables = plan.collect_tables();
+        let tables = plan.physical_plan().collect_tables();
         self.cache.insert(
             fingerprint,
             CacheEntry {
@@ -484,8 +530,8 @@ impl PlanCache {
         );
     }
 
-    /// Gets a cached plan or compiles and caches a new one.
-    pub fn get_or_insert_with<F>(&mut self, fingerprint: u64, compile: F) -> &PhysicalPlan
+    /// Gets a cached compiled plan or compiles and caches a new one.
+    pub fn get_or_insert_with<F>(&mut self, fingerprint: u64, compile: F) -> &CompiledPhysicalPlan
     where
         F: FnOnce() -> PhysicalPlan,
     {
@@ -504,8 +550,45 @@ impl PlanCache {
                 self.evict_lru();
             }
 
+            let plan = CompiledPhysicalPlan::new(compile());
+            let tables = plan.physical_plan().collect_tables();
+            self.cache.insert(
+                fingerprint,
+                CacheEntry {
+                    plan,
+                    last_access: self.access_counter,
+                    tables,
+                },
+            );
+            &self.cache.get(&fingerprint).unwrap().plan
+        }
+    }
+
+    /// Gets a cached compiled plan or inserts a fully precompiled plan.
+    pub fn get_or_insert_compiled_with<F>(
+        &mut self,
+        fingerprint: u64,
+        compile: F,
+    ) -> &CompiledPhysicalPlan
+    where
+        F: FnOnce() -> CompiledPhysicalPlan,
+    {
+        self.access_counter += 1;
+
+        if self.cache.contains_key(&fingerprint) {
+            let entry = self.cache.get_mut(&fingerprint).unwrap();
+            entry.last_access = self.access_counter;
+            self.hits += 1;
+            &self.cache.get(&fingerprint).unwrap().plan
+        } else {
+            self.misses += 1;
+
+            if self.cache.len() >= self.max_size {
+                self.evict_lru();
+            }
+
             let plan = compile();
-            let tables = plan.collect_tables();
+            let tables = plan.physical_plan().collect_tables();
             self.cache.insert(
                 fingerprint,
                 CacheEntry {
@@ -595,8 +678,10 @@ impl PlanCache {
 mod tests {
     use super::*;
     use crate::ast::{Expr, JoinType};
+    use crate::executor::{InMemoryDataSource, PhysicalPlanRunner};
     use alloc::boxed::Box;
     use alloc::string::String;
+    use alloc::vec;
     use cynos_core::Value;
 
     #[test]
@@ -758,6 +843,40 @@ mod tests {
         assert_eq!(compile_count, 1);
         assert_eq!(cache.hits(), 1);
         assert_eq!(cache.misses(), 1);
+    }
+
+    #[test]
+    fn test_cache_entry_executes_with_cached_artifact() {
+        let mut cache = PlanCache::new(10);
+        let fingerprint = 77u64;
+        let plan = PhysicalPlan::filter(
+            PhysicalPlan::table_scan("users"),
+            Expr::eq(
+                Expr::column("users", "id", 0),
+                Expr::literal(Value::Int64(2)),
+            ),
+        );
+        cache.insert(fingerprint, plan);
+
+        let cached = cache.get(fingerprint).unwrap();
+
+        let mut ds = InMemoryDataSource::new();
+        ds.add_table(
+            "users",
+            vec![
+                cynos_core::Row::new(1, vec![Value::Int64(1)]),
+                cynos_core::Row::new(2, vec![Value::Int64(2)]),
+            ],
+            1,
+        );
+
+        let runner = PhysicalPlanRunner::new(&ds);
+        let result = runner
+            .execute_with_artifact(cached.physical_plan(), cached.artifact())
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.entries[0].get_field(0), Some(&Value::Int64(2)));
     }
 
     // ==================== Defect 2 Test: invalidate_table should be targeted ====================

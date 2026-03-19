@@ -2,7 +2,7 @@
 
 use crate::ast::AggregateFunc;
 use crate::executor::{Relation, RelationEntry, SharedTables};
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -15,6 +15,73 @@ pub struct AggregateExecutor {
     group_by: Vec<usize>,
     /// Aggregates to compute: (function, column_index).
     aggregates: Vec<(AggregateFunc, Option<usize>)>,
+}
+
+struct GroupState {
+    group_values: Vec<Value>,
+    version_sum: u64,
+    aggregate_states: Vec<AggregateState>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum GroupKeyValue {
+    Null,
+    Boolean(bool),
+    Int32(i32),
+    Int64(i64),
+    Float64(u64),
+    String(String),
+    DateTime(i64),
+    Bytes(Vec<u8>),
+    Jsonb(Vec<u8>),
+}
+
+enum SumOutputMode {
+    Integer,
+    Float,
+}
+
+enum AggregateState {
+    CountAll {
+        count: i64,
+    },
+    CountNonNull {
+        column_index: usize,
+        count: i64,
+    },
+    Sum {
+        column_index: usize,
+        sum: f64,
+        output_mode: SumOutputMode,
+    },
+    Avg {
+        column_index: usize,
+        sum: f64,
+        count: u64,
+    },
+    Min {
+        column_index: usize,
+        value: Option<Value>,
+    },
+    Max {
+        column_index: usize,
+        value: Option<Value>,
+    },
+    Distinct {
+        column_index: usize,
+        seen: BTreeSet<Value>,
+    },
+    StdDev {
+        column_index: usize,
+        count: u64,
+        mean: f64,
+        m2: f64,
+    },
+    GeoMean {
+        column_index: usize,
+        count: u64,
+        log_sum: f64,
+    },
 }
 
 impl AggregateExecutor {
@@ -35,14 +102,16 @@ impl AggregateExecutor {
     pub fn execute(&self, input: Relation) -> Relation {
         let tables = input.tables().to_vec();
         let shared_tables: SharedTables = tables.clone().into();
-        // After aggregation, the result has a new column structure
         let result_column_count = self.group_by.len() + self.aggregates.len();
 
         if self.group_by.is_empty() {
-            // No grouping - aggregate entire relation
-            // Compute version as sum of all input row versions for change detection
-            let version_sum: u64 = input.iter().map(|e| e.row.version()).sum();
-            let values = self.compute_aggregates(input.iter());
+            let mut version_sum = 0u64;
+            let mut states = self.init_states();
+            for entry in input.iter() {
+                version_sum = version_sum.wrapping_add(entry.row.version());
+                self.update_states(&mut states, entry);
+            }
+            let values = self.finalize_states(states);
             let entry = RelationEntry::new_combined(
                 Rc::new(Row::dummy_with_version(version_sum, values)),
                 shared_tables,
@@ -54,35 +123,28 @@ impl AggregateExecutor {
             };
         }
 
-        // Group by specified columns
-        let mut groups: BTreeMap<String, Vec<&RelationEntry>> = BTreeMap::new();
+        let mut groups: BTreeMap<Vec<GroupKeyValue>, GroupState> = BTreeMap::new();
 
         for entry in input.iter() {
-            let key = self.make_group_key(entry);
-            groups.entry(key).or_default().push(entry);
+            let group_values = self.extract_group_values(entry);
+            let group_key = GroupKeyValue::from_values(&group_values);
+            let group = groups.entry(group_key).or_insert_with(|| GroupState {
+                group_values,
+                version_sum: 0,
+                aggregate_states: self.init_states(),
+            });
+            group.version_sum = group.version_sum.wrapping_add(entry.row.version());
+            self.update_states(&mut group.aggregate_states, entry);
         }
 
         let entries: Vec<RelationEntry> = groups
             .into_iter()
-            .map(|(_, group_entries)| {
-                let mut values = Vec::new();
-
-                // Compute version as sum of group row versions for change detection
-                let version_sum: u64 = group_entries.iter().map(|e| e.row.version()).sum();
-
-                // Add group by values
-                if let Some(first) = group_entries.first() {
-                    for &idx in &self.group_by {
-                        values.push(first.get_field(idx).cloned().unwrap_or(Value::Null));
-                    }
-                }
-
-                // Add aggregate values
-                let agg_values = self.compute_aggregates(group_entries.iter().copied());
-                values.extend(agg_values);
+            .map(|(_, group_state)| {
+                let mut values = group_state.group_values;
+                values.extend(self.finalize_states(group_state.aggregate_states));
 
                 RelationEntry::new_combined(
-                    Rc::new(Row::dummy_with_version(version_sum, values)),
+                    Rc::new(Row::dummy_with_version(group_state.version_sum, values)),
                     shared_tables.clone(),
                 )
             })
@@ -95,201 +157,262 @@ impl AggregateExecutor {
         }
     }
 
-    fn make_group_key(&self, entry: &RelationEntry) -> String {
+    fn extract_group_values(&self, entry: &RelationEntry) -> Vec<Value> {
         self.group_by
             .iter()
-            .map(|&idx| {
-                entry
-                    .get_field(idx)
-                    .map(value_to_string)
-                    .unwrap_or_else(|| String::from("null"))
-            })
-            .collect::<Vec<_>>()
-            .join("|")
-    }
-
-    fn compute_aggregates<'a>(
-        &self,
-        entries: impl Iterator<Item = &'a RelationEntry>,
-    ) -> Vec<Value> {
-        let entries: Vec<_> = entries.collect();
-
-        self.aggregates
-            .iter()
-            .map(|(func, col_idx)| self.compute_single_aggregate(*func, *col_idx, &entries))
+            .map(|&idx| entry.get_field(idx).cloned().unwrap_or(Value::Null))
             .collect()
     }
 
-    fn compute_single_aggregate(
-        &self,
-        func: AggregateFunc,
-        col_idx: Option<usize>,
-        entries: &[&RelationEntry],
-    ) -> Value {
+    fn init_states(&self) -> Vec<AggregateState> {
+        self.aggregates
+            .iter()
+            .map(|(func, column_index)| AggregateState::new(*func, *column_index))
+            .collect()
+    }
+
+    fn update_states(&self, states: &mut [AggregateState], entry: &RelationEntry) {
+        for state in states {
+            state.update(entry);
+        }
+    }
+
+    fn finalize_states(&self, states: Vec<AggregateState>) -> Vec<Value> {
+        states.into_iter().map(AggregateState::finalize).collect()
+    }
+}
+
+impl AggregateState {
+    fn new(func: AggregateFunc, column_index: Option<usize>) -> Self {
         match func {
-            AggregateFunc::Count => {
-                if let Some(idx) = col_idx {
-                    // COUNT(column) - count non-null values
-                    let count = entries
-                        .iter()
-                        .filter(|e| e.get_field(idx).map(|v| !v.is_null()).unwrap_or(false))
-                        .count();
-                    Value::Int64(count as i64)
-                } else {
-                    // COUNT(*) - count all rows
-                    Value::Int64(entries.len() as i64)
-                }
-            }
-            AggregateFunc::Sum => {
-                let idx = col_idx.unwrap_or(0);
-                let sum = entries
-                    .iter()
-                    .filter_map(|e| e.get_field(idx))
-                    .filter(|v| !v.is_null())
-                    .fold(0.0f64, |acc, v| {
-                        acc + match v {
-                            Value::Int32(i) => *i as f64,
-                            Value::Int64(i) => *i as f64,
-                            Value::Float64(f) => *f,
-                            _ => 0.0,
-                        }
-                    });
+            AggregateFunc::Count => match column_index {
+                Some(column_index) => Self::CountNonNull {
+                    column_index,
+                    count: 0,
+                },
+                None => Self::CountAll { count: 0 },
+            },
+            AggregateFunc::Sum => Self::Sum {
+                column_index: column_index.unwrap_or(0),
+                sum: 0.0,
+                output_mode: SumOutputMode::Integer,
+            },
+            AggregateFunc::Avg => Self::Avg {
+                column_index: column_index.unwrap_or(0),
+                sum: 0.0,
+                count: 0,
+            },
+            AggregateFunc::Min => Self::Min {
+                column_index: column_index.unwrap_or(0),
+                value: None,
+            },
+            AggregateFunc::Max => Self::Max {
+                column_index: column_index.unwrap_or(0),
+                value: None,
+            },
+            AggregateFunc::Distinct => Self::Distinct {
+                column_index: column_index.unwrap_or(0),
+                seen: BTreeSet::new(),
+            },
+            AggregateFunc::StdDev => Self::StdDev {
+                column_index: column_index.unwrap_or(0),
+                count: 0,
+                mean: 0.0,
+                m2: 0.0,
+            },
+            AggregateFunc::GeoMean => Self::GeoMean {
+                column_index: column_index.unwrap_or(0),
+                count: 0,
+                log_sum: 0.0,
+            },
+        }
+    }
 
-                if entries.iter().all(|e| {
-                    e.get_field(idx)
-                        .map(|v| v.is_null() || matches!(v, Value::Int32(_) | Value::Int64(_)))
-                        .unwrap_or(true)
-                }) {
-                    Value::Int64(sum as i64)
-                } else {
-                    Value::Float64(sum)
+    fn update(&mut self, entry: &RelationEntry) {
+        match self {
+            Self::CountAll { count } => {
+                *count += 1;
+            }
+            Self::CountNonNull {
+                column_index,
+                count,
+            } => {
+                if entry
+                    .get_field(*column_index)
+                    .map(|value| !value.is_null())
+                    .unwrap_or(false)
+                {
+                    *count += 1;
                 }
             }
-            AggregateFunc::Avg => {
-                let idx = col_idx.unwrap_or(0);
-                let values: Vec<f64> = entries
-                    .iter()
-                    .filter_map(|e| e.get_field(idx))
-                    .filter(|v| !v.is_null())
-                    .filter_map(|v| match v {
-                        Value::Int32(i) => Some(*i as f64),
-                        Value::Int64(i) => Some(*i as f64),
-                        Value::Float64(f) => Some(*f),
-                        _ => None,
-                    })
-                    .collect();
-
-                if values.is_empty() {
-                    Value::Null
-                } else {
-                    let sum: f64 = values.iter().sum();
-                    Value::Float64(sum / values.len() as f64)
+            Self::Sum {
+                column_index,
+                sum,
+                output_mode,
+            } => {
+                let Some(value) = entry.get_field(*column_index) else {
+                    return;
+                };
+                if value.is_null() {
+                    return;
                 }
-            }
-            AggregateFunc::Min => {
-                let idx = col_idx.unwrap_or(0);
-                entries
-                    .iter()
-                    .filter_map(|e| e.get_field(idx))
-                    .filter(|v| !v.is_null())
-                    .min()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-            }
-            AggregateFunc::Max => {
-                let idx = col_idx.unwrap_or(0);
-                entries
-                    .iter()
-                    .filter_map(|e| e.get_field(idx))
-                    .filter(|v| !v.is_null())
-                    .max()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-            }
-            AggregateFunc::Distinct => {
-                let idx = col_idx.unwrap_or(0);
-                let mut seen: BTreeMap<String, Value> = BTreeMap::new();
-                for entry in entries {
-                    if let Some(v) = entry.get_field(idx) {
-                        let key = value_to_string(v);
-                        seen.entry(key).or_insert_with(|| v.clone());
+                match value {
+                    Value::Int32(value) => *sum += *value as f64,
+                    Value::Int64(value) => *sum += *value as f64,
+                    Value::Float64(value) => {
+                        *sum += *value;
+                        *output_mode = SumOutputMode::Float;
+                    }
+                    _ => {
+                        *output_mode = SumOutputMode::Float;
                     }
                 }
-                // Return count of distinct values for now
-                Value::Int64(seen.len() as i64)
             }
-            AggregateFunc::StdDev => {
-                let idx = col_idx.unwrap_or(0);
-                let values: Vec<f64> = entries
-                    .iter()
-                    .filter_map(|e| e.get_field(idx))
-                    .filter(|v| !v.is_null())
-                    .filter_map(|v| match v {
-                        Value::Int32(i) => Some(*i as f64),
-                        Value::Int64(i) => Some(*i as f64),
-                        Value::Float64(f) => Some(*f),
-                        _ => None,
-                    })
-                    .collect();
-
-                if values.is_empty() {
-                    Value::Null
-                } else {
-                    let mean: f64 = values.iter().sum::<f64>() / values.len() as f64;
-                    let variance: f64 = values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>()
-                        / values.len() as f64;
-                    Value::Float64(sqrt(variance))
+            Self::Avg {
+                column_index,
+                sum,
+                count,
+            } => {
+                if let Some(value) = entry.get_field(*column_index).and_then(Self::numeric_value) {
+                    *sum += value;
+                    *count += 1;
                 }
             }
-            AggregateFunc::GeoMean => {
-                let idx = col_idx.unwrap_or(0);
-                let values: Vec<f64> = entries
-                    .iter()
-                    .filter_map(|e| e.get_field(idx))
-                    .filter(|v| !v.is_null())
-                    .filter_map(|v| match v {
-                        Value::Int32(i) => Some(*i as f64),
-                        Value::Int64(i) => Some(*i as f64),
-                        Value::Float64(f) => Some(*f),
-                        _ => None,
-                    })
-                    .filter(|&v| v > 0.0)
-                    .collect();
-
-                if values.is_empty() {
-                    Value::Null
-                } else {
-                    let log_sum: f64 = values.iter().map(|v| log(*v)).sum();
-                    let geomean = exp(log_sum / values.len() as f64);
-                    Value::Float64(geomean)
+            Self::Min {
+                column_index,
+                value,
+            } => {
+                let Some(candidate) = entry.get_field(*column_index) else {
+                    return;
+                };
+                if candidate.is_null() {
+                    return;
+                }
+                match value {
+                    Some(current) if candidate >= current => {}
+                    slot => *slot = Some(candidate.clone()),
                 }
             }
+            Self::Max {
+                column_index,
+                value,
+            } => {
+                let Some(candidate) = entry.get_field(*column_index) else {
+                    return;
+                };
+                if candidate.is_null() {
+                    return;
+                }
+                match value {
+                    Some(current) if candidate <= current => {}
+                    slot => *slot = Some(candidate.clone()),
+                }
+            }
+            Self::Distinct { column_index, seen } => {
+                if let Some(value) = entry.get_field(*column_index) {
+                    seen.insert(value.clone());
+                }
+            }
+            Self::StdDev {
+                column_index,
+                count,
+                mean,
+                m2,
+            } => {
+                let Some(value) = entry.get_field(*column_index).and_then(Self::numeric_value)
+                else {
+                    return;
+                };
+                *count += 1;
+                let delta = value - *mean;
+                *mean += delta / *count as f64;
+                let delta2 = value - *mean;
+                *m2 += delta * delta2;
+            }
+            Self::GeoMean {
+                column_index,
+                count,
+                log_sum,
+            } => {
+                let Some(value) = entry.get_field(*column_index).and_then(Self::numeric_value)
+                else {
+                    return;
+                };
+                if value > 0.0 {
+                    *count += 1;
+                    *log_sum += log(value);
+                }
+            }
+        }
+    }
+
+    fn finalize(self) -> Value {
+        match self {
+            Self::CountAll { count } | Self::CountNonNull { count, .. } => Value::Int64(count),
+            Self::Sum {
+                sum,
+                output_mode: SumOutputMode::Integer,
+                ..
+            } => Value::Int64(sum as i64),
+            Self::Sum {
+                sum,
+                output_mode: SumOutputMode::Float,
+                ..
+            } => Value::Float64(sum),
+            Self::Avg { sum, count, .. } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float64(sum / count as f64)
+                }
+            }
+            Self::Min { value, .. } | Self::Max { value, .. } => value.unwrap_or(Value::Null),
+            Self::Distinct { seen, .. } => Value::Int64(seen.len() as i64),
+            Self::StdDev { count, m2, .. } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float64(sqrt(m2 / count as f64))
+                }
+            }
+            Self::GeoMean { count, log_sum, .. } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float64(exp(log_sum / count as f64))
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn numeric_value(value: &Value) -> Option<f64> {
+        match value {
+            Value::Int32(value) => Some(*value as f64),
+            Value::Int64(value) => Some(*value as f64),
+            Value::Float64(value) => Some(*value),
+            _ => None,
         }
     }
 }
 
-/// Converts a value to a unique string representation for grouping.
-///
-/// This function includes type prefixes to distinguish between different types
-/// with the same numeric representation (e.g., Int32(42) vs Int64(42) vs DateTime(42)).
-///
-/// For strings, the separator character `|` is escaped to prevent key collisions
-/// when string values contain the separator (e.g., ("a|b", "c") vs ("a", "b|c")).
-fn value_to_string(value: &Value) -> String {
-    match value {
-        Value::Null => String::from("N:"),
-        Value::Boolean(b) => alloc::format!("B:{}", b),
-        Value::Int32(i) => alloc::format!("I32:{}", i),
-        Value::Int64(i) => alloc::format!("I64:{}", i),
-        Value::Float64(f) => alloc::format!("F64:{}", f),
-        // Escape backslash first, then escape the separator character
-        Value::String(s) => {
-            let escaped = s.replace('\\', "\\\\").replace('|', "\\|");
-            alloc::format!("S:{}", escaped)
+impl GroupKeyValue {
+    fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Null => Self::Null,
+            Value::Boolean(value) => Self::Boolean(*value),
+            Value::Int32(value) => Self::Int32(*value),
+            Value::Int64(value) => Self::Int64(*value),
+            Value::Float64(value) => Self::Float64(value.to_bits()),
+            Value::String(value) => Self::String(value.clone()),
+            Value::DateTime(value) => Self::DateTime(*value),
+            Value::Bytes(value) => Self::Bytes(value.clone()),
+            Value::Jsonb(value) => Self::Jsonb(value.0.clone()),
         }
-        Value::DateTime(d) => alloc::format!("DT:{}", d),
-        Value::Bytes(b) => alloc::format!("BY:{:?}", b),
-        Value::Jsonb(j) => alloc::format!("J:{:?}", j.0),
+    }
+
+    fn from_values(values: &[Value]) -> Vec<Self> {
+        values.iter().map(Self::from_value).collect()
     }
 }
 

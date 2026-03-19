@@ -1,5 +1,6 @@
 //! B+Tree implementation.
 
+use super::iter::BTreeIterator;
 use super::node::{Node, NodeId};
 use crate::comparator::{Comparator, SimpleComparator};
 use crate::stats::IndexStats;
@@ -455,6 +456,139 @@ impl<K: Clone + Ord> BTreeIndex<K> {
             }
         }
     }
+
+    #[inline]
+    fn key_past_forward_range(range: &KeyRange<K>, key: &K) -> bool {
+        match range {
+            KeyRange::All | KeyRange::LowerBound { .. } => false,
+            KeyRange::Only(value) => key > value,
+            KeyRange::UpperBound { value, exclusive } => {
+                if *exclusive {
+                    key >= value
+                } else {
+                    key > value
+                }
+            }
+            KeyRange::Bound {
+                upper,
+                upper_exclusive,
+                ..
+            } => {
+                if *upper_exclusive {
+                    key >= upper
+                } else {
+                    key > upper
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn key_past_reverse_range(range: &KeyRange<K>, key: &K) -> bool {
+        match range {
+            KeyRange::All | KeyRange::UpperBound { .. } => false,
+            KeyRange::Only(value) => key < value,
+            KeyRange::LowerBound { value, exclusive } => {
+                if *exclusive {
+                    key <= value
+                } else {
+                    key < value
+                }
+            }
+            KeyRange::Bound {
+                lower,
+                lower_exclusive,
+                ..
+            } => {
+                if *lower_exclusive {
+                    key <= lower
+                } else {
+                    key < lower
+                }
+            }
+        }
+    }
+
+    /// Visits row IDs within the given key range without first materializing a `Vec<RowId>`.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_range<F>(
+        &self,
+        range: Option<&KeyRange<K>>,
+        reverse: bool,
+        limit: Option<usize>,
+        skip: usize,
+        mut visitor: F,
+    ) where
+        F: FnMut(RowId) -> bool,
+    {
+        let range = range.cloned().unwrap_or(KeyRange::All);
+
+        let start = if reverse {
+            match &range {
+                KeyRange::All | KeyRange::LowerBound { .. } => {
+                    let leaf = self.rightmost_leaf();
+                    if self.arena[leaf].is_empty() {
+                        None
+                    } else {
+                        Some((leaf, self.arena[leaf].key_count() - 1))
+                    }
+                }
+                KeyRange::Only(key)
+                | KeyRange::UpperBound { value: key, .. }
+                | KeyRange::Bound { upper: key, .. } => {
+                    let leaf = self.find_leaf(key);
+                    let node = &self.arena[leaf];
+                    let pos = node.find_key_position(key);
+                    if pos > 0 {
+                        Some((leaf, pos - 1))
+                    } else if let Some(prev) = node.prev {
+                        let prev_node = &self.arena[prev];
+                        if prev_node.is_empty() {
+                            None
+                        } else {
+                            Some((prev, prev_node.key_count() - 1))
+                        }
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else {
+            self.find_range_start(&range)
+        };
+
+        let Some((start_node, start_pos)) = start else {
+            return;
+        };
+
+        let mut skipped = 0usize;
+        let mut emitted = 0usize;
+
+        for (key, row_id) in BTreeIterator::new_at(&self.arena, start_node, start_pos, reverse) {
+            if range.contains(key) {
+                if skipped < skip {
+                    skipped += 1;
+                    continue;
+                }
+                if let Some(limit) = limit {
+                    if emitted >= limit {
+                        break;
+                    }
+                }
+                if !visitor(row_id) {
+                    break;
+                }
+                emitted += 1;
+                continue;
+            }
+
+            if (!reverse && Self::key_past_forward_range(&range, key))
+                || (reverse && Self::key_past_reverse_range(&range, key))
+            {
+                break;
+            }
+        }
+    }
 }
 
 impl<K: Clone + Ord> Index<K> for BTreeIndex<K> {
@@ -613,132 +747,11 @@ impl<K: Clone + Ord> RangeIndex<K> for BTreeIndex<K> {
         limit: Option<usize>,
         skip: usize,
     ) -> Vec<RowId> {
-        let range = range.cloned().unwrap_or(KeyRange::All);
-
-        // Find starting position
-        let start = if reverse {
-            match &range {
-                KeyRange::All | KeyRange::LowerBound { .. } => {
-                    let leaf = self.rightmost_leaf();
-                    if self.arena[leaf].is_empty() {
-                        None
-                    } else {
-                        Some((leaf, self.arena[leaf].key_count() - 1))
-                    }
-                }
-                KeyRange::Only(key)
-                | KeyRange::UpperBound { value: key, .. }
-                | KeyRange::Bound { upper: key, .. } => {
-                    let leaf = self.find_leaf(key);
-                    let node = &self.arena[leaf];
-                    let pos = node.find_key_position(key);
-                    if pos > 0 {
-                        Some((leaf, pos - 1))
-                    } else if let Some(prev) = node.prev {
-                        let prev_node = &self.arena[prev];
-                        if prev_node.is_empty() {
-                            None
-                        } else {
-                            Some((prev, prev_node.key_count() - 1))
-                        }
-                    } else {
-                        None
-                    }
-                }
-            }
-        } else {
-            self.find_range_start(&range)
-        };
-
-        let (start_node, start_pos) = match start {
-            Some((n, p)) => (n, p),
-            None => return Vec::new(),
-        };
-
-        // Collect results
         let mut result = Vec::new();
-        let mut skipped = 0;
-        let mut collected = 0;
-
-        let mut current_node = Some(start_node);
-        let mut current_pos = start_pos;
-
-        while let Some(node_id) = current_node {
-            let node = &self.arena[node_id];
-
-            if node.is_empty() {
-                break;
-            }
-
-            // Process current position
-            if current_pos < node.key_count() {
-                let key = &node.keys[current_pos];
-
-                // Check if key is in range
-                if range.contains(key) {
-                    for &value in &node.values[current_pos] {
-                        if skipped < skip {
-                            skipped += 1;
-                            continue;
-                        }
-
-                        if let Some(lim) = limit {
-                            if collected >= lim {
-                                return result;
-                            }
-                        }
-
-                        result.push(value);
-                        collected += 1;
-                    }
-                } else if !reverse {
-                    // For forward iteration, if key is past range, we're done
-                    match &range {
-                        KeyRange::Only(_) => break,
-                        KeyRange::UpperBound { value, exclusive } => {
-                            if *exclusive && key >= value || !*exclusive && key > value {
-                                break;
-                            }
-                        }
-                        KeyRange::Bound {
-                            upper,
-                            upper_exclusive,
-                            ..
-                        } => {
-                            if *upper_exclusive && key >= upper || !*upper_exclusive && key > upper
-                            {
-                                break;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            // Move to next position
-            if reverse {
-                if current_pos > 0 {
-                    current_pos -= 1;
-                } else {
-                    current_node = node.prev;
-                    if let Some(prev_id) = current_node {
-                        let prev_node = &self.arena[prev_id];
-                        current_pos = if prev_node.is_empty() {
-                            0
-                        } else {
-                            prev_node.key_count() - 1
-                        };
-                    }
-                }
-            } else {
-                current_pos += 1;
-                if current_pos >= node.key_count() {
-                    current_node = node.next;
-                    current_pos = 0;
-                }
-            }
-        }
-
+        self.visit_range(range, reverse, limit, skip, |row_id| {
+            result.push(row_id);
+            true
+        });
         result
     }
 }
@@ -843,6 +856,42 @@ mod tests {
 
         assert!(tree.is_empty());
         assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn test_btree_visit_range_matches_get_range_forward() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, false);
+        for (key, row_id) in [(1, 10), (2, 20), (2, 21), (3, 30), (4, 40)] {
+            tree.add(key, row_id).unwrap();
+        }
+
+        let range = KeyRange::bound(2, 3, false, false);
+        let expected = tree.get_range(Some(&range), false, Some(2), 1);
+        let mut actual = Vec::new();
+        tree.visit_range(Some(&range), false, Some(2), 1, |row_id| {
+            actual.push(row_id);
+            true
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_btree_visit_range_matches_get_range_reverse() {
+        let mut tree: BTreeIndex<i32> = BTreeIndex::new(5, false);
+        for (key, row_id) in [(1, 10), (2, 20), (2, 21), (3, 30), (4, 40)] {
+            tree.add(key, row_id).unwrap();
+        }
+
+        let range = KeyRange::bound(2, 4, false, false);
+        let expected = tree.get_range(Some(&range), true, Some(3), 1);
+        let mut actual = Vec::new();
+        tree.visit_range(Some(&range), true, Some(3), 1, |row_id| {
+            actual.push(row_id);
+            true
+        });
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
