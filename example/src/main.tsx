@@ -1,11 +1,12 @@
 import { createRoot } from 'react-dom/client'
 import { useState, useEffect, lazy, Suspense } from 'react'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { Layers, Activity, GitCompare, Home, Code, Loader2 } from 'lucide-react'
+import { Layers, Activity, GitCompare, Home, Code, Loader2, Braces } from 'lucide-react'
 import Landing from './Landing'
 import App from './App'
 import IvmDemo from './IvmDemo'
 import QueryBuilder from './QueryBuilder'
+import GraphqlDemo from './GraphqlDemo'
 import './index.css'
 
 // Lazy load hidden comparison page
@@ -25,7 +26,7 @@ function Router() {
     setRoute(hash)
   }
 
-  const currentTab = route === '#/live' ? 'live' : route === '#/ivm' ? 'ivm' : route === '#/query' ? 'query' : 'home'
+  const currentTab = route === '#/live' ? 'live' : route === '#/ivm' ? 'ivm' : route === '#/query' ? 'query' : route === '#/graphql' ? 'graphql' : 'home'
 
   return (
     <div className="min-h-screen bg-background">
@@ -78,6 +79,14 @@ function Router() {
                   <Code className="w-4 h-4" />
                   Query Builder
                 </TabsTrigger>
+                <TabsTrigger
+                  value="graphql"
+                  onClick={() => navigate('#/graphql')}
+                  className="gap-1.5"
+                >
+                  <Braces className="w-4 h-4" />
+                  GraphQL
+                </TabsTrigger>
               </TabsList>
             </Tabs>
 
@@ -107,6 +116,12 @@ function Router() {
               >
                 <Code className="w-5 h-5" />
               </button>
+              <button
+                onClick={() => navigate('#/graphql')}
+                className={`p-2 rounded-md transition-colors ${currentTab === 'graphql' ? 'bg-muted text-foreground' : 'text-muted-foreground hover:text-foreground'}`}
+              >
+                <Braces className="w-5 h-5" />
+              </button>
             </div>
           </div>
         </div>
@@ -120,6 +135,8 @@ function Router() {
           <IvmDemo />
         ) : route === '#/query' ? (
           <QueryBuilder />
+        ) : route === '#/graphql' ? (
+          <GraphqlDemo />
         ) : route === '#/lf' ? (
           <Suspense fallback={
             <div className="flex flex-col items-center justify-center min-h-[60vh] gap-4">

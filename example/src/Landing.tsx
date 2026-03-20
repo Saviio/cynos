@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Database, Zap, GitCompare, ArrowRight, Activity, Gauge, Terminal, Box, Cpu, Code } from 'lucide-react'
+import { Database, Zap, GitCompare, ArrowRight, Activity, Gauge, Terminal, Box, Cpu, Code, Braces } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { TextMorph } from 'torph/react'
 import { WaveBackground } from './components/WaveBackground'
@@ -129,7 +129,7 @@ export default function Landing({ onNavigate }: LandingProps) {
             <h2 className="text-2xl md:text-3xl font-bold tracking-tight">INTERACTIVE DEMOS</h2>
           </div>
 
-          <div className="grid md:grid-cols-3 gap-6 max-w-5xl mx-auto">
+          <div className="grid md:grid-cols-2 lg:grid-cols-4 gap-6 max-w-6xl mx-auto">
             <div
               className="border border-white/10 bg-white/[0.02] p-8 hover:border-white/30 transition-all cursor-pointer group"
               onClick={() => onNavigate('#/live')}
@@ -193,6 +193,28 @@ export default function Landing({ onNavigate }: LandingProps) {
                 <span className="text-xs px-2 py-1 border border-white/20 text-white/60">UPDATE</span>
               </div>
             </div>
+
+            <div
+              className="border border-white/10 bg-white/[0.02] p-8 hover:border-white/30 transition-all cursor-pointer group"
+              onClick={() => onNavigate('#/graphql')}
+            >
+              <div className="flex items-center justify-between mb-6">
+                <div className="flex items-center gap-3">
+                  <Braces className="w-4 h-4" />
+                  <span className="text-xs tracking-widest uppercase">API</span>
+                </div>
+                <ArrowRight className="w-4 h-4 text-white/30 group-hover:text-white transition-colors" />
+              </div>
+              <h3 className="text-lg font-bold tracking-wide uppercase mb-3">GraphQL</h3>
+              <p className="text-sm text-white/40 mb-6">
+                Auto-generated GraphQL schema with queries, mutations, and subscriptions.
+              </p>
+              <div className="flex gap-2 flex-wrap">
+                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">Query</span>
+                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">Mutation</span>
+                <span className="text-xs px-2 py-1 border border-white/20 text-white/60">Subscribe</span>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -206,8 +228,8 @@ export default function Landing({ onNavigate }: LandingProps) {
               <div className="text-xs text-white/40 tracking-widest uppercase">Like Syntax</div>
             </div>
             <div className="text-center">
-              <div className="text-4xl md:text-5xl font-bold mb-2 font-mono">1M+</div>
-              <div className="text-xs text-white/40 tracking-widest uppercase">Rows Supported</div>
+              <div className="text-4xl md:text-5xl font-bold mb-2 font-mono">GQL</div>
+              <div className="text-xs text-white/40 tracking-widest uppercase">Supported</div>
             </div>
             <div className="text-center">
               <div className="text-4xl md:text-5xl font-bold mb-2 font-mono">O(δ)</div>
