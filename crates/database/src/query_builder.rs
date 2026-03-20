@@ -240,9 +240,51 @@ impl SelectBuilder {
     fn get_modifier_column_info(&self, col_name: &str) -> Option<(String, usize, DataType)> {
         if self.frozen_base.is_some() {
             self.get_frozen_output_column_info(col_name)
+        } else if !self.joins.is_empty() {
+            self.get_join_output_column_info(col_name)
         } else {
             self.get_column_info_any_table(col_name)
         }
+    }
+
+    fn get_join_output_column_info(&self, col_name: &str) -> Option<(String, usize, DataType)> {
+        let (target_table, target_col) = if let Some(dot_pos) = col_name.find('.') {
+            (Some(&col_name[..dot_pos]), &col_name[dot_pos + 1..])
+        } else {
+            (None, col_name)
+        };
+
+        let mut offset = 0usize;
+
+        if let Some(main_table) = &self.from_table {
+            if let Some(schema) = self.get_schema() {
+                if target_table.is_none() || target_table == Some(main_table.as_str()) {
+                    if let Some(col) = schema.get_column(target_col) {
+                        return Some((String::new(), offset + col.index(), col.data_type()));
+                    }
+                }
+                offset += schema.columns().len();
+            }
+        }
+
+        let cache = self.cache.borrow();
+        for join in &self.joins {
+            if let Some(store) = cache.get_table(&join.table) {
+                let schema = store.schema();
+                let ref_name = join.reference_name();
+                if target_table.is_none()
+                    || target_table == Some(ref_name)
+                    || target_table == Some(join.table.as_str())
+                {
+                    if let Some(col) = schema.get_column(target_col) {
+                        return Some((String::new(), offset + col.index(), col.data_type()));
+                    }
+                }
+                offset += schema.columns().len();
+            }
+        }
+
+        None
     }
 
     /// Gets column info for any table (main table or joined tables).
@@ -550,6 +592,10 @@ impl SelectBuilder {
             return self.get_frozen_output_column_info(col_name);
         }
 
+        if !self.joins.is_empty() {
+            return self.get_join_output_column_info(col_name);
+        }
+
         // Check if column name is qualified (contains '.')
         let (target_table, target_col) = if let Some(dot_pos) = col_name.find('.') {
             (Some(&col_name[..dot_pos]), &col_name[dot_pos + 1..])
@@ -670,7 +716,7 @@ impl SelectBuilder {
 
     fn build_join_output(&self) -> Result<QueryOutput, JsValue> {
         let main_schema = self.representative_schema()?;
-        let mut schemas = alloc::vec![main_schema.clone()];
+        let mut sources = alloc::vec![(main_schema.name().to_string(), main_schema.clone(), false)];
 
         {
             let cache = self.cache.borrow();
@@ -678,29 +724,33 @@ impl SelectBuilder {
                 let join_store = cache.get_table(&join.table).ok_or_else(|| {
                     JsValue::from_str(&alloc::format!("Join table not found: {}", join.table))
                 })?;
-                schemas.push(join_store.schema().clone());
+                sources.push((
+                    join.reference_name().to_string(),
+                    join_store.schema().clone(),
+                    true,
+                ));
             }
         }
 
         let mut name_counts: hashbrown::HashMap<&str, usize> = hashbrown::HashMap::new();
-        for schema in &schemas {
+        for (_, schema, _) in &sources {
             for col in schema.columns() {
                 *name_counts.entry(col.name()).or_insert(0) += 1;
             }
         }
 
         let mut columns = Vec::new();
-        for (schema_idx, schema) in schemas.iter().enumerate() {
+        for (source_name, schema, force_nullable) in &sources {
             for col in schema.columns() {
                 let output_name = if name_counts.get(col.name()).copied().unwrap_or(0) > 1 {
-                    alloc::format!("{}.{}", schema.name(), col.name())
+                    alloc::format!("{}.{}", source_name, col.name())
                 } else {
                     col.name().to_string()
                 };
                 columns.push(OutputColumn {
                     name: output_name,
                     data_type: col.data_type(),
-                    is_nullable: schema_idx > 0 || col.is_nullable(),
+                    is_nullable: *force_nullable || col.is_nullable(),
                 });
             }
         }
@@ -2705,6 +2755,71 @@ mod tests {
         }
     }
 
+    fn build_self_join_test_context() -> TestSelectContext {
+        let employees = TableBuilder::new("employees")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_column("manager_id", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(employees).unwrap();
+
+        {
+            let store = cache.get_table_mut("employees").unwrap();
+            store
+                .insert(Row::new(
+                    1,
+                    vec![Value::Int64(1), Value::String("CEO".into()), Value::Null],
+                ))
+                .unwrap();
+            store
+                .insert(Row::new(
+                    2,
+                    vec![
+                        Value::Int64(2),
+                        Value::String("Manager".into()),
+                        Value::Int64(1),
+                    ],
+                ))
+                .unwrap();
+            store
+                .insert(Row::new(
+                    3,
+                    vec![
+                        Value::Int64(3),
+                        Value::String("Engineer".into()),
+                        Value::Int64(2),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        let cache = Rc::new(RefCell::new(cache));
+        let query_registry = Rc::new(RefCell::new(QueryRegistry::new()));
+        query_registry
+            .borrow_mut()
+            .set_self_ref(query_registry.clone());
+
+        let table_id_map = Rc::new(RefCell::new(hashbrown::HashMap::new()));
+        table_id_map.borrow_mut().insert("employees".into(), 1);
+
+        TestSelectContext {
+            cache,
+            query_registry,
+            table_id_map,
+            schema_layout_cache: Rc::new(RefCell::new(SchemaLayoutCache::new())),
+            plan_cache: Rc::new(RefCell::new(PlanCache::default_size())),
+        }
+    }
+
     #[wasm_bindgen_test]
     fn test_select_builder_union_executes_distinct() {
         let ctx = build_union_test_context();
@@ -2796,6 +2911,63 @@ mod tests {
             error.as_string().as_deref(),
             Some("UNION operands must produce the same number of columns with matching types")
         );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_select_builder_self_join_projection_uses_joined_row_offsets() {
+        let ctx = build_self_join_test_context();
+        let columns = js_sys::Array::new();
+        columns.push(&JsValue::from_str("employees.name"));
+        columns.push(&JsValue::from_str("managers.name"));
+
+        let query = ctx
+            .builder_with_columns(columns.into())
+            .from("employees")
+            .left_join(
+                "employees as managers",
+                &crate::expr::Column::new_simple("employees.manager_id")
+                    .eq(&JsValue::from_str("managers.id")),
+            );
+
+        let plan = query.build_logical_plan("employees");
+        match &plan {
+            LogicalPlan::Project { columns, .. } => {
+                assert_eq!(columns.len(), 2);
+                match &columns[0] {
+                    cynos_query::ast::Expr::Column(col) => {
+                        assert_eq!(col.table, "");
+                        assert_eq!(col.index, 1);
+                    }
+                    other => panic!("expected projected column, got {:?}", other),
+                }
+                match &columns[1] {
+                    cynos_query::ast::Expr::Column(col) => {
+                        assert_eq!(col.table, "");
+                        assert_eq!(col.index, 4);
+                    }
+                    other => panic!("expected projected column, got {:?}", other),
+                }
+
+                let cache = ctx.cache.borrow();
+                let rows = execute_plan(&cache, "employees", plan.clone()).unwrap();
+                let values: Vec<Vec<Value>> = rows.iter().map(|row| row.values().to_vec()).collect();
+                assert_eq!(
+                    values,
+                    vec![
+                        vec![Value::String("CEO".into()), Value::Null],
+                        vec![
+                            Value::String("Manager".into()),
+                            Value::String("CEO".into()),
+                        ],
+                        vec![
+                            Value::String("Engineer".into()),
+                            Value::String("Manager".into()),
+                        ],
+                    ]
+                );
+            }
+            other => panic!("expected project plan, got {:?}", other),
+        }
     }
 
     #[wasm_bindgen_test]

@@ -44,6 +44,7 @@ function deepEqual(a: any, b: any): boolean {
   if (a === b) return true;
   // Handle NaN comparison (NaN !== NaN, but we want them to be equal)
   if (typeof a === 'number' && typeof b === 'number' && Number.isNaN(a) && Number.isNaN(b)) return true;
+  if (a instanceof Date && b instanceof Date) return a.getTime() === b.getTime();
   if (typeof a === 'bigint' && typeof b === 'bigint') return a === b;
   if (typeof a !== typeof b) return false;
   if (a === null || b === null) return a === b;
@@ -59,10 +60,14 @@ function deepEqual(a: any, b: any): boolean {
     return a.every((v, i) => v === b[i]);
   }
 
-  const keysA = Object.keys(a);
-  const keysB = Object.keys(b);
+  const keysA = Object.keys(a).sort();
+  const keysB = Object.keys(b).sort();
   if (keysA.length !== keysB.length) return false;
-  return keysA.every(key => deepEqual(a[key], b[key]));
+  return keysA.every((key, index) => key === keysB[index] && deepEqual(a[key], b[key]));
+}
+
+function schemaLayoutColumnNames(layout: { columnCount(): number; columnName(idx: number): string | undefined }): string[] {
+  return Array.from({ length: layout.columnCount() }, (_, index) => layout.columnName(index) ?? `column_${index}`);
 }
 
 /**
@@ -80,35 +85,56 @@ async function execAndVerifyBinary(query: BinaryVerifiableQuery): Promise<any[]>
   const binaryResult = await query.execBinary();
   const rs = new ResultSet(binaryResult, layout);
 
-  // 验证长度一致
-  expect(rs.length).toBe(jsonResult.length);
+  try {
+    const layoutColumns = schemaLayoutColumnNames(layout);
 
-  // 验证每行数据一致
-  for (let i = 0; i < rs.length; i++) {
-    const jsonRow = jsonResult[i];
-    const binaryRow = rs.get(i);
+    // 验证 layout / ResultSet 元信息一致
+    expect(rs.columnCount).toBe(layout.columnCount());
+    expect(rs.columns).toEqual(layoutColumns);
 
-    // 比较每个字段
-    for (const key of Object.keys(jsonRow)) {
-      const jsonVal = (jsonRow as any)[key];
-      const binaryVal = (binaryRow as any)[key];
+    // 验证长度一致
+    expect(rs.length).toBe(jsonResult.length);
 
-      if (!deepEqual(jsonVal, binaryVal)) {
-        // Custom stringify that handles BigInt
-        const stringify = (v: any) => {
-          if (typeof v === 'bigint') return v.toString() + 'n';
-          return JSON.stringify(v);
-        };
-        throw new Error(
-          `Row ${i}, field "${key}" mismatch:\n` +
-          `  exec():       ${stringify(jsonVal)} (${typeof jsonVal})\n` +
-          `  execBinary(): ${stringify(binaryVal)} (${typeof binaryVal})`
-        );
+    if (jsonResult.length > 0) {
+      expect(Object.keys(jsonResult[0])).toEqual(layoutColumns);
+    }
+
+    const binaryRows = rs.toArray();
+    expect(binaryRows).toHaveLength(jsonResult.length);
+
+    // 验证每行数据一致
+    for (let i = 0; i < rs.length; i++) {
+      const jsonRow = jsonResult[i];
+      const binaryRow = binaryRows[i];
+
+      expect(Object.keys(binaryRow)).toEqual(Object.keys(jsonRow));
+
+      // 比较每个字段
+      for (const key of Object.keys(jsonRow)) {
+        const jsonVal = (jsonRow as any)[key];
+        const binaryVal = (binaryRow as any)[key];
+
+        if (!deepEqual(jsonVal, binaryVal)) {
+          // Custom stringify that handles BigInt
+          const stringify = (v: any) => {
+            if (typeof v === 'bigint') return v.toString() + 'n';
+            if (v instanceof Date) return v.toISOString();
+            return JSON.stringify(v);
+          };
+          throw new Error(
+            `Row ${i}, field "${key}" mismatch:\n` +
+            `  exec():       ${stringify(jsonVal)} (${typeof jsonVal})\n` +
+            `  execBinary(): ${stringify(binaryVal)} (${typeof binaryVal})`
+          );
+        }
       }
     }
-  }
 
-  return jsonResult;
+    return jsonResult;
+  } finally {
+    rs.free();
+    layout.free();
+  }
 }
 
 // ============================================================================
@@ -523,6 +549,40 @@ describe('2. SELECT 查询', () => {
         'Shanghai',
       ]);
     });
+
+    it('prepared query 在底层数据变化后仍应返回最新结果', async () => {
+      const db = createUsersDb('prepared_query_3');
+      await db.insert('users').values(testUsers).exec();
+
+      const query = db.select(['id', 'name', 'active'])
+        .from('users')
+        .where(col('active').eq(true))
+        .orderBy('id', JsSortOrder.Asc);
+
+      const prepared = query.prepare();
+
+      let result = await execAndVerifyBinary(prepared);
+      expect(result).toEqual([
+        { id: 1, name: 'Alice', active: true },
+        { id: 3, name: 'Charlie', active: true },
+        { id: 4, name: 'David', active: true },
+      ]);
+
+      await db.update('users').set('active', false).where(col('id').eq(3)).exec();
+      await db.insert('users').values([
+        { id: 6, name: 'Frank', age: 29, score: 81.25, active: true, city: 'Shenzhen' },
+      ]).exec();
+
+      result = await execAndVerifyBinary(prepared);
+      expect(result).toEqual([
+        { id: 1, name: 'Alice', active: true },
+        { id: 4, name: 'David', active: true },
+        { id: 6, name: 'Frank', active: true },
+      ]);
+
+      const directResult = await execAndVerifyBinary(query);
+      expect(result).toEqual(directResult);
+    });
   });
 
   describe('2.1 Filter 过滤条件', () => {
@@ -836,6 +896,163 @@ describe('2. SELECT 查询', () => {
         expect(result).toHaveLength(3);
       });
     });
+
+    describe('2.1.13 Rust API 补充过滤操作', () => {
+      it('notBetween: 应该返回范围外的行', async () => {
+        const db = createUsersDb('filter_not_between_1');
+        await db.insert('users').values(testUsers).exec();
+
+        const result = await execAndVerifyBinary(
+          db.select('*').from('users')
+            .where(col('age').notBetween(26, 30))
+            .orderBy('id', JsSortOrder.Asc)
+        );
+
+        expect(result.map((row: any) => row.id)).toEqual([1, 3, 4]);
+      });
+
+      it('notIn: 应该返回不在列表中的行', async () => {
+        const db = createUsersDb('filter_not_in_1');
+        await db.insert('users').values(testUsers).exec();
+
+        const result = await execAndVerifyBinary(
+          db.select('*').from('users')
+            .where(col('city').notIn(['Beijing', 'Shanghai']))
+        );
+
+        expect(result).toEqual([
+          { id: 4, name: 'David', age: 35, score: 92, active: true, city: 'Guangzhou' },
+        ]);
+      });
+
+      it('notLike: 应该返回不匹配模式的行', async () => {
+        const db = createUsersDb('filter_not_like_1');
+        await db.insert('users').values(testUsers).exec();
+
+        const result = await execAndVerifyBinary(
+          db.select('*').from('users')
+            .where(col('name').notLike('%e'))
+            .orderBy('id', JsSortOrder.Asc)
+        );
+
+        expect(result.map((row: any) => row.name)).toEqual(['Bob', 'David']);
+      });
+
+      it('match / notMatch: 应该支持正则过滤', async () => {
+        const db = createUsersDb('filter_match_1');
+        await db.insert('users').values(testUsers).exec();
+
+        const matched = await execAndVerifyBinary(
+          db.select('*').from('users')
+            .where(col('name').match('^[AE].*'))
+            .orderBy('id', JsSortOrder.Asc)
+        );
+        expect(matched.map((row: any) => row.name)).toEqual(['Alice', 'Eve']);
+
+        const notMatched = await execAndVerifyBinary(
+          db.select('*').from('users')
+            .where(col('name').notMatch('^[AE].*'))
+            .orderBy('id', JsSortOrder.Asc)
+        );
+        expect(notMatched.map((row: any) => row.name)).toEqual(['Bob', 'Charlie', 'David']);
+      });
+
+      it('多次调用 where() 应该按 AND 语义叠加', async () => {
+        const db = createUsersDb('filter_where_chain_1');
+        await db.insert('users').values(testUsers).exec();
+
+        const result = await execAndVerifyBinary(
+          db.select(['id', 'name', 'city']).from('users')
+            .where(col('age').gte(25))
+            .where(col('active').eq(true))
+            .where(col('city').eq('Beijing'))
+            .orderBy('id', JsSortOrder.Asc)
+        );
+
+        expect(result).toEqual([
+          { id: 1, name: 'Alice', city: 'Beijing' },
+          { id: 3, name: 'Charlie', city: 'Beijing' },
+        ]);
+      });
+    });
+
+    describe('2.1.14 JSONB 路径补充操作', () => {
+      it('contains: 应该按 JSONB 路径中的值过滤', async () => {
+        const db = new Database('filter_jsonb_contains_1');
+        const builder = db.createTable('documents')
+          .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+          .column('title', JsDataType.String, null)
+          .column('metadata', JsDataType.Jsonb, null);
+        db.registerTable(builder);
+
+        await db.insert('documents').values([
+          {
+            id: 1,
+            title: 'Rust Book',
+            metadata: { tags: ['rust', 'wasm'], author: { name: 'Ada' }, published: true },
+          },
+          {
+            id: 2,
+            title: 'JS Guide',
+            metadata: { tags: ['js'], author: { name: 'Bea' } },
+          },
+          {
+            id: 3,
+            title: 'Database Notes',
+            metadata: { tags: ['storage', 'wasm'], author: null },
+          },
+        ]).exec();
+
+        const result = await execAndVerifyBinary(
+          db.select(['id', 'title']).from('documents')
+            .where(col('metadata').get('$.tags').contains('wasm'))
+            .orderBy('id', JsSortOrder.Asc)
+        );
+
+        expect(result).toEqual([
+          { id: 1, title: 'Rust Book' },
+          { id: 3, title: 'Database Notes' },
+        ]);
+      });
+
+      it('exists: 应该按 JSONB 路径存在性过滤', async () => {
+        const db = new Database('filter_jsonb_exists_1');
+        const builder = db.createTable('documents')
+          .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+          .column('title', JsDataType.String, null)
+          .column('metadata', JsDataType.Jsonb, null);
+        db.registerTable(builder);
+
+        await db.insert('documents').values([
+          {
+            id: 1,
+            title: 'Rust Book',
+            metadata: { tags: ['rust', 'wasm'], author: { name: 'Ada' }, published: true },
+          },
+          {
+            id: 2,
+            title: 'JS Guide',
+            metadata: { tags: ['js'], author: { name: 'Bea' } },
+          },
+          {
+            id: 3,
+            title: 'Database Notes',
+            metadata: { tags: ['storage', 'wasm'], author: null },
+          },
+        ]).exec();
+
+        const result = await execAndVerifyBinary(
+          db.select(['id', 'title']).from('documents')
+            .where(col('metadata').get('$.author.name').exists())
+            .orderBy('id', JsSortOrder.Asc)
+        );
+
+        expect(result).toEqual([
+          { id: 1, title: 'Rust Book' },
+          { id: 2, title: 'JS Guide' },
+        ]);
+      });
+    });
   });
 
   describe('2.2 Projection 列选择', () => {
@@ -900,6 +1117,40 @@ describe('2. SELECT 查询', () => {
       expect(result[0].name).toBe('David');
       expect(result[0].age).toBe(35);
       expect(result[0]).not.toHaveProperty('id');
+    });
+
+    it('重复列名投影应该在 layout 和 execBinary 中保留限定名', async () => {
+      const db = new Database('proj_qualified_duplicate_1');
+      const builder = db.createTable('employees')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('name', JsDataType.String, null)
+        .column('manager_id', JsDataType.Int64, new ColumnOptions().setNullable(true));
+      db.registerTable(builder);
+
+      await db.insert('employees').values([
+        { id: 1, name: 'CEO', manager_id: null },
+        { id: 2, name: 'Manager', manager_id: 1 },
+        { id: 3, name: 'Engineer', manager_id: 2 },
+      ]).exec();
+
+      const query = db.select(['employees.name', 'managers.name'])
+        .from('employees')
+        .leftJoin('employees as managers', col('employees.manager_id').eq(col('managers.id')))
+        .orderBy('employees.id', JsSortOrder.Asc);
+
+      const layout = query.getSchemaLayout();
+      try {
+        expect(schemaLayoutColumnNames(layout)).toEqual(['employees.name', 'managers.name']);
+      } finally {
+        layout.free();
+      }
+
+      const result = await execAndVerifyBinary(query);
+      expect(result).toEqual([
+        { 'employees.name': 'CEO', 'managers.name': null },
+        { 'employees.name': 'Manager', 'managers.name': 'CEO' },
+        { 'employees.name': 'Engineer', 'managers.name': 'Manager' },
+      ]);
     });
   });
 
@@ -5772,6 +6023,121 @@ describe('16. 聚合函数 (Aggregate Functions)', () => {
       expect(lastResult[0].count).toBe(1);
 
       unsubscribe();
+    });
+  });
+
+  describe('16.11 聚合 execBinary 正确性', () => {
+    it('多聚合查询的 exec 和 execBinary 应保持一致', async () => {
+      const db = new Database('agg_binary_multi_1');
+      const builder = db.createTable('metrics')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('category', JsDataType.String, null)
+        .column('amount', JsDataType.Float64, null);
+      db.registerTable(builder);
+
+      await db.insert('metrics').values([
+        { id: 1, category: 'A', amount: 2 },
+        { id: 2, category: 'B', amount: 8 },
+      ]).exec();
+
+      const query = db.select('*').from('metrics')
+        .count()
+        .sum('amount')
+        .avg('amount')
+        .min('amount')
+        .max('amount')
+        .distinct('category')
+        .stddev('amount')
+        .geomean('amount');
+
+      const layout = query.getSchemaLayout();
+      try {
+        expect(schemaLayoutColumnNames(layout)).toEqual([
+          'count',
+          'sum_amount',
+          'avg_amount',
+          'min_amount',
+          'max_amount',
+          'distinct_category',
+          'stddev_amount',
+          'geomean_amount',
+        ]);
+      } finally {
+        layout.free();
+      }
+
+      const result = await execAndVerifyBinary(query);
+      expect(result).toHaveLength(1);
+      expect(result[0].count).toBe(2);
+      expect(result[0].sum_amount).toBe(10);
+      expect(result[0].avg_amount).toBe(5);
+      expect(result[0].min_amount).toBe(2);
+      expect(result[0].max_amount).toBe(8);
+      expect(result[0].distinct_category).toBe(2);
+      expect(result[0].stddev_amount).toBeCloseTo(3, 5);
+      expect(result[0].geomean_amount).toBeCloseTo(4, 5);
+    });
+
+    it('多列 GROUP BY(array) 查询在 prepared / binary 路径下应保持一致', async () => {
+      const db = new Database('agg_binary_group_by_array_1');
+      const builder = db.createTable('sales')
+        .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+        .column('region', JsDataType.String, null)
+        .column('active', JsDataType.Bool, null)
+        .column('amount', JsDataType.Float64, null);
+      db.registerTable(builder);
+
+      await db.insert('sales').values([
+        { id: 1, region: 'east', active: false, amount: 12 },
+        { id: 2, region: 'east', active: true, amount: 10 },
+        { id: 3, region: 'east', active: true, amount: 20 },
+        { id: 4, region: 'west', active: false, amount: 7 },
+        { id: 5, region: 'west', active: false, amount: 13 },
+        { id: 6, region: 'west', active: true, amount: 8 },
+      ]).exec();
+
+      const query = db.select('*').from('sales')
+        .groupBy(['region', 'active'])
+        .count()
+        .sum('amount')
+        .avg('amount')
+        .orderBy('region', JsSortOrder.Asc)
+        .orderBy('active', JsSortOrder.Asc);
+
+      const layout = query.getSchemaLayout();
+      try {
+        expect(schemaLayoutColumnNames(layout)).toEqual([
+          'region',
+          'active',
+          'count',
+          'sum_amount',
+          'avg_amount',
+        ]);
+      } finally {
+        layout.free();
+      }
+
+      const result = await execAndVerifyBinary(query);
+      const sortedResult = [...result].sort((left: any, right: any) => {
+        const regionCompare = left.region.localeCompare(right.region);
+        if (regionCompare !== 0) return regionCompare;
+        return Number(left.active) - Number(right.active);
+      });
+      expect(sortedResult).toEqual([
+        { region: 'east', active: false, count: 1, sum_amount: 12, avg_amount: 12 },
+        { region: 'east', active: true, count: 2, sum_amount: 30, avg_amount: 15 },
+        { region: 'west', active: false, count: 2, sum_amount: 20, avg_amount: 10 },
+        { region: 'west', active: true, count: 1, sum_amount: 8, avg_amount: 8 },
+      ]);
+
+      const prepared = query.prepare();
+      const preparedResult = await execAndVerifyBinary(prepared);
+      const sortedPrepared = [...preparedResult].sort((left: any, right: any) => {
+        const regionCompare = left.region.localeCompare(right.region);
+        if (regionCompare !== 0) return regionCompare;
+        return Number(left.active) - Number(right.active);
+      });
+      expect(sortedPrepared).toEqual(sortedResult);
     });
   });
 });

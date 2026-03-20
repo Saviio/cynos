@@ -240,10 +240,12 @@ impl JoinOutputLayout {
         let mut table_column_counts = Vec::with_capacity(output_tables.len());
         let mut segments = Vec::with_capacity(output_tables.len());
         let mut total_width = 0usize;
+        let mut left_used = vec![false; left_tables.len()];
+        let mut right_used = vec![false; right_tables.len()];
 
         for table in output_tables {
             if let Some((source_offset, width)) =
-                Self::find_segment(left_tables, left_counts, table)
+                Self::take_segment(left_tables, left_counts, &mut left_used, table)
             {
                 tables.push(table.clone());
                 table_column_counts.push(width);
@@ -257,7 +259,7 @@ impl JoinOutputLayout {
             }
 
             if let Some((source_offset, width)) =
-                Self::find_segment(right_tables, right_counts, table)
+                Self::take_segment(right_tables, right_counts, &mut right_used, table)
             {
                 tables.push(table.clone());
                 table_column_counts.push(width);
@@ -373,15 +375,17 @@ impl JoinOutputLayout {
         )
     }
 
-    fn find_segment(
+    fn take_segment(
         tables: &[String],
         table_column_counts: &[usize],
+        used: &mut [bool],
         target: &str,
     ) -> Option<(usize, usize)> {
         let mut offset = 0usize;
         for (index, table) in tables.iter().enumerate() {
             let width = table_column_counts.get(index).copied().unwrap_or(0);
-            if table == target {
+            if table == target && !used.get(index).copied().unwrap_or(true) {
+                used[index] = true;
                 return Some((offset, width));
             }
             offset += width;
@@ -8949,6 +8953,69 @@ mod tests {
                 Value::Int64(10),
                 Value::Int64(10),
                 Value::String("Engineering".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_joined_row_view_materializes_self_join_with_duplicate_output_tables() {
+        let left = RelationEntry::from_row(
+            Rc::new(Row::new(
+                1,
+                alloc::vec![
+                    Value::Int64(1),
+                    Value::String("Engineer".into()),
+                    Value::Int64(2),
+                ],
+            )),
+            "employees",
+        );
+        let right = RelationEntry::from_row(
+            Rc::new(Row::new(
+                2,
+                alloc::vec![
+                    Value::Int64(2),
+                    Value::String("Manager".into()),
+                    Value::Int64(1),
+                ],
+            )),
+            "employees",
+        );
+        let layout = JoinOutputLayout::from_sources(
+            &alloc::vec!["employees".into()],
+            &alloc::vec![3],
+            &alloc::vec!["employees".into()],
+            &alloc::vec![3],
+            &alloc::vec!["employees".into(), "employees".into()],
+        );
+
+        assert_eq!(
+            layout.tables,
+            alloc::vec![String::from("employees"), String::from("employees")]
+        );
+        assert_eq!(layout.table_column_counts, alloc::vec![3, 3]);
+        assert_eq!(
+            layout.materialization_pattern,
+            JoinMaterializationPattern::LeftThenRight
+        );
+
+        let view = JoinedRowView::from_entries(Some(&left), Some(&right), &layout);
+
+        assert_eq!(view.get_value(0), Some(&Value::Int64(1)));
+        assert_eq!(view.get_value(1), Some(&Value::String("Engineer".into())));
+        assert_eq!(view.get_value(2), Some(&Value::Int64(2)));
+        assert_eq!(view.get_value(3), Some(&Value::Int64(2)));
+        assert_eq!(view.get_value(4), Some(&Value::String("Manager".into())));
+        assert_eq!(view.get_value(5), Some(&Value::Int64(1)));
+        assert_eq!(
+            view.materialize_row().values(),
+            &[
+                Value::Int64(1),
+                Value::String("Engineer".into()),
+                Value::Int64(2),
+                Value::Int64(2),
+                Value::String("Manager".into()),
+                Value::Int64(1),
             ]
         );
     }
