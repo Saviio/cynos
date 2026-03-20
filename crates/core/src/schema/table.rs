@@ -333,11 +333,31 @@ impl TableBuilder {
 
     /// Adds a foreign key constraint.
     pub fn add_foreign_key(
+        self,
+        name: impl Into<String>,
+        child_column: &str,
+        parent_table: &str,
+        parent_column: &str,
+    ) -> Result<Self> {
+        self.add_foreign_key_with_graphql_names(
+            name,
+            child_column,
+            parent_table,
+            parent_column,
+            None::<String>,
+            None::<String>,
+        )
+    }
+
+    /// Adds a foreign key constraint with optional GraphQL relation field names.
+    pub fn add_foreign_key_with_graphql_names(
         mut self,
         name: impl Into<String>,
         child_column: &str,
         parent_table: &str,
         parent_column: &str,
+        graphql_forward_field: Option<impl Into<String>>,
+        graphql_reverse_field: Option<impl Into<String>>,
     ) -> Result<Self> {
         let name = name.into();
         Self::check_naming_rules(&name)?;
@@ -348,7 +368,8 @@ impl TableBuilder {
             });
         }
 
-        let fk = ForeignKey::new(&name, &self.name, child_column, parent_table, parent_column);
+        let fk = ForeignKey::new(&name, &self.name, child_column, parent_table, parent_column)
+            .graphql_fields(graphql_forward_field, graphql_reverse_field);
         self.foreign_keys.push(fk);
 
         // Add index for foreign key column

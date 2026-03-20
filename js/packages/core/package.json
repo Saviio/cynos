@@ -30,7 +30,7 @@
   "scripts": {
     "build:wasm": "cd ../../../crates/database && wasm-pack build --target web --out-dir ../../js/packages/core/wasm",
     "build:wasm:benchmark": "cd ../../../crates/database && wasm-pack build --target web --out-dir ../../js/packages/core/wasm -- --features benchmark",
-    "sync:wasm": "cp wasm/cynos_database.d.ts src/wasm.d.ts && sed 's/cynos_database_bg\\.wasm/cynos.wasm/g' wasm/cynos_database.js > src/wasm.js && cp src/wasm.js dist/wasm.js && cp wasm/cynos_database.d.ts dist/wasm.d.ts && cp wasm/cynos_database_bg.wasm dist/cynos.wasm",
+    "sync:wasm": "mkdir -p dist && cp wasm/cynos_database.d.ts src/wasm.d.ts && sed 's/cynos_database_bg\\.wasm/cynos.wasm/g' wasm/cynos_database.js > src/wasm.js && cp src/wasm.js dist/wasm.js && cp wasm/cynos_database.d.ts dist/wasm.d.ts && cp wasm/cynos_database_bg.wasm dist/cynos.wasm",
     "build:ts": "pnpm run sync:wasm && tsc",
     "build": "pnpm run build:wasm && sleep 3 && pnpm run build:ts && pnpm run sync:wasm",
     "build:benchmark": "pnpm run build:wasm:benchmark && pnpm run build:ts && pnpm run sync:wasm",

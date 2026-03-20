@@ -15,11 +15,13 @@ import init, {
   JsTable,
   SelectBuilder,
   PreparedSelectQuery,
+  PreparedGraphqlQuery,
   InsertBuilder,
   UpdateBuilder,
   DeleteBuilder,
   JsTransaction,
   JsObservableQuery,
+  JsGraphqlSubscription,
   JsIvmObservableQuery,
   JsChangesStream,
   Column,
@@ -27,6 +29,7 @@ import init, {
   JsDataType,
   JsSortOrder,
   ColumnOptions,
+  ForeignKeyOptions,
   col,
   SchemaLayout,
   BinaryResult,
@@ -40,11 +43,13 @@ export type {
   JsTable,
   SelectBuilder,
   PreparedSelectQuery,
+  PreparedGraphqlQuery,
   InsertBuilder,
   UpdateBuilder,
   DeleteBuilder,
   JsTransaction,
   JsObservableQuery,
+  JsGraphqlSubscription,
   JsIvmObservableQuery,
   JsChangesStream,
   Column,
@@ -53,7 +58,7 @@ export type {
   BinaryResult,
 };
 
-export { JsDataType, JsSortOrder, ColumnOptions, col, ResultSet };
+export { JsDataType, JsSortOrder, ColumnOptions, ForeignKeyOptions, col, ResultSet };
 
 export type { DataType, SortOrder, ChangeSet, Row, SubscriptionCallback, Unsubscribe } from './types.js';
 
