@@ -1612,6 +1612,29 @@ impl RowStore {
         }
     }
 
+    /// Visits rows matching a GIN key-value query without materializing the full result.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_gin_index_by_key_value<F>(
+        &self,
+        index_name: &str,
+        key: &str,
+        value: &str,
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let Some(gin_idx) = self.gin_indices.get(index_name) else {
+            return;
+        };
+
+        gin_idx.visit_by_key_value(key, value, |row_id| {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                return true;
+            };
+            visitor(row)
+        });
+    }
+
     /// Queries the GIN index by key existence.
     pub fn gin_index_get_by_key(&self, index_name: &str, key: &str) -> Vec<Rc<Row>> {
         if let Some(gin_idx) = self.gin_indices.get(index_name) {
@@ -1623,6 +1646,24 @@ impl RowStore {
         } else {
             Vec::new()
         }
+    }
+
+    /// Visits rows matching a GIN key-existence query without materializing the full result.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_gin_index_by_key<F>(&self, index_name: &str, key: &str, mut visitor: F)
+    where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let Some(gin_idx) = self.gin_indices.get(index_name) else {
+            return;
+        };
+
+        gin_idx.visit_by_key(key, |row_id| {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                return true;
+            };
+            visitor(row)
+        });
     }
 
     /// Queries the GIN index by multiple key-value pairs (AND query).
@@ -1641,6 +1682,28 @@ impl RowStore {
         } else {
             Vec::new()
         }
+    }
+
+    /// Visits rows matching all GIN key-value pairs without materializing the full row set.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_gin_index_by_key_values_all<F>(
+        &self,
+        index_name: &str,
+        pairs: &[(&str, &str)],
+        mut visitor: F,
+    ) where
+        F: FnMut(&Rc<Row>) -> bool,
+    {
+        let Some(gin_idx) = self.gin_indices.get(index_name) else {
+            return;
+        };
+
+        gin_idx.visit_by_key_values_all(pairs, |row_id| {
+            let Some(row) = self.row_ref_by_id(row_id) else {
+                return true;
+            };
+            visitor(row)
+        });
     }
 
     /// Returns the raw row IDs from the GIN index for a given key.
@@ -2792,6 +2855,30 @@ mod tests {
             1,
             "GIN index should find row by key-value 'status=active'"
         );
+    }
+
+    #[test]
+    fn test_gin_index_visit_stops_early() {
+        let mut store = RowStore::new(test_schema_with_gin_index());
+        for row_id in 1..=5 {
+            store
+                .insert(Row::new(
+                    row_id,
+                    vec![
+                        Value::Int64(row_id as i64),
+                        make_jsonb(r#"{"status":"active"}"#),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        let mut visited = Vec::new();
+        store.visit_gin_index_by_key_value("idx_data_gin", "status", "active", |row| {
+            visited.push(row.id());
+            visited.len() < 2
+        });
+
+        assert_eq!(visited, vec![1, 2]);
     }
 
     #[test]

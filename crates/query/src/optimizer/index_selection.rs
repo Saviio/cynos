@@ -970,6 +970,7 @@ impl IndexSelection {
                 index: first.index.clone(),
                 column: first.column.clone(),
                 pairs,
+                recheck: None,
             }
         } else {
             let best_idx = self.choose_best_single_gin_predicate(&gin_predicates)?;
@@ -981,6 +982,7 @@ impl IndexSelection {
                     index: info.index.clone(),
                     column: info.column.clone(),
                     pairs: pairs.clone(),
+                    recheck: None,
                 }
             } else {
                 LogicalPlan::GinIndexScan {
@@ -991,8 +993,52 @@ impl IndexSelection {
                     path: info.path.clone(),
                     value: info.value.clone(),
                     query_type: info.query_type.clone(),
+                    recheck: None,
                 }
             }
+        };
+
+        let recheck = gin_predicates
+            .iter()
+            .enumerate()
+            .filter(|(idx, info)| used_predicates[*idx] && !info.requires_post_filter)
+            .map(|(_, info)| info.original_predicate.clone())
+            .reduce(Expr::and);
+
+        let gin_plan = match gin_plan {
+            LogicalPlan::GinIndexScan {
+                table,
+                index,
+                column,
+                column_index,
+                path,
+                value,
+                query_type,
+                ..
+            } => LogicalPlan::GinIndexScan {
+                table,
+                index,
+                column,
+                column_index,
+                path,
+                value,
+                query_type,
+                recheck,
+            },
+            LogicalPlan::GinIndexScanMulti {
+                table,
+                index,
+                column,
+                pairs,
+                ..
+            } => LogicalPlan::GinIndexScanMulti {
+                table,
+                index,
+                column,
+                pairs,
+                recheck,
+            },
+            _ => unreachable!("GIN selection must produce a GIN scan"),
         };
 
         for (idx, info) in gin_predicates.into_iter().enumerate() {

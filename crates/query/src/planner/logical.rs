@@ -50,6 +50,8 @@ pub enum LogicalPlan {
         value: Option<Value>,
         /// Query type: "eq", "contains", or "exists".
         query_type: String,
+        /// Optional recheck predicate preserved for later physical rewrites.
+        recheck: Option<Expr>,
     },
 
     /// GIN index scan for multiple JSONB predicates (AND combination).
@@ -61,6 +63,8 @@ pub enum LogicalPlan {
         column: String,
         /// Multiple (path, value) pairs to match (all must match - AND semantics).
         pairs: Vec<(String, Value)>,
+        /// Optional recheck predicate preserved for later physical rewrites.
+        recheck: Option<Expr>,
     },
 
     /// Filter (WHERE clause).

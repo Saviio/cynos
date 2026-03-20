@@ -240,6 +240,30 @@ impl RelationEntry {
         }
     }
 
+    /// Fast combine with nulls on the left that reuses pre-computed tables.
+    /// The combined row's version is the right row's version (left side is NULL).
+    #[inline]
+    pub fn combine_null_with_fast(
+        left_column_count: usize,
+        right: &RelationEntry,
+        combined_tables: SharedTables,
+    ) -> Self {
+        let right_values = right.row.values();
+        let total_len = left_column_count + right_values.len();
+
+        let mut values = Vec::with_capacity(total_len);
+        values.resize(left_column_count, Value::Null);
+        values.extend(right_values.iter().cloned());
+
+        let combined_version = right.row.version();
+
+        Self {
+            row: Rc::new(Row::dummy_with_version(combined_version, values)),
+            is_combined: true,
+            tables: TablesStorage::Shared(combined_tables),
+        }
+    }
+
     /// Creates a combined entry with null values for the left side (for right outer joins).
     /// The combined row's version is the right row's version (left side is NULL).
     pub fn combine_null_with(

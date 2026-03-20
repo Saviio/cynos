@@ -24,6 +24,7 @@
 //! 4. **Physical Optimization** - Context-aware physical transformations:
 //!    - TopNPushdown (converts Sort+Limit to TopN)
 //!    - OrderByIndexPass (leverages indexes for sorting)
+//!    - IndexJoinPass (uses indexed inner lookups for bounded joins)
 //!    - LimitSkipByIndexPass (pushes limit/offset to IndexScan)
 //!
 //! ## Usage
@@ -36,8 +37,8 @@
 
 use crate::context::ExecutionContext;
 use crate::optimizer::{
-    AndPredicatePass, CrossProductPass, ImplicitJoinsPass, IndexSelection, JoinReorder,
-    LimitSkipByIndexPass, NotSimplification, OptimizerPass, OrderByIndexPass,
+    AndPredicatePass, CrossProductPass, ImplicitJoinsPass, IndexJoinPass, IndexSelection,
+    JoinReorder, LimitSkipByIndexPass, NotSimplification, OptimizerPass, OrderByIndexPass,
     OuterJoinSimplification, PredicatePushdown, TopNPushdown,
 };
 use crate::planner::{LogicalPlan, PhysicalPlan};
@@ -177,6 +178,7 @@ impl QueryPlanner {
                 path,
                 value,
                 query_type,
+                recheck,
             } => {
                 let key: alloc::string::String = path.trim_start_matches("$.").into();
                 let value_str = value.map(|v| match v {
@@ -187,7 +189,7 @@ impl QueryPlanner {
                     cynos_core::Value::Boolean(b) => alloc::format!("{}", b),
                     _ => alloc::format!("{:?}", v),
                 });
-                PhysicalPlan::gin_index_scan(table, index, key, value_str, query_type)
+                PhysicalPlan::gin_index_scan(table, index, key, value_str, query_type, recheck)
             }
 
             LogicalPlan::GinIndexScanMulti {
@@ -195,6 +197,7 @@ impl QueryPlanner {
                 index,
                 column: _,
                 pairs,
+                recheck,
             } => {
                 let string_pairs: Vec<(alloc::string::String, alloc::string::String)> = pairs
                     .into_iter()
@@ -211,7 +214,7 @@ impl QueryPlanner {
                         (key, value_str)
                     })
                     .collect();
-                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs)
+                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs, recheck)
             }
 
             LogicalPlan::Filter { input, predicate } => {
@@ -317,6 +320,7 @@ impl QueryPlanner {
     fn optimize_physical(&self, mut physical: PhysicalPlan) -> PhysicalPlan {
         physical = TopNPushdown::new().optimize(physical);
         physical = OrderByIndexPass::new(&self.ctx).optimize(physical);
+        physical = IndexJoinPass::new(&self.ctx).optimize(physical);
         LimitSkipByIndexPass::new(&self.ctx).optimize(physical)
     }
 }
@@ -451,6 +455,70 @@ mod tests {
                 assert!(reverse);
             }
             _ => panic!("Expected IndexScan, got {:?}", physical),
+        }
+    }
+
+    #[test]
+    fn test_query_planner_uses_index_join_for_bounded_unique_join() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "users",
+            TableStats {
+                row_count: 100_000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_age", alloc::vec!["age".into()], false),
+                    IndexInfo::new("idx_dept_id", alloc::vec!["dept_id".into()], false),
+                ],
+            },
+        );
+        ctx.register_table(
+            "departments",
+            TableStats {
+                row_count: 100,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "pk_departments_id",
+                    alloc::vec!["id".into()],
+                    true,
+                )],
+            },
+        );
+
+        let planner = QueryPlanner::new(ctx);
+        let plan = LogicalPlan::Limit {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(LogicalPlan::filter(
+                    LogicalPlan::scan("users"),
+                    Expr::gt(Expr::column("users", "age", 1), Expr::literal(60i64)),
+                )),
+                right: Box::new(LogicalPlan::scan("departments")),
+                condition: Expr::eq(
+                    Expr::column("users", "dept_id", 2),
+                    Expr::column("departments", "id", 0),
+                ),
+                join_type: crate::ast::JoinType::Inner,
+                output_tables: alloc::vec!["users".into(), "departments".into()],
+            }),
+            limit: 1_000,
+            offset: 0,
+        };
+
+        let physical = planner.plan(plan);
+        match physical {
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                assert_eq!(limit, 1_000);
+                assert_eq!(offset, 0);
+                assert!(matches!(*input, PhysicalPlan::IndexNestedLoopJoin { .. }));
+            }
+            other => panic!(
+                "Expected limit over index nested loop join, got {:?}",
+                other
+            ),
         }
     }
 

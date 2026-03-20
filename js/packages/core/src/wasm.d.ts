@@ -951,10 +951,10 @@ export interface InitOutput {
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
     readonly __wasm_bindgen_func_elem_75: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_1966: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_4755: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_1973: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_922: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2064: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_4893: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_2071: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1006: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

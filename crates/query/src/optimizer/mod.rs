@@ -131,6 +131,7 @@ impl Optimizer {
                 path,
                 value,
                 query_type,
+                recheck,
             } => {
                 // Extract the key from the JSON path (e.g., "$.category" -> "category")
                 let key = path.trim_start_matches("$.").to_string();
@@ -145,7 +146,7 @@ impl Optimizer {
                     _ => alloc::format!("{:?}", v),
                 });
 
-                PhysicalPlan::gin_index_scan(table, index, key, value_str, query_type)
+                PhysicalPlan::gin_index_scan(table, index, key, value_str, query_type, recheck)
             }
 
             LogicalPlan::GinIndexScanMulti {
@@ -153,6 +154,7 @@ impl Optimizer {
                 index,
                 column: _,
                 pairs,
+                recheck,
             } => {
                 // Convert (path, value) pairs to (key, value_str) pairs
                 let string_pairs: Vec<(String, String)> = pairs
@@ -171,7 +173,7 @@ impl Optimizer {
                     })
                     .collect();
 
-                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs)
+                PhysicalPlan::gin_index_scan_multi(table, index, string_pairs, recheck)
             }
 
             LogicalPlan::Filter { input, predicate } => {

@@ -45,17 +45,18 @@ Representative recent local measurements, on Node.js + WASM with both 10K and 10
 
 | Workload | Cynos | Representative comparison | What it suggests |
 | --- | ---: | ---: | --- |
-| Relational join (`users JOIN departments ... LIMIT 1000`) | `7.52 ms` at 10K, `11.49 ms` at 100K | PGlite `9.43 ms` at 10K, `10.38 ms` at 100K | Cynos is in the same practical range for embedded relational execution, not only for live-query APIs |
-| Wide scan (`LIMIT 5000`) via plain `exec()` vs `execBinary()` | `17.23 ms -> 1.27 ms` at 10K, `19.05 ms -> 1.11 ms` at 100K | same Cynos query, different transport path | Binary delivery remains one of Cynos's clearest advantages in WASM embeddings |
-| Live update latency | `changes(): 0.744 ms`, `trace(): 0.024 ms` at 10K; `changes(): 3.67 ms`, `trace(): 0.020 ms` at 100K | PGlite live query `3.90 ms` at 10K, `8.44 ms` at 100K | Cynos is especially strong when live queries are part of the hot path, and `trace()` stays close to constant here |
-| JSONB compound filter with and without metadata index | `0.613 ms` vs `16.84 ms` at 10K; `5.83 ms` vs `16.76 ms` at 100K | same Cynos workload | JSONB performance depends materially on index design; in this harness the current metadata index helps compound filters much more than it helps every JSON query shape |
-| Approximate compressed runtime assets used in the local harness | `~315 KiB gzip` | sql.js `~340 KiB gzip`; PGlite core+live `~4.85 MiB gzip` | Cynos stays relatively compact for a relational + reactive WASM runtime, especially relative to a PostgreSQL-compatible stack |
+| Relational join (`users JOIN departments ... LIMIT 1000`) | `6.34 ms` at 10K, `7.79 ms` at 100K | PGlite `9.09 ms` at 10K, `10.15 ms` at 100K | Cynos is already competitive on embedded relational work, not only on live-query APIs |
+| Wide scan (`LIMIT 5000`) via plain `exec()` vs `execBinary()` | `18.91 ms -> 0.86 ms` at 10K, `17.16 ms -> 0.80 ms` at 100K | same Cynos query, different transport path | Binary delivery remains one of Cynos's clearest advantages in WASM embeddings |
+| Live update latency | `changes(): 0.461 ms`, `trace(): 0.021 ms` at 10K; `changes(): 3.54 ms`, `trace(): 0.019 ms` at 100K | PGlite live query `2.69 ms` at 10K, `8.10 ms` at 100K | Cynos is especially strong when live queries are part of the hot path, and `trace()` stays close to constant here |
+| Complex JSON query (`category + status + priority ORDER BY updatedAt DESC LIMIT 20`) | `0.444 ms` at 10K, `0.376 ms` at 100K | PGlite `0.311 ms` at 10K, `0.315 ms` at 100K | Cynos now lands in the same practical range while keeping JSONB querying and reactive delivery in one engine |
+| Mutation-driven requery (`insert + complex JSON query`) | `0.369 ms` at 10K, `0.345 ms` at 100K | PGlite `0.406 ms` at 10K, `0.444 ms` at 100K | The re-query path stays competitive even when the query includes nested JSON predicates and ordering |
+| Approximate compressed runtime assets used in the local harness | `~315 KiB gzip` | sql.js `~331 KiB gzip`; PGlite core+live ESM assets `~2.88 MiB gzip` | Cynos stays relatively compact for a relational + reactive WASM runtime, especially relative to a PostgreSQL-compatible stack |
 
 A few important caveats to keep the comparison fair:
 
 - In the same local harness, SQLite (`sql.js`) remained faster on very small point lookups, scalar JSON reads, and some aggregate-heavy paths.
 - RxDB remained faster on warm cached document reads; Cynos's advantage is the unified relational + JSONB + reactive engine, not cache-hit document lookup latency alone.
-- On the current 100K document benchmark, Cynos's metadata index does not improve every JSON path query shape yet; the strongest benefit in this harness is on compound filters, which makes the benchmark useful as an optimizer/index-planning regression check.
+- On the current 10K/100K document benchmark, Cynos's metadata index is still workload-sensitive: it helps some JSON query shapes materially, but the 100K compound path is not yet a universal win and remains a useful optimizer/index-planning regression check.
 - The compressed footprint row above compares the concrete runtime assets used in the local harness, not every possible bundle configuration; actual shipped size depends on packaging, tree-shaking, and which optional features are included.
 - PGlite remains the better fit when PostgreSQL compatibility and ecosystem reuse are the primary requirements.
 

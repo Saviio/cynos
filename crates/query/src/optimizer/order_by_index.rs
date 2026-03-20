@@ -206,24 +206,7 @@ impl<'a> OrderByIndexPass<'a> {
         scan_limit: Option<(usize, usize)>,
     ) -> Option<PhysicalPlan> {
         match plan {
-            PhysicalPlan::TableScan { table } => {
-                let order_columns = self.extract_order_columns(order_by)?;
-                let column_refs: Vec<&str> =
-                    order_columns.iter().map(|column| column.as_str()).collect();
-                let index = self.ctx.find_index_prefix(&table, &column_refs)?;
-                let reverse = self.check_order_match(order_by, &index.columns)?;
-                let (limit, offset) = scan_limit
-                    .map(|(limit, offset)| (Some(limit), Some(offset)))
-                    .unwrap_or((None, None));
-                Some(PhysicalPlan::IndexScan {
-                    table,
-                    index: index.name.clone(),
-                    bounds: IndexBounds::all(),
-                    limit,
-                    offset,
-                    reverse,
-                })
-            }
+            PhysicalPlan::TableScan { table } => self.build_order_scan(table, order_by, scan_limit),
             PhysicalPlan::IndexScan {
                 table,
                 index,
@@ -255,6 +238,24 @@ impl<'a> OrderByIndexPass<'a> {
                     reverse,
                 })
             }
+            PhysicalPlan::GinIndexScan { table, recheck, .. } => {
+                scan_limit?;
+                let recheck = recheck?;
+                let input = self.build_order_scan(table, order_by, None)?;
+                Some(PhysicalPlan::Filter {
+                    input: Box::new(input),
+                    predicate: recheck,
+                })
+            }
+            PhysicalPlan::GinIndexScanMulti { table, recheck, .. } => {
+                scan_limit?;
+                let recheck = recheck?;
+                let input = self.build_order_scan(table, order_by, None)?;
+                Some(PhysicalPlan::Filter {
+                    input: Box::new(input),
+                    predicate: recheck,
+                })
+            }
             PhysicalPlan::Project { input, columns } => {
                 let rewritten_input = self.rewrite_for_order(*input, order_by, scan_limit)?;
                 Some(PhysicalPlan::Project {
@@ -263,11 +264,34 @@ impl<'a> OrderByIndexPass<'a> {
                 })
             }
             PhysicalPlan::Filter { input, predicate } => {
-                let rewritten_input = self.rewrite_for_order(*input, order_by, None)?;
-                Some(PhysicalPlan::Filter {
-                    input: Box::new(rewritten_input),
-                    predicate,
-                })
+                let original_input = *input;
+                if let Some(rewritten_input) =
+                    self.rewrite_for_order(original_input.clone(), order_by, None)
+                {
+                    return Some(PhysicalPlan::Filter {
+                        input: Box::new(rewritten_input),
+                        predicate,
+                    });
+                }
+
+                if scan_limit.is_none() {
+                    return None;
+                }
+
+                match original_input {
+                    PhysicalPlan::GinIndexScan { table, recheck, .. }
+                    | PhysicalPlan::GinIndexScanMulti { table, recheck, .. } => {
+                        let input = self.build_order_scan(table, order_by, None)?;
+                        Some(PhysicalPlan::Filter {
+                            input: Box::new(input),
+                            predicate: match recheck {
+                                Some(source_recheck) => Expr::and(predicate, source_recheck),
+                                None => predicate,
+                            },
+                        })
+                    }
+                    _ => return None,
+                }
             }
             PhysicalPlan::NoOp { input } => {
                 let rewritten_input = self.rewrite_for_order(*input, order_by, scan_limit)?;
@@ -277,6 +301,30 @@ impl<'a> OrderByIndexPass<'a> {
             }
             _ => None,
         }
+    }
+
+    fn build_order_scan(
+        &self,
+        table: String,
+        order_by: &[(Expr, SortOrder)],
+        scan_limit: Option<(usize, usize)>,
+    ) -> Option<PhysicalPlan> {
+        let order_columns = self.extract_order_columns(order_by)?;
+        let column_refs: Vec<&str> = order_columns.iter().map(|column| column.as_str()).collect();
+        let index = self.ctx.find_index_prefix(&table, &column_refs)?;
+        let reverse = self.check_order_match(order_by, &index.columns)?;
+        let (limit, offset) = scan_limit
+            .map(|(limit, offset)| (Some(limit), Some(offset)))
+            .unwrap_or((None, None));
+
+        Some(PhysicalPlan::IndexScan {
+            table,
+            index: index.name.clone(),
+            bounds: IndexBounds::all(),
+            limit,
+            offset,
+            reverse,
+        })
     }
 
     fn can_push_limit_into_scan(&self, plan: &PhysicalPlan) -> bool {
@@ -343,6 +391,17 @@ mod tests {
                 indexes: alloc::vec![
                     IndexInfo::new("idx_id", alloc::vec!["id".into()], true),
                     IndexInfo::new("idx_score", alloc::vec!["score".into()], false),
+                ],
+            },
+        );
+        ctx.register_table(
+            "documents",
+            TableStats {
+                row_count: 100_000,
+                is_sorted: false,
+                indexes: alloc::vec![
+                    IndexInfo::new("idx_updated_at", alloc::vec!["updated_at".into()], false),
+                    IndexInfo::new_gin("idx_metadata", alloc::vec!["metadata".into()],),
                 ],
             },
         );
@@ -490,6 +549,70 @@ mod tests {
                 assert_eq!(offset, Some(2));
             }
             other => panic!("expected index scan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_topn_gin_scan_rewrites_to_ordered_index_filter() {
+        let ctx = create_test_context();
+        let pass = OrderByIndexPass::new(&ctx);
+        let recheck = Expr::Function {
+            name: "JSONB_PATH_EQ".into(),
+            args: alloc::vec![
+                Expr::column("documents", "metadata", 3),
+                Expr::literal(cynos_core::Value::String("$.category".into())),
+                Expr::literal(cynos_core::Value::String("tech".into())),
+            ],
+        };
+        let plan = PhysicalPlan::TopN {
+            input: Box::new(PhysicalPlan::GinIndexScanMulti {
+                table: "documents".into(),
+                index: "idx_metadata".into(),
+                pairs: alloc::vec![("category".into(), "tech".into())],
+                recheck: Some(recheck.clone()),
+            }),
+            order_by: alloc::vec![(Expr::column("documents", "updated_at", 2), SortOrder::Desc)],
+            limit: 20,
+            offset: 0,
+        };
+
+        let result = pass.optimize(plan);
+        match result {
+            PhysicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                assert_eq!(limit, 20);
+                assert_eq!(offset, 0);
+                match *input {
+                    PhysicalPlan::Filter { input, predicate } => {
+                        assert_eq!(
+                            alloc::format!("{:?}", predicate),
+                            alloc::format!("{:?}", recheck)
+                        );
+                        match *input {
+                            PhysicalPlan::IndexScan {
+                                table,
+                                index,
+                                reverse,
+                                limit,
+                                offset,
+                                ..
+                            } => {
+                                assert_eq!(table, "documents");
+                                assert_eq!(index, "idx_updated_at");
+                                assert!(reverse);
+                                assert_eq!(limit, None);
+                                assert_eq!(offset, None);
+                            }
+                            other => panic!("expected index scan, got {:?}", other),
+                        }
+                    }
+                    other => panic!("expected filter, got {:?}", other),
+                }
+            }
+            other => panic!("expected limit, got {:?}", other),
         }
     }
 

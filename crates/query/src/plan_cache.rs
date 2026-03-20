@@ -91,6 +91,7 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
             path,
             value,
             query_type,
+            recheck,
         } => {
             hasher.write(b"gin_index_scan");
             hasher.write(table.as_bytes());
@@ -102,12 +103,16 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
                 hash_value(v, hasher);
             }
             hasher.write(query_type.as_bytes());
+            if let Some(expr) = recheck {
+                hash_expr(expr, hasher);
+            }
         }
         LogicalPlan::GinIndexScanMulti {
             table,
             index,
             column,
             pairs,
+            recheck,
         } => {
             hasher.write(b"gin_index_scan_multi");
             hasher.write(table.as_bytes());
@@ -116,6 +121,9 @@ fn hash_logical_plan<H: Hasher>(plan: &LogicalPlan, hasher: &mut H) {
             for (path, value) in pairs {
                 hasher.write(path.as_bytes());
                 hash_value(value, hasher);
+            }
+            if let Some(expr) = recheck {
+                hash_expr(expr, hasher);
             }
         }
         LogicalPlan::Filter { input, predicate } => {

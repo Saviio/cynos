@@ -67,6 +67,8 @@ pub enum PhysicalPlan {
         value: Option<String>,
         /// Query type: "eq", "contains", or "exists".
         query_type: String,
+        /// Optional recheck predicate preserved for later physical rewrites.
+        recheck: Option<Expr>,
     },
 
     /// GIN index scan for multiple JSONB predicates (AND combination).
@@ -76,6 +78,8 @@ pub enum PhysicalPlan {
         index: String,
         /// Multiple key-value pairs to match (all must match - AND semantics).
         pairs: Vec<(String, String)>,
+        /// Optional recheck predicate preserved for later physical rewrites.
+        recheck: Option<Expr>,
     },
 
     /// Filter operator.
@@ -305,6 +309,7 @@ impl PhysicalPlan {
         key: impl Into<String>,
         value: Option<String>,
         query_type: impl Into<String>,
+        recheck: Option<Expr>,
     ) -> Self {
         PhysicalPlan::GinIndexScan {
             table: table.into(),
@@ -312,6 +317,7 @@ impl PhysicalPlan {
             key: key.into(),
             value,
             query_type: query_type.into(),
+            recheck,
         }
     }
 
@@ -320,11 +326,13 @@ impl PhysicalPlan {
         table: impl Into<String>,
         index: impl Into<String>,
         pairs: Vec<(String, String)>,
+        recheck: Option<Expr>,
     ) -> Self {
         PhysicalPlan::GinIndexScanMulti {
             table: table.into(),
             index: index.into(),
             pairs,
+            recheck,
         }
     }
 

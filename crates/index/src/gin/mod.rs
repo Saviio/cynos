@@ -149,6 +149,23 @@ impl GinIndex {
             .unwrap_or_default()
     }
 
+    /// Visits row IDs that contain the given key (for `?` operator).
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_by_key<F>(&self, key: &str, mut visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        let Some(posting) = self.key_index.get(key) else {
+            return;
+        };
+
+        for row_id in posting.iter() {
+            if !visitor(row_id) {
+                break;
+            }
+        }
+    }
+
     /// Gets all row IDs that contain the given key-value pair (for `@>` operator).
     pub fn get_by_key_value(&self, key: &str, value: &str) -> Vec<RowId> {
         let pair = (key.into(), value.into());
@@ -156,6 +173,24 @@ impl GinIndex {
             .get(&pair)
             .map(|p| p.to_vec())
             .unwrap_or_default()
+    }
+
+    /// Visits row IDs that contain the given key-value pair (for `@>` operator).
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_by_key_value<F>(&self, key: &str, value: &str, mut visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        let pair = (key.into(), value.into());
+        let Some(posting) = self.key_value_index.get(&pair) else {
+            return;
+        };
+
+        for row_id in posting.iter() {
+            if !visitor(row_id) {
+                break;
+            }
+        }
     }
 
     /// Gets all row IDs that contain ALL of the given keys (AND query).
@@ -224,6 +259,19 @@ impl GinIndex {
         }
 
         result
+    }
+
+    /// Visits row IDs that contain all of the given key-value pairs.
+    /// Return `false` from the visitor to stop early.
+    pub fn visit_by_key_values_all<F>(&self, pairs: &[(&str, &str)], mut visitor: F)
+    where
+        F: FnMut(RowId) -> bool,
+    {
+        for row_id in self.get_by_key_values_all(pairs) {
+            if !visitor(row_id) {
+                break;
+            }
+        }
     }
 
     /// Returns the number of unique keys in the index.
@@ -373,6 +421,22 @@ mod tests {
         // Query: rows with "email" OR "nonexistent"
         let result = gin.get_by_keys_any(&["email", "nonexistent"]);
         assert_eq!(result, vec![3]);
+    }
+
+    #[test]
+    fn test_gin_visit_by_key_value_stops_early() {
+        let mut gin = GinIndex::new();
+        for row_id in 1..=5 {
+            gin.add_key_value("status".into(), "active".into(), row_id);
+        }
+
+        let mut visited = Vec::new();
+        gin.visit_by_key_value("status", "active", |row_id| {
+            visited.push(row_id);
+            visited.len() < 2
+        });
+
+        assert_eq!(visited, vec![1, 2]);
     }
 
     #[test]

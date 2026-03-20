@@ -18,6 +18,7 @@ use std::rc::Rc;
 
 const TABLE_NAME: &str = "users";
 const DEPARTMENTS_TABLE_NAME: &str = "departments";
+const DOCUMENTS_TABLE_NAME: &str = "documents";
 const TABLE_ID: TableId = 1;
 const HIT_ROW_ID: u64 = 9;
 const MISS_ROW_ID: u64 = 8;
@@ -91,6 +92,21 @@ fn department_schema() -> Table {
         .unwrap()
 }
 
+fn documents_schema() -> Table {
+    TableBuilder::new(DOCUMENTS_TABLE_NAME)
+        .unwrap()
+        .add_column("id", DataType::Int64)
+        .unwrap()
+        .add_column("metadata", DataType::Jsonb)
+        .unwrap()
+        .add_primary_key(&["id"], false)
+        .unwrap()
+        .add_index("idx_metadata_gin", &["metadata"], false)
+        .unwrap()
+        .build()
+        .unwrap()
+}
+
 fn populate_users(store: &mut RowStore, size: usize) {
     let departments = ["Engineering", "Sales", "Marketing", "HR", "Finance"];
     for i in 0..size {
@@ -103,6 +119,34 @@ fn populate_users(store: &mut RowStore, size: usize) {
                     Value::Int32((20 + (i % 50)) as i32),
                     Value::String(departments[i % departments.len()].into()),
                     Value::Int64((50_000 + (i % 100) as i64 * 1_000) as i64),
+                ],
+            ))
+            .unwrap();
+    }
+}
+
+fn populate_documents(store: &mut RowStore, size: usize) {
+    let categories = ["tech", "ops", "design", "data"];
+    let statuses = ["published", "draft", "review"];
+    let regions = ["apac", "emea", "amer"];
+
+    for i in 0..size {
+        let category = categories[i % categories.len()];
+        let status = statuses[i % statuses.len()];
+        let priority = (i % 5) + 1;
+        let region = regions[i % regions.len()];
+        let portable = if i % 4 == 0 { "portable" } else { "desktop" };
+        let featured = if i % 3 == 0 { "featured" } else { "standard" };
+        let metadata = format!(
+            "{{\"category\":\"{category}\",\"status\":\"{status}\",\"priority\":{priority},\"region\":\"{region}\",\"tags\":[\"{portable}\",\"{featured}\",\"p{priority}\"]}}"
+        );
+
+        store
+            .insert(Row::new(
+                i as u64,
+                vec![
+                    Value::Int64((i + 1) as i64),
+                    Value::Jsonb(cynos_core::JsonbValue(metadata.into_bytes())),
                 ],
             ))
             .unwrap();
@@ -167,6 +211,16 @@ fn build_join_cache(size: usize) -> TableCache {
                 .unwrap();
         }
     }
+
+    cache
+}
+
+fn build_documents_cache(size: usize) -> TableCache {
+    let mut cache = TableCache::new();
+    cache.create_table(documents_schema()).unwrap();
+
+    let store = cache.get_table_mut(DOCUMENTS_TABLE_NAME).unwrap();
+    populate_documents(store, size);
 
     cache
 }
@@ -290,6 +344,28 @@ fn join_project_limit_plan() -> LogicalPlan {
     )
 }
 
+fn jsonb_eq_plan() -> LogicalPlan {
+    LogicalPlan::filter(
+        LogicalPlan::scan(DOCUMENTS_TABLE_NAME),
+        Expr::jsonb_path_eq(
+            Expr::column(DOCUMENTS_TABLE_NAME, "metadata", 1),
+            "$.category",
+            Value::String("tech".into()),
+        ),
+    )
+}
+
+fn jsonb_contains_plan() -> LogicalPlan {
+    LogicalPlan::filter(
+        LogicalPlan::scan(DOCUMENTS_TABLE_NAME),
+        Expr::jsonb_contains(
+            Expr::column(DOCUMENTS_TABLE_NAME, "metadata", 1),
+            "$.tags",
+            Value::String("portable".into()),
+        ),
+    )
+}
+
 fn compiled_filter_plan(cache: &TableCache) -> CompiledPhysicalPlan {
     compile_cached_plan(cache, TABLE_NAME, filter_plan())
 }
@@ -320,6 +396,14 @@ fn compiled_join_plan(cache: &TableCache) -> CompiledPhysicalPlan {
 
 fn compiled_join_project_limit_plan(cache: &TableCache) -> CompiledPhysicalPlan {
     compile_cached_plan(cache, TABLE_NAME, join_project_limit_plan())
+}
+
+fn compiled_jsonb_eq_plan(cache: &TableCache) -> CompiledPhysicalPlan {
+    compile_cached_plan(cache, DOCUMENTS_TABLE_NAME, jsonb_eq_plan())
+}
+
+fn compiled_jsonb_contains_plan(cache: &TableCache) -> CompiledPhysicalPlan {
+    compile_cached_plan(cache, DOCUMENTS_TABLE_NAME, jsonb_contains_plan())
 }
 
 fn update_user<F>(cache: &Rc<RefCell<TableCache>>, row_id: u64, mutator: F)
@@ -626,6 +710,56 @@ fn bench_index_cursor_scan(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_jsonb_gin(c: &mut Criterion) {
+    let mut group = c.benchmark_group("jsonb_gin_execute");
+
+    for size in [10_000usize, 100_000usize] {
+        let cache = build_documents_cache(size);
+        let compiled_eq = compiled_jsonb_eq_plan(&cache);
+        let compiled_contains = compiled_jsonb_contains_plan(&cache);
+        let physical_eq = compile_plan(&cache, DOCUMENTS_TABLE_NAME, jsonb_eq_plan());
+        let physical_contains = compile_plan(&cache, DOCUMENTS_TABLE_NAME, jsonb_contains_plan());
+
+        group.bench_with_input(BenchmarkId::new("path_eq/compiled", size), &size, |b, _| {
+            b.iter(|| {
+                let rows = execute_compiled_physical_plan(&cache, &compiled_eq).unwrap();
+                black_box(rows.len())
+            })
+        });
+
+        group.bench_with_input(BenchmarkId::new("path_eq/physical", size), &size, |b, _| {
+            b.iter(|| {
+                let rows = execute_physical_plan(&cache, &physical_eq).unwrap();
+                black_box(rows.len())
+            })
+        });
+
+        group.bench_with_input(
+            BenchmarkId::new("contains/compiled", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let rows = execute_compiled_physical_plan(&cache, &compiled_contains).unwrap();
+                    black_box(rows.len())
+                })
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("contains/physical", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let rows = execute_physical_plan(&cache, &physical_contains).unwrap();
+                    black_box(rows.len())
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_plan_cache_hit_compound_filter(c: &mut Criterion) {
     let mut group = c.benchmark_group("plan_cache_hit_compound_filter_execute");
 
@@ -814,6 +948,7 @@ criterion_group!(
     bench_hash_join,
     bench_hash_join_project_limit,
     bench_index_cursor_scan,
+    bench_jsonb_gin,
     bench_plan_cache_hit_compound_filter,
     bench_requery_create,
     bench_requery_pipeline_create,

@@ -23,6 +23,8 @@ use alloc::string::String;
 
 const INDEX_JOIN_ALWAYS_OUTER_ROWS: usize = 64;
 const INDEX_JOIN_MAX_OUTER_ROWS: usize = 4096;
+const INDEX_JOIN_MAX_UNIQUE_EFFECTIVE_OUTER_ROWS: usize = 4096;
+const INDEX_JOIN_ROW_GOAL_SMALL_INNER_ROWS: usize = 512;
 const INDEX_JOIN_MIN_INNER_OUTER_RATIO: usize = 4;
 
 /// Pass that converts eligible joins to index nested loop joins.
@@ -38,10 +40,10 @@ impl<'a> IndexJoinPass<'a> {
 
     /// Optimizes the physical plan by converting eligible joins to index joins.
     pub fn optimize(&self, plan: PhysicalPlan) -> PhysicalPlan {
-        self.traverse(plan)
+        self.traverse(plan, None)
     }
 
-    fn traverse(&self, plan: PhysicalPlan) -> PhysicalPlan {
+    fn traverse(&self, plan: PhysicalPlan, row_goal: Option<usize>) -> PhysicalPlan {
         match plan {
             // Check hash joins for index join optimization
             PhysicalPlan::HashJoin {
@@ -51,8 +53,8 @@ impl<'a> IndexJoinPass<'a> {
                 join_type,
                 output_tables,
             } => {
-                let left = self.traverse(*left);
-                let right = self.traverse(*right);
+                let left = self.traverse(*left, None);
+                let right = self.traverse(*right, None);
 
                 // Only optimize inner equi-joins
                 if join_type != JoinType::Inner || !condition.is_equi_join() {
@@ -67,7 +69,7 @@ impl<'a> IndexJoinPass<'a> {
 
                 // Try to find an index on either side
                 if let Some((outer, inner_table, inner_index, outer_is_left)) =
-                    self.find_index_join_candidate(&left, &right, &condition)
+                    self.find_index_join_candidate(&left, &right, &condition, row_goal)
                 {
                     return PhysicalPlan::IndexNestedLoopJoin {
                         outer: Box::new(outer),
@@ -97,8 +99,8 @@ impl<'a> IndexJoinPass<'a> {
                 join_type,
                 output_tables,
             } => {
-                let left = self.traverse(*left);
-                let right = self.traverse(*right);
+                let left = self.traverse(*left, None);
+                let right = self.traverse(*right, None);
 
                 // Only optimize inner equi-joins
                 if join_type != JoinType::Inner || !condition.is_equi_join() {
@@ -113,7 +115,7 @@ impl<'a> IndexJoinPass<'a> {
 
                 // Try to find an index on either side
                 if let Some((outer, inner_table, inner_index, outer_is_left)) =
-                    self.find_index_join_candidate(&left, &right, &condition)
+                    self.find_index_join_candidate(&left, &right, &condition, row_goal)
                 {
                     return PhysicalPlan::IndexNestedLoopJoin {
                         outer: Box::new(outer),
@@ -137,12 +139,12 @@ impl<'a> IndexJoinPass<'a> {
 
             // Recursively process other nodes
             PhysicalPlan::Filter { input, predicate } => PhysicalPlan::Filter {
-                input: Box::new(self.traverse(*input)),
+                input: Box::new(self.traverse(*input, row_goal)),
                 predicate,
             },
 
             PhysicalPlan::Project { input, columns } => PhysicalPlan::Project {
-                input: Box::new(self.traverse(*input)),
+                input: Box::new(self.traverse(*input, row_goal)),
                 columns,
             },
 
@@ -153,8 +155,8 @@ impl<'a> IndexJoinPass<'a> {
                 join_type,
                 output_tables,
             } => PhysicalPlan::SortMergeJoin {
-                left: Box::new(self.traverse(*left)),
-                right: Box::new(self.traverse(*right)),
+                left: Box::new(self.traverse(*left, None)),
+                right: Box::new(self.traverse(*right, None)),
                 condition,
                 join_type,
                 output_tables,
@@ -165,13 +167,13 @@ impl<'a> IndexJoinPass<'a> {
                 group_by,
                 aggregates,
             } => PhysicalPlan::HashAggregate {
-                input: Box::new(self.traverse(*input)),
+                input: Box::new(self.traverse(*input, None)),
                 group_by,
                 aggregates,
             },
 
             PhysicalPlan::Sort { input, order_by } => PhysicalPlan::Sort {
-                input: Box::new(self.traverse(*input)),
+                input: Box::new(self.traverse(*input, None)),
                 order_by,
             },
 
@@ -180,24 +182,27 @@ impl<'a> IndexJoinPass<'a> {
                 limit,
                 offset,
             } => PhysicalPlan::Limit {
-                input: Box::new(self.traverse(*input)),
+                input: Box::new(self.traverse(
+                    *input,
+                    Self::combine_row_goal(row_goal, limit.saturating_add(offset)),
+                )),
                 limit,
                 offset,
             },
 
             PhysicalPlan::CrossProduct { left, right } => PhysicalPlan::CrossProduct {
-                left: Box::new(self.traverse(*left)),
-                right: Box::new(self.traverse(*right)),
+                left: Box::new(self.traverse(*left, None)),
+                right: Box::new(self.traverse(*right, None)),
             },
 
             PhysicalPlan::Union { left, right, all } => PhysicalPlan::Union {
-                left: Box::new(self.traverse(*left)),
-                right: Box::new(self.traverse(*right)),
+                left: Box::new(self.traverse(*left, None)),
+                right: Box::new(self.traverse(*right, None)),
                 all,
             },
 
             PhysicalPlan::NoOp { input } => PhysicalPlan::NoOp {
-                input: Box::new(self.traverse(*input)),
+                input: Box::new(self.traverse(*input, row_goal)),
             },
 
             PhysicalPlan::TopN {
@@ -206,7 +211,10 @@ impl<'a> IndexJoinPass<'a> {
                 limit,
                 offset,
             } => PhysicalPlan::TopN {
-                input: Box::new(self.traverse(*input)),
+                input: Box::new(self.traverse(
+                    *input,
+                    Self::combine_row_goal(row_goal, limit.saturating_add(offset)),
+                )),
                 order_by,
                 limit,
                 offset,
@@ -231,22 +239,51 @@ impl<'a> IndexJoinPass<'a> {
         left: &PhysicalPlan,
         right: &PhysicalPlan,
         condition: &Expr,
+        row_goal: Option<usize>,
     ) -> Option<(PhysicalPlan, String, String, bool)> {
         // Extract join columns from the condition
-        let (left_col, right_col) = self.extract_join_columns(condition)?;
+        let (cond_left_col, cond_right_col) = self.extract_join_columns(condition)?;
+        let (left_col, right_col) =
+            self.align_join_columns(left, right, cond_left_col, cond_right_col)?;
 
         // Check if right side is a table scan with an index on the join column
         if let Some((table, index)) = self.get_indexed_table_scan(right, right_col) {
-            if self.should_use_index_join(left, &table, &index) {
+            if self.should_use_index_join(left, &table, &index, row_goal) {
                 return Some((left.clone(), table, index.name.clone(), true));
             }
         }
 
         // Check if left side is a table scan with an index on the join column
         if let Some((table, index)) = self.get_indexed_table_scan(left, left_col) {
-            if self.should_use_index_join(right, &table, &index) {
+            if self.should_use_index_join(right, &table, &index, row_goal) {
                 return Some((right.clone(), table, index.name.clone(), false));
             }
+        }
+
+        None
+    }
+
+    fn align_join_columns<'b>(
+        &self,
+        left: &PhysicalPlan,
+        right: &PhysicalPlan,
+        first: &'b ColumnRef,
+        second: &'b ColumnRef,
+    ) -> Option<(&'b ColumnRef, &'b ColumnRef)> {
+        let left_tables = left.collect_tables();
+        let right_tables = right.collect_tables();
+
+        let first_in_left = left_tables.iter().any(|table| table == &first.table);
+        let first_in_right = right_tables.iter().any(|table| table == &first.table);
+        let second_in_left = left_tables.iter().any(|table| table == &second.table);
+        let second_in_right = right_tables.iter().any(|table| table == &second.table);
+
+        if first_in_left && second_in_right && !first_in_right && !second_in_left {
+            return Some((first, second));
+        }
+
+        if second_in_left && first_in_right && !second_in_right && !first_in_left {
+            return Some((second, first));
         }
 
         None
@@ -306,32 +343,45 @@ impl<'a> IndexJoinPass<'a> {
         outer: &PhysicalPlan,
         inner_table: &str,
         inner_index: &IndexInfo,
+        row_goal: Option<usize>,
     ) -> bool {
         if outer.collect_tables().len() != 1 {
             return false;
         }
 
         let outer_rows = self.estimate_rows(outer);
+        let effective_outer_rows = row_goal.map_or(outer_rows, |goal| outer_rows.min(goal));
         let inner_rows = self
             .ctx
             .get_stats(inner_table)
             .map(|stats| stats.row_count)
             .unwrap_or(1000);
 
-        if outer_rows == 0 || inner_rows == 0 {
+        if effective_outer_rows == 0 || inner_rows == 0 {
             return false;
         }
 
-        if outer_rows <= INDEX_JOIN_ALWAYS_OUTER_ROWS {
+        if effective_outer_rows <= INDEX_JOIN_ALWAYS_OUTER_ROWS {
             return true;
         }
 
         if inner_index.is_unique {
-            return outer_rows <= inner_rows;
+            return effective_outer_rows <= INDEX_JOIN_MAX_UNIQUE_EFFECTIVE_OUTER_ROWS;
         }
 
-        outer_rows <= INDEX_JOIN_MAX_OUTER_ROWS
-            && inner_rows >= outer_rows.saturating_mul(INDEX_JOIN_MIN_INNER_OUTER_RATIO)
+        if row_goal.is_some()
+            && effective_outer_rows <= INDEX_JOIN_MAX_OUTER_ROWS
+            && inner_rows <= INDEX_JOIN_ROW_GOAL_SMALL_INNER_ROWS
+        {
+            return true;
+        }
+
+        effective_outer_rows <= INDEX_JOIN_MAX_OUTER_ROWS
+            && inner_rows >= effective_outer_rows.saturating_mul(INDEX_JOIN_MIN_INNER_OUTER_RATIO)
+    }
+
+    fn combine_row_goal(existing: Option<usize>, candidate: usize) -> Option<usize> {
+        Some(existing.map_or(candidate, |current| current.min(candidate)))
     }
 
     fn estimate_rows(&self, plan: &PhysicalPlan) -> usize {
@@ -633,5 +683,63 @@ mod tests {
 
         let result = pass.optimize(plan);
         assert!(matches!(result, PhysicalPlan::HashJoin { .. }));
+    }
+
+    #[test]
+    fn test_limit_row_goal_enables_unique_index_join() {
+        let mut ctx = ExecutionContext::new();
+        ctx.register_table(
+            "users",
+            TableStats {
+                row_count: 100_000,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new("idx_age", alloc::vec!["age".into()], false,)],
+            },
+        );
+        ctx.register_table(
+            "departments",
+            TableStats {
+                row_count: 100,
+                is_sorted: false,
+                indexes: alloc::vec![IndexInfo::new(
+                    "pk_departments_id",
+                    alloc::vec!["id".into()],
+                    true,
+                )],
+            },
+        );
+
+        let pass = IndexJoinPass::new(&ctx);
+        let plan = PhysicalPlan::Limit {
+            input: Box::new(PhysicalPlan::hash_join(
+                PhysicalPlan::IndexScan {
+                    table: "users".into(),
+                    index: "idx_age".into(),
+                    bounds: crate::planner::IndexBounds::all(),
+                    limit: None,
+                    offset: None,
+                    reverse: false,
+                },
+                PhysicalPlan::table_scan("departments"),
+                Expr::eq(
+                    Expr::column("users", "dept_id", 2),
+                    Expr::column("departments", "id", 0),
+                ),
+                JoinType::Inner,
+            )),
+            limit: 1_000,
+            offset: 0,
+        };
+
+        let result = pass.optimize(plan);
+        match result {
+            PhysicalPlan::Limit { input, .. } => {
+                assert!(matches!(*input, PhysicalPlan::IndexNestedLoopJoin { .. }));
+            }
+            other => panic!(
+                "expected limit over index nested loop join, got {:?}",
+                other
+            ),
+        }
     }
 }

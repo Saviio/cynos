@@ -409,11 +409,7 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
             .get_table(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        for row in store.gin_index_get_by_key_value(index, key, value) {
-            if !visitor(&row) {
-                break;
-            }
-        }
+        store.visit_gin_index_by_key_value(index, key, value, |row| visitor(row));
         Ok(())
     }
 
@@ -446,11 +442,7 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
             .get_table(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        for row in store.gin_index_get_by_key(index, key) {
-            if !visitor(&row) {
-                break;
-            }
-        }
+        store.visit_gin_index_by_key(index, key, |row| visitor(row));
         Ok(())
     }
 
@@ -483,11 +475,7 @@ impl<'a> DataSource for TableCacheDataSource<'a> {
             .get_table(table)
             .ok_or_else(|| ExecutionError::TableNotFound(table.into()))?;
 
-        for row in store.gin_index_get_by_key_values_all(index, pairs) {
-            if !visitor(&row) {
-                break;
-            }
-        }
+        store.visit_gin_index_by_key_values_all(index, pairs, |row| visitor(row));
         Ok(())
     }
 }
@@ -657,19 +645,16 @@ pub fn explain_plan(cache: &TableCache, table_name: &str, plan: LogicalPlan) -> 
 
 /// Executes a pre-compiled physical plan.
 /// This is faster than execute_plan because it skips optimization.
+/// The plan is still lowered to the fused execution kernel on each call;
+/// callers that want to reuse that lowering should use `CompiledPhysicalPlan`.
 pub fn execute_physical_plan(
     cache: &TableCache,
     physical_plan: &PhysicalPlan,
 ) -> ExecutionResult<Vec<Rc<Row>>> {
     let data_source = TableCacheDataSource::new(cache);
     let runner = PhysicalPlanRunner::new(&data_source);
-    let relation = runner.execute(physical_plan)?;
-
-    Ok(relation
-        .entries
-        .into_iter()
-        .map(|entry| entry.row)
-        .collect())
+    let artifact = runner.compile_execution_artifact_with_data_source(physical_plan);
+    runner.execute_with_artifact_row_vec(physical_plan, &artifact)
 }
 
 pub fn execute_compiled_physical_plan(
@@ -688,14 +673,14 @@ pub fn execute_physical_plan_with_summary(
 ) -> ExecutionResult<QueryExecutionOutput> {
     let data_source = TableCacheDataSource::new(cache);
     let runner = PhysicalPlanRunner::new(&data_source);
-    let relation = runner.execute(physical_plan)?;
-
-    let mut rows = Vec::with_capacity(relation.entries.len());
+    let artifact = runner.compile_execution_artifact_with_data_source(physical_plan);
+    let mut rows = Vec::new();
     let mut summary = QueryResultSummaryBuilder::default();
-    for entry in relation.entries {
-        summary.push(entry.row.as_ref());
-        rows.push(entry.row);
-    }
+    runner.execute_with_artifact_rows(physical_plan, &artifact, |row| {
+        summary.push(row.as_ref());
+        rows.push(row);
+        Ok(true)
+    })?;
 
     Ok(QueryExecutionOutput {
         rows,
@@ -896,6 +881,52 @@ mod tests {
         cache
     }
 
+    fn create_jsonb_test_cache() -> TableCache {
+        let documents = TableBuilder::new("documents")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("metadata", DataType::Jsonb)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .add_index("idx_metadata_gin", &["metadata"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut cache = TableCache::new();
+        cache.create_table(documents).unwrap();
+
+        let store = cache.get_table_mut("documents").unwrap();
+        for (row_id, metadata) in [
+            (
+                1u64,
+                br#"{"tags":["portable","featured"],"category":"tech"}"#.as_slice(),
+            ),
+            (
+                2u64,
+                br#"{"tags":["desktop","standard"],"category":"ops"}"#.as_slice(),
+            ),
+            (
+                3u64,
+                br#"{"tags":["portable","review"],"category":"tech"}"#.as_slice(),
+            ),
+        ] {
+            store
+                .insert(Row::new(
+                    row_id,
+                    alloc::vec![
+                        Value::Int64(row_id as i64),
+                        Value::Jsonb(cynos_core::JsonbValue(metadata.to_vec())),
+                    ],
+                ))
+                .unwrap();
+        }
+
+        cache
+    }
+
     #[test]
     fn test_table_cache_data_source() {
         // Basic test to ensure the module compiles
@@ -923,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compile_plan_keeps_hash_join_for_in_memory_fk_join() {
+    fn test_compile_plan_prefers_index_join_for_small_outer_fk_join() {
         let cache = create_join_test_cache();
         let plan = LogicalPlan::inner_join(
             LogicalPlan::scan("users"),
@@ -936,7 +967,7 @@ mod tests {
 
         let physical = compile_plan(&cache, "users", plan);
 
-        assert!(matches!(physical, PhysicalPlan::HashJoin { .. }));
+        assert!(matches!(physical, PhysicalPlan::IndexNestedLoopJoin { .. }));
     }
 
     #[test]
@@ -975,6 +1006,79 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_plan_matches_jsonb_gin_contains_execution() {
+        let cache = create_jsonb_test_cache();
+        let plan = LogicalPlan::filter(
+            LogicalPlan::scan("documents"),
+            AstExpr::jsonb_contains(
+                AstExpr::column("documents", "metadata", 1),
+                "$.tags",
+                Value::String("portable".into()),
+            ),
+        );
+
+        let physical = compile_plan(&cache, "documents", plan.clone());
+        let compiled = compile_cached_plan(&cache, "documents", plan);
+
+        let expected = execute_physical_plan(&cache, &physical).unwrap();
+        let actual = execute_compiled_physical_plan(&cache, &compiled).unwrap();
+
+        let expected_ids: Vec<u64> = expected.into_iter().map(|row| row.id()).collect();
+        let actual_ids: Vec<u64> = actual.into_iter().map(|row| row.id()).collect();
+
+        assert_eq!(actual_ids, expected_ids);
+        assert_eq!(actual_ids, alloc::vec![1, 3]);
+    }
+
+    #[test]
+    fn test_execute_physical_plan_matches_legacy_runner_for_join_project_limit() {
+        let cache = create_join_test_cache();
+        let plan = LogicalPlan::limit(
+            LogicalPlan::project(
+                LogicalPlan::inner_join(
+                    LogicalPlan::scan("users"),
+                    LogicalPlan::scan("orders"),
+                    AstExpr::eq(
+                        AstExpr::column("users", "id", 0),
+                        AstExpr::column("orders", "user_id", 1),
+                    ),
+                ),
+                alloc::vec![
+                    AstExpr::column("users", "name", 1),
+                    AstExpr::column("orders", "amount", 2),
+                ],
+            ),
+            5,
+            0,
+        );
+
+        let physical = compile_plan(&cache, "users", plan);
+        let actual = execute_physical_plan(&cache, &physical).unwrap();
+
+        let data_source = TableCacheDataSource::new(&cache);
+        let runner = PhysicalPlanRunner::new(&data_source);
+        let expected = runner.execute(&physical).unwrap();
+
+        let actual_snapshot: Vec<(u64, u64, Vec<Value>)> = actual
+            .into_iter()
+            .map(|row| (row.id(), row.version(), row.values().to_vec()))
+            .collect();
+        let expected_snapshot: Vec<(u64, u64, Vec<Value>)> = expected
+            .entries
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.row.id(),
+                    entry.row.version(),
+                    entry.row.values().to_vec(),
+                )
+            })
+            .collect();
+
+        assert_eq!(actual_snapshot, expected_snapshot);
+    }
+
+    #[test]
     fn test_compiled_plan_summary_matches_materialized_rows() {
         let cache = create_join_test_cache();
         let compiled = compile_cached_plan(
@@ -997,6 +1101,37 @@ mod tests {
         );
 
         let output = execute_compiled_physical_plan_with_summary(&cache, &compiled).unwrap();
+
+        assert_eq!(output.summary, QueryResultSummary::from_rows(&output.rows));
+    }
+
+    #[test]
+    fn test_physical_plan_summary_matches_materialized_rows() {
+        let cache = create_join_test_cache();
+        let physical = compile_plan(
+            &cache,
+            "users",
+            LogicalPlan::limit(
+                LogicalPlan::project(
+                    LogicalPlan::inner_join(
+                        LogicalPlan::scan("users"),
+                        LogicalPlan::scan("orders"),
+                        AstExpr::eq(
+                            AstExpr::column("users", "id", 0),
+                            AstExpr::column("orders", "user_id", 1),
+                        ),
+                    ),
+                    alloc::vec![
+                        AstExpr::column("users", "name", 1),
+                        AstExpr::column("orders", "amount", 2),
+                    ],
+                ),
+                8,
+                0,
+            ),
+        );
+
+        let output = execute_physical_plan_with_summary(&cache, &physical).unwrap();
 
         assert_eq!(output.summary, QueryResultSummary::from_rows(&output.rows));
     }
