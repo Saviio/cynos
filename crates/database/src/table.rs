@@ -20,6 +20,14 @@ pub struct ColumnOptions {
     pub auto_increment: bool,
 }
 
+/// Foreign-key options for GraphQL relation naming.
+#[wasm_bindgen]
+#[derive(Clone, Debug, Default)]
+pub struct ForeignKeyOptions {
+    field_name: Option<String>,
+    reverse_field_name: Option<String>,
+}
+
 #[wasm_bindgen]
 impl ColumnOptions {
     #[wasm_bindgen(constructor)]
@@ -52,6 +60,26 @@ impl ColumnOptions {
     }
 }
 
+#[wasm_bindgen]
+impl ForeignKeyOptions {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[wasm_bindgen(js_name = fieldName)]
+    pub fn set_field_name(mut self, value: &str) -> Self {
+        self.field_name = Some(value.to_string());
+        self
+    }
+
+    #[wasm_bindgen(js_name = reverseFieldName)]
+    pub fn set_reverse_field_name(mut self, value: &str) -> Self {
+        self.reverse_field_name = Some(value.to_string());
+        self
+    }
+}
+
 /// JavaScript-friendly table builder.
 #[wasm_bindgen]
 pub struct JsTableBuilder {
@@ -59,6 +87,7 @@ pub struct JsTableBuilder {
     columns: Vec<ColumnDef>,
     primary_key: Option<Vec<String>>,
     indices: Vec<IndexDef>,
+    foreign_keys: Vec<ForeignKeyDef>,
     auto_increment: bool,
 }
 
@@ -78,6 +107,16 @@ struct IndexDef {
     unique: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ForeignKeyDef {
+    name: String,
+    child_column: String,
+    parent_table: String,
+    parent_column: String,
+    field_name: Option<String>,
+    reverse_field_name: Option<String>,
+}
+
 #[wasm_bindgen]
 impl JsTableBuilder {
     /// Creates a new table builder.
@@ -88,6 +127,7 @@ impl JsTableBuilder {
             columns: Vec::new(),
             primary_key: None,
             indices: Vec::new(),
+            foreign_keys: Vec::new(),
             auto_increment: false,
         }
     }
@@ -185,6 +225,28 @@ impl JsTableBuilder {
         self
     }
 
+    /// Adds a foreign key and optional GraphQL relation names.
+    #[wasm_bindgen(js_name = foreignKey)]
+    pub fn foreign_key(
+        mut self,
+        name: &str,
+        child_column: &str,
+        parent_table: &str,
+        parent_column: &str,
+        options: Option<ForeignKeyOptions>,
+    ) -> Self {
+        let options = options.unwrap_or_default();
+        self.foreign_keys.push(ForeignKeyDef {
+            name: name.to_string(),
+            child_column: child_column.to_string(),
+            parent_table: parent_table.to_string(),
+            parent_column: parent_column.to_string(),
+            field_name: options.field_name,
+            reverse_field_name: options.reverse_field_name,
+        });
+        self
+    }
+
     /// Builds the table schema (internal use).
     pub(crate) fn build_internal(&self) -> Result<Table, JsValue> {
         let mut builder = TableBuilder::new(&self.name)
@@ -214,6 +276,20 @@ impl JsTableBuilder {
             let col_refs: Vec<&str> = idx.columns.iter().map(|s| s.as_str()).collect();
             builder = builder
                 .add_index(&idx.name, &col_refs, idx.unique)
+                .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
+        }
+
+        // Add foreign keys
+        for fk in &self.foreign_keys {
+            builder = builder
+                .add_foreign_key_with_graphql_names(
+                    &fk.name,
+                    &fk.child_column,
+                    &fk.parent_table,
+                    &fk.parent_column,
+                    fk.field_name.clone(),
+                    fk.reverse_field_name.clone(),
+                )
                 .map_err(|e| JsValue::from_str(&alloc::format!("{:?}", e)))?;
         }
 

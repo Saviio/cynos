@@ -22,6 +22,7 @@ cynos-incremental = { version = "0.1.0", path = "crates/incremental" }
 cynos-reactive = { version = "0.1.0", path = "crates/reactive" }
 cynos-binary = { version = "0.1.0", path = "crates/binary" }
 cynos-database = { version = "0.1.0", path = "crates/database" }
+cynos-gql = { version = "0.1.0", path = "crates/gql" }
 hashbrown = { version = "0.14", default-features = false, features = ["alloc", "ahash"] }
 proptest = "1.4"
 criterion = "0.5"

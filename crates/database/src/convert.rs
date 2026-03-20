@@ -3,6 +3,7 @@
 //! This module provides functions to convert between JS values and Cynos's
 //! internal types (Value, Row, etc.).
 
+use alloc::collections::BTreeMap;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -308,6 +309,146 @@ pub fn joined_rows_to_js_array(rows: &[Rc<Row>], schemas: &[&Table]) -> JsValue 
     }
 
     arr.into()
+}
+
+/// Converts a JS variables object into GraphQL variables.
+pub fn js_to_gql_variables(js: Option<&JsValue>) -> Result<cynos_gql::VariableValues, JsValue> {
+    let Some(js) = js else {
+        return Ok(BTreeMap::new());
+    };
+
+    if js.is_null() || js.is_undefined() {
+        return Ok(BTreeMap::new());
+    }
+
+    if !js.is_object() || js_sys::Array::is_array(js) {
+        return Err(JsValue::from_str("GraphQL variables must be an object"));
+    }
+
+    let keys = js_sys::Reflect::own_keys(js)
+        .map_err(|_| JsValue::from_str("Failed to enumerate GraphQL variables"))?;
+    let mut variables = BTreeMap::new();
+    for key in keys.iter() {
+        let Some(name) = key.as_string() else {
+            continue;
+        };
+        let value = js_sys::Reflect::get(js, &key)
+            .map_err(|_| JsValue::from_str("Failed to read GraphQL variable"))?;
+        variables.insert(name, js_to_gql_input_value(&value)?);
+    }
+
+    Ok(variables)
+}
+
+/// Converts a GraphQL execution response into the standard `{ data }` object shape.
+pub fn gql_response_to_js(response: &cynos_gql::GraphqlResponse) -> Result<JsValue, JsValue> {
+    let obj = js_sys::Object::new();
+    let data = gql_value_to_js(&response.data);
+    js_sys::Reflect::set(&obj, &JsValue::from_str("data"), &data)?;
+    Ok(obj.into())
+}
+
+fn js_to_gql_input_value(js: &JsValue) -> Result<cynos_gql::InputValue, JsValue> {
+    if js.is_null() || js.is_undefined() {
+        return Ok(cynos_gql::InputValue::Null);
+    }
+
+    if let Some(value) = js.as_bool() {
+        return Ok(cynos_gql::InputValue::Boolean(value));
+    }
+
+    if js.is_bigint() {
+        let string = js_sys::BigInt::from(js.clone())
+            .to_string(10)
+            .map_err(|_| JsValue::from_str("Failed to convert BigInt"))?;
+        let value: i64 = String::from(string)
+            .parse()
+            .map_err(|_| JsValue::from_str("BigInt out of i64 range"))?;
+        return Ok(cynos_gql::InputValue::Int(value));
+    }
+
+    if let Some(value) = js.as_f64() {
+        if value.fract() == 0.0 {
+            return Ok(cynos_gql::InputValue::Int(value as i64));
+        }
+        return Ok(cynos_gql::InputValue::Float(
+            cynos_gql::ast::FloatValue::new(value),
+        ));
+    }
+
+    if let Some(value) = js.as_string() {
+        return Ok(cynos_gql::InputValue::String(value));
+    }
+
+    if js.is_instance_of::<js_sys::Date>() {
+        let date = js_sys::Date::from(js.clone());
+        return Ok(cynos_gql::InputValue::Int(date.get_time() as i64));
+    }
+
+    if js.is_instance_of::<js_sys::Uint8Array>() {
+        let array = js_sys::Uint8Array::new(js);
+        let values = array
+            .to_vec()
+            .into_iter()
+            .map(|value| cynos_gql::InputValue::Int(value as i64))
+            .collect();
+        return Ok(cynos_gql::InputValue::List(values));
+    }
+
+    if js_sys::Array::is_array(js) {
+        let array = js_sys::Array::from(js);
+        let mut values = Vec::with_capacity(array.length() as usize);
+        for value in array.iter() {
+            values.push(js_to_gql_input_value(&value)?);
+        }
+        return Ok(cynos_gql::InputValue::List(values));
+    }
+
+    if js.is_object() {
+        let keys = js_sys::Reflect::own_keys(js)
+            .map_err(|_| JsValue::from_str("Failed to enumerate GraphQL input object"))?;
+        let mut fields = Vec::with_capacity(keys.length() as usize);
+        for key in keys.iter() {
+            let Some(name) = key.as_string() else {
+                continue;
+            };
+            let value = js_sys::Reflect::get(js, &key)
+                .map_err(|_| JsValue::from_str("Failed to read GraphQL input field"))?;
+            fields.push(cynos_gql::ast::ObjectField {
+                name,
+                value: js_to_gql_input_value(&value)?,
+            });
+        }
+        return Ok(cynos_gql::InputValue::Object(fields));
+    }
+
+    Err(JsValue::from_str("Unsupported GraphQL input value"))
+}
+
+fn gql_value_to_js(value: &cynos_gql::ResponseValue) -> JsValue {
+    match value {
+        cynos_gql::ResponseValue::Null => JsValue::NULL,
+        cynos_gql::ResponseValue::Scalar(value) => value_to_js(value),
+        cynos_gql::ResponseValue::List(values) => {
+            let array = js_sys::Array::new_with_length(values.len() as u32);
+            for (index, value) in values.iter().enumerate() {
+                array.set(index as u32, gql_value_to_js(value));
+            }
+            array.into()
+        }
+        cynos_gql::ResponseValue::Object(fields) => {
+            let object = js_sys::Object::new();
+            for field in fields {
+                js_sys::Reflect::set(
+                    &object,
+                    &JsValue::from_str(&field.name),
+                    &gql_value_to_js(&field.value),
+                )
+                .ok();
+            }
+            object.into()
+        }
+    }
 }
 
 /// Infers the data type from a JavaScript value.

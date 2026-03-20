@@ -1,0 +1,15 @@
+[package]
+name = "cynos-gql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GraphQL schema and query layer for Cynos"
+
+[dependencies]
+cynos-core = { workspace = true }
+cynos-index = { workspace = true }
+cynos-jsonb = { workspace = true }
+cynos-query = { workspace = true }
+cynos-storage = { workspace = true }
+hashbrown = { workspace = true }

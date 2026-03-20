@@ -41,6 +41,10 @@ pub struct ForeignKey {
     pub action: ConstraintAction,
     /// When to evaluate the constraint.
     pub timing: ConstraintTiming,
+    /// Optional GraphQL field name on the child table that points to the parent row.
+    pub graphql_forward_field: Option<String>,
+    /// Optional GraphQL field name on the parent table that exposes child rows.
+    pub graphql_reverse_field: Option<String>,
 }
 
 impl ForeignKey {
@@ -60,6 +64,8 @@ impl ForeignKey {
             parent_column: parent_column.into(),
             action: ConstraintAction::Restrict,
             timing: ConstraintTiming::Immediate,
+            graphql_forward_field: None,
+            graphql_reverse_field: None,
         }
     }
 
@@ -73,6 +79,27 @@ impl ForeignKey {
     pub fn timing(mut self, timing: ConstraintTiming) -> Self {
         self.timing = timing;
         self
+    }
+
+    /// Sets GraphQL relation field names for both directions.
+    pub fn graphql_fields(
+        mut self,
+        forward: Option<impl Into<String>>,
+        reverse: Option<impl Into<String>>,
+    ) -> Self {
+        self.graphql_forward_field = forward.map(|value| value.into());
+        self.graphql_reverse_field = reverse.map(|value| value.into());
+        self
+    }
+
+    /// Returns the GraphQL field name on the child table, when explicitly set.
+    pub fn graphql_forward_field(&self) -> Option<&str> {
+        self.graphql_forward_field.as_deref()
+    }
+
+    /// Returns the GraphQL reverse field name on the parent table, when explicitly set.
+    pub fn graphql_reverse_field(&self) -> Option<&str> {
+        self.graphql_reverse_field.as_deref()
     }
 }
 

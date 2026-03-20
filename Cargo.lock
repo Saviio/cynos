@@ -247,6 +247,7 @@ dependencies = [
  "criterion",
  "cynos-binary",
  "cynos-core",
+ "cynos-gql",
  "cynos-incremental",
  "cynos-index",
  "cynos-jsonb",
@@ -261,6 +262,18 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+]
+
+[[package]]
+name = "cynos-gql"
+version = "0.1.0"
+dependencies = [
+ "cynos-core",
+ "cynos-index",
+ "cynos-jsonb",
+ "cynos-query",
+ "cynos-storage",
+ "hashbrown 0.14.5",
 ]
 
 [[package]]

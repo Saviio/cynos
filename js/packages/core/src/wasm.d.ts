@@ -189,6 +189,16 @@ export class Database {
      */
     dropTable(name: string): void;
     /**
+     * Executes a GraphQL query against the current database snapshot.
+     *
+     * Returns a standard GraphQL payload object with a single `data` property.
+     */
+    graphql(query: string, variables?: any | null, operation_name?: string | null): any;
+    /**
+     * Renders the current GraphQL schema as SDL.
+     */
+    graphqlSchema(): string;
+    /**
      * Checks if a table exists.
      */
     hasTable(name: string): boolean;
@@ -201,6 +211,10 @@ export class Database {
      */
     constructor(name: string);
     /**
+     * Parses and prepares a GraphQL query for repeated execution.
+     */
+    prepareGraphql(query: string, operation_name?: string | null): PreparedGraphqlQuery;
+    /**
      * Registers a table schema with the database.
      */
     registerTable(builder: JsTableBuilder): void;
@@ -211,6 +225,10 @@ export class Database {
      * - Multiple strings: select('name', 'score') - passed as variadic args
      */
     select(...columns: any): SelectBuilder;
+    /**
+     * Creates a live GraphQL subscription backed by the root query planner path.
+     */
+    subscribeGraphql(query: string, variables?: any | null, operation_name?: string | null): JsGraphqlSubscription;
     /**
      * Gets a table reference by name.
      */
@@ -281,6 +299,17 @@ export class Expr {
 }
 
 /**
+ * Foreign-key options for GraphQL relation naming.
+ */
+export class ForeignKeyOptions {
+    free(): void;
+    [Symbol.dispose](): void;
+    fieldName(value: string): ForeignKeyOptions;
+    constructor();
+    reverseFieldName(value: string): ForeignKeyOptions;
+}
+
+/**
  * INSERT query builder.
  */
 export class InsertBuilder {
@@ -344,6 +373,31 @@ export enum JsDataType {
     DateTime = 5,
     Bytes = 6,
     Jsonb = 7,
+}
+
+/**
+ * JavaScript-friendly GraphQL subscription wrapper.
+ *
+ * The callback receives a standard GraphQL payload object with a single `data`
+ * property. The payload is emitted immediately on subscribe and again whenever
+ * the root query result changes.
+ */
+export class JsGraphqlSubscription {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Returns the current GraphQL payload.
+     */
+    getResult(): any;
+    /**
+     * Subscribes to GraphQL payload changes and emits the initial value immediately.
+     */
+    subscribe(callback: Function): Function;
+    /**
+     * Returns the number of active subscriptions.
+     */
+    subscriptionCount(): number;
 }
 
 /**
@@ -493,6 +547,10 @@ export class JsTableBuilder {
      */
     column(name: string, data_type: JsDataType, options?: ColumnOptions | null): JsTableBuilder;
     /**
+     * Adds a foreign key and optional GraphQL relation names.
+     */
+    foreignKey(name: string, child_column: string, parent_table: string, parent_column: string, options?: ForeignKeyOptions | null): JsTableBuilder;
+    /**
      * Adds an index to the table.
      */
     index(name: string, columns: any): JsTableBuilder;
@@ -574,6 +632,23 @@ export class JsonbColumn {
      * Creates an exists expression for the JSONB path.
      */
     exists(): Expr;
+}
+
+/**
+ * A prepared GraphQL query that reuses the parsed document across executions.
+ */
+export class PreparedGraphqlQuery {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Executes the prepared GraphQL query with an optional variables object.
+     */
+    exec(variables?: any | null): any;
+    /**
+     * Creates a live subscription from a prepared GraphQL subscription document.
+     */
+    subscribe(variables?: any | null): JsGraphqlSubscription;
 }
 
 export class PreparedSelectQuery {
@@ -812,18 +887,21 @@ export interface InitOutput {
     readonly __wbg_database_free: (a: number, b: number) => void;
     readonly __wbg_deletebuilder_free: (a: number, b: number) => void;
     readonly __wbg_expr_free: (a: number, b: number) => void;
+    readonly __wbg_foreignkeyoptions_free: (a: number, b: number) => void;
     readonly __wbg_get_columnoptions_auto_increment: (a: number) => number;
     readonly __wbg_get_columnoptions_nullable: (a: number) => number;
     readonly __wbg_get_columnoptions_primary_key: (a: number) => number;
     readonly __wbg_get_columnoptions_unique: (a: number) => number;
     readonly __wbg_insertbuilder_free: (a: number, b: number) => void;
     readonly __wbg_jschangesstream_free: (a: number, b: number) => void;
+    readonly __wbg_jsgraphqlsubscription_free: (a: number, b: number) => void;
     readonly __wbg_jsivmobservablequery_free: (a: number, b: number) => void;
     readonly __wbg_jsobservablequery_free: (a: number, b: number) => void;
     readonly __wbg_jsonbcolumn_free: (a: number, b: number) => void;
     readonly __wbg_jstable_free: (a: number, b: number) => void;
     readonly __wbg_jstablebuilder_free: (a: number, b: number) => void;
     readonly __wbg_jstransaction_free: (a: number, b: number) => void;
+    readonly __wbg_preparedgraphqlquery_free: (a: number, b: number) => void;
     readonly __wbg_preparedselectquery_free: (a: number, b: number) => void;
     readonly __wbg_selectbuilder_free: (a: number, b: number) => void;
     readonly __wbg_set_columnoptions_auto_increment: (a: number, b: number) => void;
@@ -864,12 +942,16 @@ export interface InitOutput {
     readonly database_createTable: (a: number, b: number, c: number) => number;
     readonly database_delete: (a: number, b: number, c: number) => number;
     readonly database_dropTable: (a: number, b: number, c: number, d: number) => void;
+    readonly database_graphql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly database_graphqlSchema: (a: number, b: number) => void;
     readonly database_hasTable: (a: number, b: number, c: number) => number;
     readonly database_insert: (a: number, b: number, c: number) => number;
     readonly database_name: (a: number, b: number) => void;
     readonly database_new: (a: number, b: number) => number;
+    readonly database_prepareGraphql: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly database_registerTable: (a: number, b: number, c: number) => void;
     readonly database_select: (a: number, b: number) => number;
+    readonly database_subscribeGraphql: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly database_table: (a: number, b: number, c: number) => number;
     readonly database_tableCount: (a: number) => number;
     readonly database_tableNames: (a: number) => number;
@@ -881,6 +963,9 @@ export interface InitOutput {
     readonly expr_and: (a: number, b: number) => number;
     readonly expr_not: (a: number) => number;
     readonly expr_or: (a: number, b: number) => number;
+    readonly foreignkeyoptions_fieldName: (a: number, b: number, c: number) => number;
+    readonly foreignkeyoptions_new: () => number;
+    readonly foreignkeyoptions_reverseFieldName: (a: number, b: number, c: number) => number;
     readonly init: () => void;
     readonly insertbuilder_exec: (a: number) => number;
     readonly insertbuilder_values: (a: number, b: number) => number;
@@ -888,6 +973,9 @@ export interface InitOutput {
     readonly jschangesstream_getResultBinary: (a: number) => number;
     readonly jschangesstream_getSchemaLayout: (a: number) => number;
     readonly jschangesstream_subscribe: (a: number, b: number) => number;
+    readonly jsgraphqlsubscription_getResult: (a: number) => number;
+    readonly jsgraphqlsubscription_subscribe: (a: number, b: number) => number;
+    readonly jsgraphqlsubscription_subscriptionCount: (a: number) => number;
     readonly jsivmobservablequery_getResult: (a: number) => number;
     readonly jsivmobservablequery_getResultBinary: (a: number) => number;
     readonly jsivmobservablequery_getSchemaLayout: (a: number) => number;
@@ -914,6 +1002,7 @@ export interface InitOutput {
     readonly jstable_primaryKeyColumns: (a: number) => number;
     readonly jstablebuilder_build: (a: number, b: number) => void;
     readonly jstablebuilder_column: (a: number, b: number, c: number, d: number, e: number) => number;
+    readonly jstablebuilder_foreignKey: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => number;
     readonly jstablebuilder_index: (a: number, b: number, c: number, d: number) => number;
     readonly jstablebuilder_jsonbIndex: (a: number, b: number, c: number, d: number) => number;
     readonly jstablebuilder_name: (a: number, b: number) => void;
@@ -927,6 +1016,8 @@ export interface InitOutput {
     readonly jstransaction_rollback: (a: number, b: number) => void;
     readonly jstransaction_state: (a: number, b: number) => void;
     readonly jstransaction_update: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly preparedgraphqlquery_exec: (a: number, b: number, c: number) => void;
+    readonly preparedgraphqlquery_subscribe: (a: number, b: number, c: number) => void;
     readonly preparedselectquery_exec: (a: number) => number;
     readonly preparedselectquery_execBinary: (a: number) => number;
     readonly preparedselectquery_getSchemaLayout: (a: number) => number;
@@ -977,11 +1068,11 @@ export interface InitOutput {
     readonly schemalayout_columnType: (a: number, b: number) => number;
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
-    readonly __wasm_bindgen_func_elem_75: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2116: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_4945: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_2123: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_1015: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_79: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2202: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_6158: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_2209: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1053: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

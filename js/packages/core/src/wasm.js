@@ -604,6 +604,54 @@ export class Database {
         }
     }
     /**
+     * Executes a GraphQL query against the current database snapshot.
+     *
+     * Returns a standard GraphQL payload object with a single `data` property.
+     * @param {string} query
+     * @param {any | null} [variables]
+     * @param {string | null} [operation_name]
+     * @returns {any}
+     */
+    graphql(query, variables, operation_name) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(query, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            var ptr1 = isLikeNone(operation_name) ? 0 : passStringToWasm0(operation_name, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var len1 = WASM_VECTOR_LEN;
+            wasm.database_graphql(retptr, this.__wbg_ptr, ptr0, len0, isLikeNone(variables) ? 0 : addHeapObject(variables), ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Renders the current GraphQL schema as SDL.
+     * @returns {string}
+     */
+    graphqlSchema() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.database_graphqlSchema(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            deferred1_0 = r0;
+            deferred1_1 = r1;
+            return getStringFromWasm0(r0, r1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export4(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * Checks if a table exists.
      * @param {string} name
      * @returns {boolean}
@@ -658,6 +706,31 @@ export class Database {
         return this;
     }
     /**
+     * Parses and prepares a GraphQL query for repeated execution.
+     * @param {string} query
+     * @param {string | null} [operation_name]
+     * @returns {PreparedGraphqlQuery}
+     */
+    prepareGraphql(query, operation_name) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(query, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            var ptr1 = isLikeNone(operation_name) ? 0 : passStringToWasm0(operation_name, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var len1 = WASM_VECTOR_LEN;
+            wasm.database_prepareGraphql(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return PreparedGraphqlQuery.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Registers a table schema with the database.
      * @param {JsTableBuilder} builder
      */
@@ -689,6 +762,32 @@ export class Database {
             return SelectBuilder.__wrap(ret);
         } finally {
             heap[stack_pointer++] = undefined;
+        }
+    }
+    /**
+     * Creates a live GraphQL subscription backed by the root query planner path.
+     * @param {string} query
+     * @param {any | null} [variables]
+     * @param {string | null} [operation_name]
+     * @returns {JsGraphqlSubscription}
+     */
+    subscribeGraphql(query, variables, operation_name) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(query, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            var ptr1 = isLikeNone(operation_name) ? 0 : passStringToWasm0(operation_name, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            var len1 = WASM_VECTOR_LEN;
+            wasm.database_subscribeGraphql(retptr, this.__wbg_ptr, ptr0, len0, isLikeNone(variables) ? 0 : addHeapObject(variables), ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return JsGraphqlSubscription.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
         }
     }
     /**
@@ -845,6 +944,58 @@ export class Expr {
 if (Symbol.dispose) Expr.prototype[Symbol.dispose] = Expr.prototype.free;
 
 /**
+ * Foreign-key options for GraphQL relation naming.
+ */
+export class ForeignKeyOptions {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(ForeignKeyOptions.prototype);
+        obj.__wbg_ptr = ptr;
+        ForeignKeyOptionsFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        ForeignKeyOptionsFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_foreignkeyoptions_free(ptr, 0);
+    }
+    /**
+     * @param {string} value
+     * @returns {ForeignKeyOptions}
+     */
+    fieldName(value) {
+        const ptr = this.__destroy_into_raw();
+        const ptr0 = passStringToWasm0(value, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.foreignkeyoptions_fieldName(ptr, ptr0, len0);
+        return ForeignKeyOptions.__wrap(ret);
+    }
+    constructor() {
+        const ret = wasm.foreignkeyoptions_new();
+        this.__wbg_ptr = ret >>> 0;
+        ForeignKeyOptionsFinalization.register(this, this.__wbg_ptr, this);
+        return this;
+    }
+    /**
+     * @param {string} value
+     * @returns {ForeignKeyOptions}
+     */
+    reverseFieldName(value) {
+        const ptr = this.__destroy_into_raw();
+        const ptr0 = passStringToWasm0(value, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.foreignkeyoptions_reverseFieldName(ptr, ptr0, len0);
+        return ForeignKeyOptions.__wrap(ret);
+    }
+}
+if (Symbol.dispose) ForeignKeyOptions.prototype[Symbol.dispose] = ForeignKeyOptions.prototype.free;
+
+/**
  * INSERT query builder.
  */
 export class InsertBuilder {
@@ -971,6 +1122,59 @@ export const JsDataType = Object.freeze({
     Bytes: 6, "6": "Bytes",
     Jsonb: 7, "7": "Jsonb",
 });
+
+/**
+ * JavaScript-friendly GraphQL subscription wrapper.
+ *
+ * The callback receives a standard GraphQL payload object with a single `data`
+ * property. The payload is emitted immediately on subscribe and again whenever
+ * the root query result changes.
+ */
+export class JsGraphqlSubscription {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(JsGraphqlSubscription.prototype);
+        obj.__wbg_ptr = ptr;
+        JsGraphqlSubscriptionFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        JsGraphqlSubscriptionFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_jsgraphqlsubscription_free(ptr, 0);
+    }
+    /**
+     * Returns the current GraphQL payload.
+     * @returns {any}
+     */
+    getResult() {
+        const ret = wasm.jsgraphqlsubscription_getResult(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * Subscribes to GraphQL payload changes and emits the initial value immediately.
+     * @param {Function} callback
+     * @returns {Function}
+     */
+    subscribe(callback) {
+        const ret = wasm.jsgraphqlsubscription_subscribe(this.__wbg_ptr, addHeapObject(callback));
+        return takeObject(ret);
+    }
+    /**
+     * Returns the number of active subscriptions.
+     * @returns {number}
+     */
+    subscriptionCount() {
+        const ret = wasm.jsgraphqlsubscription_subscriptionCount(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+}
+if (Symbol.dispose) JsGraphqlSubscription.prototype[Symbol.dispose] = JsGraphqlSubscription.prototype.free;
 
 /**
  * JavaScript-friendly IVM observable query wrapper.
@@ -1317,6 +1521,33 @@ export class JsTableBuilder {
         return JsTableBuilder.__wrap(ret);
     }
     /**
+     * Adds a foreign key and optional GraphQL relation names.
+     * @param {string} name
+     * @param {string} child_column
+     * @param {string} parent_table
+     * @param {string} parent_column
+     * @param {ForeignKeyOptions | null} [options]
+     * @returns {JsTableBuilder}
+     */
+    foreignKey(name, child_column, parent_table, parent_column, options) {
+        const ptr = this.__destroy_into_raw();
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(child_column, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(parent_table, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len2 = WASM_VECTOR_LEN;
+        const ptr3 = passStringToWasm0(parent_column, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len3 = WASM_VECTOR_LEN;
+        let ptr4 = 0;
+        if (!isLikeNone(options)) {
+            _assertClass(options, ForeignKeyOptions);
+            ptr4 = options.__destroy_into_raw();
+        }
+        const ret = wasm.jstablebuilder_foreignKey(ptr, ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4);
+        return JsTableBuilder.__wrap(ret);
+    }
+    /**
      * Adds an index to the table.
      * @param {string} name
      * @param {any} columns
@@ -1636,6 +1867,70 @@ export class JsonbColumn {
     }
 }
 if (Symbol.dispose) JsonbColumn.prototype[Symbol.dispose] = JsonbColumn.prototype.free;
+
+/**
+ * A prepared GraphQL query that reuses the parsed document across executions.
+ */
+export class PreparedGraphqlQuery {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(PreparedGraphqlQuery.prototype);
+        obj.__wbg_ptr = ptr;
+        PreparedGraphqlQueryFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        PreparedGraphqlQueryFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_preparedgraphqlquery_free(ptr, 0);
+    }
+    /**
+     * Executes the prepared GraphQL query with an optional variables object.
+     * @param {any | null} [variables]
+     * @returns {any}
+     */
+    exec(variables) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.preparedgraphqlquery_exec(retptr, this.__wbg_ptr, isLikeNone(variables) ? 0 : addHeapObject(variables));
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return takeObject(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
+     * Creates a live subscription from a prepared GraphQL subscription document.
+     * @param {any | null} [variables]
+     * @returns {JsGraphqlSubscription}
+     */
+    subscribe(variables) {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.preparedgraphqlquery_subscribe(retptr, this.__wbg_ptr, isLikeNone(variables) ? 0 : addHeapObject(variables));
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return JsGraphqlSubscription.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+}
+if (Symbol.dispose) PreparedGraphqlQuery.prototype[Symbol.dispose] = PreparedGraphqlQuery.prototype.free;
 
 export class PreparedSelectQuery {
     static __wrap(ptr) {
@@ -2374,6 +2669,16 @@ function __wbg_get_imports() {
             const ret = Reflect.get(getObject(arg0), getObject(arg1));
             return addHeapObject(ret);
         }, arguments); },
+        __wbg_instanceof_Date_1b9f15b87f10aa4c: function(arg0) {
+            let result;
+            try {
+                result = getObject(arg0) instanceof Date;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_instanceof_Memory_dc8c61e3f831ee37: function(arg0) {
             let result;
             try {
@@ -2388,6 +2693,16 @@ function __wbg_get_imports() {
             let result;
             try {
                 result = getObject(arg0) instanceof Object;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
+        __wbg_instanceof_Uint8Array_9b9075935c74707c: function(arg0) {
+            let result;
+            try {
+                result = getObject(arg0) instanceof Uint8Array;
             } catch (_) {
                 result = false;
             }
@@ -2429,7 +2744,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_4945(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_6158(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -2464,6 +2779,10 @@ function __wbg_get_imports() {
             const ret = new Uint8Array(arg0 >>> 0);
             return addHeapObject(ret);
         },
+        __wbg_ownKeys_c7100fb5fa376c6f: function() { return handleError(function (arg0) {
+            const ret = Reflect.ownKeys(getObject(arg0));
+            return addHeapObject(ret);
+        }, arguments); },
         __wbg_parse_708461a1feddfb38: function() { return handleError(function (arg0, arg1) {
             const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
             return addHeapObject(ret);
@@ -2526,12 +2845,12 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_75, __wasm_bindgen_func_elem_1015);
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_79, __wasm_bindgen_func_elem_1053);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 206, function: Function { arguments: [Externref], shim_idx: 207, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_2116, __wasm_bindgen_func_elem_2123);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 213, function: Function { arguments: [Externref], shim_idx: 214, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_2202, __wasm_bindgen_func_elem_2209);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000003: function(arg0) {
@@ -2562,16 +2881,16 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1015(arg0, arg1) {
-    wasm.__wasm_bindgen_func_elem_1015(arg0, arg1);
+function __wasm_bindgen_func_elem_1053(arg0, arg1) {
+    wasm.__wasm_bindgen_func_elem_1053(arg0, arg1);
 }
 
-function __wasm_bindgen_func_elem_2123(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_2123(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_2209(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_2209(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_4945(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_4945(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_6158(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_6158(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const BinaryResultFinalization = (typeof FinalizationRegistry === 'undefined')
@@ -2592,12 +2911,18 @@ const DeleteBuilderFinalization = (typeof FinalizationRegistry === 'undefined')
 const ExprFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_expr_free(ptr >>> 0, 1));
+const ForeignKeyOptionsFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_foreignkeyoptions_free(ptr >>> 0, 1));
 const InsertBuilderFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_insertbuilder_free(ptr >>> 0, 1));
 const JsChangesStreamFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_jschangesstream_free(ptr >>> 0, 1));
+const JsGraphqlSubscriptionFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_jsgraphqlsubscription_free(ptr >>> 0, 1));
 const JsIvmObservableQueryFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_jsivmobservablequery_free(ptr >>> 0, 1));
@@ -2616,6 +2941,9 @@ const JsTransactionFinalization = (typeof FinalizationRegistry === 'undefined')
 const JsonbColumnFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_jsonbcolumn_free(ptr >>> 0, 1));
+const PreparedGraphqlQueryFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_preparedgraphqlquery_free(ptr >>> 0, 1));
 const PreparedSelectQueryFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_preparedselectquery_free(ptr >>> 0, 1));

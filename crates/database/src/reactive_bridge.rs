@@ -12,7 +12,7 @@
 //! Otherwise, falls back to re-query.
 
 use crate::binary_protocol::{BinaryEncoder, BinaryResult, SchemaLayout};
-use crate::convert::{row_to_js, value_to_js};
+use crate::convert::{gql_response_to_js, row_to_js, value_to_js};
 use crate::query_engine::{
     execute_compiled_physical_plan_with_summary, CompiledPhysicalPlan, QueryResultSummary,
 };
@@ -817,6 +817,112 @@ fn ivm_full_rows_to_js_array(rows: &[Row], schema: &Table) -> JsValue {
         arr.set(i as u32, obj.into());
     }
     arr.into()
+}
+
+/// JavaScript-friendly GraphQL subscription wrapper.
+///
+/// The callback receives a standard GraphQL payload object with a single `data`
+/// property. The payload is emitted immediately on subscribe and again whenever
+/// the root query result changes.
+#[wasm_bindgen]
+pub struct JsGraphqlSubscription {
+    inner: Rc<RefCell<ReQueryObservable>>,
+    cache: Rc<RefCell<TableCache>>,
+    catalog: cynos_gql::GraphqlCatalog,
+    field: cynos_gql::bind::BoundRootField,
+    keepalive_sub_id: usize,
+}
+
+impl JsGraphqlSubscription {
+    pub(crate) fn new(
+        inner: Rc<RefCell<ReQueryObservable>>,
+        cache: Rc<RefCell<TableCache>>,
+        catalog: cynos_gql::GraphqlCatalog,
+        field: cynos_gql::bind::BoundRootField,
+    ) -> Self {
+        let keepalive_sub_id = inner.borrow_mut().subscribe(|_| {});
+        Self {
+            inner,
+            cache,
+            catalog,
+            field,
+            keepalive_sub_id,
+        }
+    }
+
+    fn payload_for_rows(&self, rows: &[Rc<Row>]) -> JsValue {
+        let cache = self.cache.borrow();
+        let root_field =
+            match cynos_gql::execute::render_root_field_rows(&cache, &self.catalog, &self.field, rows)
+            {
+                Ok(field) => field,
+                Err(_) => return JsValue::NULL,
+            };
+
+        let response =
+            cynos_gql::GraphqlResponse::new(cynos_gql::ResponseValue::object(alloc::vec![root_field]));
+        gql_response_to_js(&response).unwrap_or(JsValue::NULL)
+    }
+}
+
+impl Drop for JsGraphqlSubscription {
+    fn drop(&mut self) {
+        self.inner.borrow_mut().unsubscribe(self.keepalive_sub_id);
+    }
+}
+
+#[wasm_bindgen]
+impl JsGraphqlSubscription {
+    /// Returns the current GraphQL payload.
+    #[wasm_bindgen(js_name = getResult)]
+    pub fn get_result(&self) -> JsValue {
+        let inner = self.inner.borrow();
+        self.payload_for_rows(inner.result())
+    }
+
+    /// Subscribes to GraphQL payload changes and emits the initial value immediately.
+    pub fn subscribe(&self, callback: js_sys::Function) -> js_sys::Function {
+        let initial = {
+            let inner = self.inner.borrow();
+            self.payload_for_rows(inner.result())
+        };
+        callback.call1(&JsValue::NULL, &initial).ok();
+
+        let inner = self.inner.clone();
+        let cache = self.cache.clone();
+        let catalog = self.catalog.clone();
+        let field = self.field.clone();
+        let sub_id = inner.borrow_mut().subscribe(move |rows| {
+            let cache = cache.borrow();
+            let payload = match cynos_gql::execute::render_root_field_rows(&cache, &catalog, &field, rows) {
+                Ok(root_field) => {
+                    let response = cynos_gql::GraphqlResponse::new(cynos_gql::ResponseValue::object(
+                        alloc::vec![root_field],
+                    ));
+                    gql_response_to_js(&response).unwrap_or(JsValue::NULL)
+                }
+                Err(_) => JsValue::NULL,
+            };
+            callback.call1(&JsValue::NULL, &payload).ok();
+        });
+
+        let called = Rc::new(RefCell::new(false));
+        let called_c = called.clone();
+        let unsubscribe = Closure::wrap(Box::new(move || {
+            let mut c = called_c.borrow_mut();
+            if !*c {
+                *c = true;
+                inner.borrow_mut().unsubscribe(sub_id);
+            }
+        }) as Box<dyn FnMut()>);
+        unsubscribe.into_js_value().unchecked_into()
+    }
+
+    /// Returns the number of active subscriptions.
+    #[wasm_bindgen(js_name = subscriptionCount)]
+    pub fn subscription_count(&self) -> usize {
+        self.inner.borrow().subscription_count().saturating_sub(1)
+    }
 }
 
 /// JavaScript-friendly changes stream.

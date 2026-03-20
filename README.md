@@ -18,6 +18,7 @@ The public JS package lives in `js/packages/core` as `@cynos/core`. The Rust cra
   - `changes()`: cached query execution, callback receives the full current result set immediately and on later changes.
   - `trace()`: incremental view maintenance (IVM), callback receives `{ added, removed }` deltas for incrementalizable queries.
 - Prepared query handles via `prepare()`, which reuse the compiled physical plan and expose `exec()`, `execBinary()`, and `getSchemaLayout()` for repeated execution.
+- A Rust/WASM-first GraphQL adapter via `cynos-gql`, including generated SDL, root `query` / `mutation` / `subscription` fields, prepared GraphQL operations, and planner-backed root-table execution for `where` / `orderBy` / `limit` / `offset`.
 - Compiled single-table execution fast paths that can fuse scan/filter/project work and apply row-local reactive patches for simple subscriptions instead of always re-running the full query.
 - Binary query results via `execBinary()` + `getSchemaLayout()` + `ResultSet` for low-overhead WASM-to-JS transfer.
 - JSONB building blocks including a compact binary codec, a JSONPath subset parser/evaluator, JSONB operators, and extraction helpers for GIN indexing.
@@ -87,6 +88,7 @@ Less ideal when durability, SQL compatibility, or sync ecosystem breadth matter 
 | `crates/reactive` | Delta-based observable queries on top of incremental views |
 | `crates/jsonb` | JSONB value model, binary codec, JSONPath subset, and operators |
 | `crates/binary` | Compact binary row encoding for WASM/JS transfer |
+| `crates/gql` | GraphQL AST, parser, schema generation, binding, planner lowering, and execution |
 | `crates/database` | WASM/JS-facing database API that stitches the other crates together |
 | `crates/perf` | Custom benchmark runner for the workspace |
 | `js/packages/core` | Published NPM package `@cynos/core` |
@@ -101,6 +103,7 @@ At a high level, Cynos is layered so the storage, planning, incremental, and hos
 Application code
   -> @cynos/core (js/packages/core)
       -> cynos-database (wasm-bindgen host API)
+          -> cynos-gql          -> GraphQL schema / parser / binder / planner lowering
           -> cynos-query        -> logical plan / physical plan / executors
           -> cynos-storage      -> row store / constraints / transaction journal
           -> cynos-index        -> B+Tree / hash / GIN primitives
@@ -171,6 +174,231 @@ Notes:
 - `select()` accepts `'*'`, a single column name, an array of column names, or multiple variadic column arguments.
 - `prepare()` returns a reusable handle with `exec()`, `execBinary()`, and `getSchemaLayout()` when the same query shape runs repeatedly.
 - For joins, use column references on both sides, for example `col('orders.user_id').eq(col('users.id'))`.
+
+## GraphQL Quick Start
+
+Cynos can expose the current table cache as a GraphQL schema directly from Rust/WASM. The GraphQL layer lives in `cynos-gql`, and the JS package exposes it through:
+
+- `db.graphqlSchema()`: render the current schema as SDL
+- `db.graphql(query, variables?, operationName?)`: execute a query or mutation and return `{ data }`
+- `db.subscribeGraphql(query, variables?, operationName?)`: create a live GraphQL subscription
+- `db.prepareGraphql(query, operationName?)`: reuse a parsed GraphQL document across executions
+
+Example schema setup with explicit relation names:
+
+```ts
+import {
+  ColumnOptions,
+  ForeignKeyOptions,
+  JsDataType,
+  createDatabase,
+  initCynos,
+} from '@cynos/core';
+
+await initCynos();
+const db = createDatabase('graphql-demo');
+
+db.registerTable(
+  db.createTable('users')
+    .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('name', JsDataType.String)
+);
+
+db.registerTable(
+  db.createTable('posts')
+    .column('id', JsDataType.Int64, new ColumnOptions().primaryKey(true))
+    .column('author_id', JsDataType.Int64)
+    .column('title', JsDataType.String)
+    .foreignKey(
+      'fk_posts_author',
+      'author_id',
+      'users',
+      'id',
+      new ForeignKeyOptions()
+        .fieldName('author')
+        .reverseFieldName('posts')
+    )
+);
+
+console.log(db.graphqlSchema());
+```
+
+### Query syntax
+
+Root query fields are generated per table:
+
+- collection query: `users`, `posts`, ...
+- primary-key query: `usersByPk`, `postsByPk`, ...
+
+Collection fields accept `where`, `orderBy`, `limit`, and `offset`.
+
+```graphql
+query GetUsers($minId: Long!) {
+  users(
+    where: { id: { gte: $minId } }
+    orderBy: [{ field: ID, direction: ASC }]
+    limit: 10
+  ) {
+    id
+    name
+    posts(orderBy: [{ field: ID, direction: DESC }], limit: 5) {
+      id
+      title
+    }
+  }
+}
+```
+
+Primary-key lookup:
+
+```graphql
+{
+  usersByPk(pk: { id: 1 }) {
+    id
+    name
+  }
+}
+```
+
+Planner note: root collection queries and `ByPk` queries are lowered into the existing `cynos-query` planner path, so root `where` / `orderBy` / `limit` / `offset` can benefit from the same index-aware execution as the native query builder.
+
+### Mutation syntax
+
+Each table generates three root mutations based on the GraphQL type name:
+
+- `insertUsers`
+- `updateUsers`
+- `deleteUsers`
+
+Examples:
+
+```graphql
+mutation {
+  insertUsers(input: [{ id: 1, name: "Alice" }]) {
+    id
+    name
+  }
+}
+```
+
+```graphql
+mutation {
+  updateUsers(
+    where: { id: { eq: 1 } }
+    set: { name: "Alicia" }
+  ) {
+    id
+    name
+  }
+}
+```
+
+```graphql
+mutation {
+  deleteUsers(where: { id: { eq: 1 } }) {
+    id
+    name
+  }
+}
+```
+
+`update<Type>` and `delete<Type>` reuse the same collection arguments as root queries, so `where`, `orderBy`, `limit`, and `offset` also shape the mutation target set.
+
+### Subscription syntax
+
+Subscriptions use the same root field shapes as queries and return standard GraphQL `{ data }` payloads in JS:
+
+```ts
+const sub = db.subscribeGraphql(`
+  subscription {
+    users(orderBy: [{ field: ID, direction: ASC }]) {
+      id
+      name
+    }
+  }
+`);
+
+console.log(sub.getResult());
+
+const stop = sub.subscribe((payload) => {
+  console.log(payload.data.users);
+});
+```
+
+Prepared GraphQL documents also support live subscriptions:
+
+```ts
+const prepared = db.prepareGraphql(
+  `
+    subscription UserFeed {
+      users(orderBy: [{ field: ID, direction: ASC }]) {
+        id
+        name
+      }
+    }
+  `,
+  'UserFeed'
+);
+
+const sub = prepared.subscribe();
+```
+
+### Filters, ordering, and scalars
+
+The generated schema includes table-specific inputs such as:
+
+- `UsersWhereInput`
+- `UsersOrderByInput`
+- `UsersPkInput`
+- `UsersInsertInput`
+- `UsersPatchInput`
+
+Common filter operators:
+
+- Boolean: `eq`, `ne`, `isNull`
+- Numeric / DateTime: `eq`, `ne`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`, `between`, `isNull`
+- String / Bytes: `eq`, `ne`, `in`, `notIn`, `gt`, `gte`, `lt`, `lte`, `like`, `isNull`
+- JSON: `path`, `eq`, `contains`, `exists`, `isNull`
+- Logical composition: `AND`, `OR`
+
+Example:
+
+```graphql
+{
+  users(
+    where: {
+      AND: [
+        { id: { between: [1, 100] } }
+        { name: { like: "Al%" } }
+      ]
+    }
+    orderBy: [{ field: ID, direction: DESC }]
+  ) {
+    id
+    name
+  }
+}
+```
+
+Current scalar mapping:
+
+- `Int32 -> Int`
+- `Int64 -> Long`
+- `Float64 -> Float`
+- `DateTime -> DateTime`
+- `Bytes -> Bytes`
+- `Jsonb -> JSON`
+
+### Current GraphQL subset limits
+
+The current GraphQL surface is intentionally focused on table access and live queries. Today it does not support:
+
+- fragments
+- directives
+- full GraphQL introspection
+- multi-root subscriptions
+
+`__typename` is supported, but GraphQL subscriptions must select exactly one concrete root field.
 
 ## Reactive Modes
 
@@ -397,6 +625,7 @@ Notes:
 - Cynos is in-memory only. There is no durable on-disk storage engine yet.
 - Transactions are journaled commit/rollback over in-memory state; this is not durable storage in the traditional ACID database sense.
 - `trace()` only works for plans that the physical planner can lower to incremental dataflow.
+- The GraphQL layer is currently a focused table/query subset: fragments, directives, and full introspection are not implemented yet, and subscriptions currently require a single concrete root field.
 - Storage/query integration currently materializes B+Tree and GIN indexes from schema definitions. A standalone hash index implementation also exists in the workspace, but it is not the default secondary-index path in `RowStore` today.
 - JavaScript `Int64` values are exposed through JS-friendly paths as numbers, so values outside the safe integer range lose precision unless the calling pattern is designed around that limitation.
 
