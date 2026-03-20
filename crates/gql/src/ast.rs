@@ -69,6 +69,7 @@ pub struct Field {
     pub alias: Option<String>,
     pub name: String,
     pub arguments: Vec<Argument>,
+    pub directives: Vec<Directive>,
     pub selection_set: Option<SelectionSet>,
 }
 
@@ -82,6 +83,12 @@ impl Field {
 pub struct Argument {
     pub name: String,
     pub value: InputValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Directive {
+    pub name: String,
+    pub arguments: Vec<Argument>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

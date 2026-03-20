@@ -199,4 +199,82 @@ describe('GraphQL', () => {
       users: [{ id: 2, name: 'Bob' }],
     });
   });
+
+  it('supports include and skip directives with variables', async () => {
+    const db = createGraphqlDb();
+
+    await db.insert('users').values([
+      { id: 1, name: 'Alice' },
+      { id: 2, name: 'Bob' },
+    ]).exec();
+    await db.insert('posts').values([
+      { id: 10, author_id: 1, title: 'Hello' },
+      { id: 11, author_id: 2, title: 'World' },
+    ]).exec();
+
+    const query = `
+      query Feed($showUsers: Boolean!, $showPosts: Boolean!, $hideName: Boolean!) {
+        users @include(if: $showUsers) {
+          id
+          name @skip(if: $hideName)
+          posts @include(if: $showPosts) {
+            id
+            title
+          }
+        }
+        posts @include(if: $showPosts) {
+          id
+        }
+      }
+    `;
+
+    const withUsersOnly = db.graphql(query, {
+      showUsers: true,
+      showPosts: false,
+      hideName: true,
+    });
+    expect(dataOf(withUsersOnly)).toEqual({
+      users: [
+        { id: 1 },
+        { id: 2 },
+      ],
+    });
+
+    const withoutRoots = db.graphql(query, {
+      showUsers: false,
+      showPosts: false,
+      hideName: false,
+    });
+    expect(dataOf(withoutRoots)).toEqual({});
+  });
+
+  it('applies directive pruning before validating subscription root selection', async () => {
+    const db = createGraphqlDb();
+
+    await db.insert('users').values([
+      { id: 1, name: 'Alice' },
+    ]).exec();
+
+    const subscription = db.subscribeGraphql(
+      `
+        subscription Feed($showUsers: Boolean!, $showPosts: Boolean!) {
+          users @include(if: $showUsers) {
+            id
+            name
+          }
+          posts @include(if: $showPosts) {
+            id
+          }
+        }
+      `,
+      {
+        showUsers: true,
+        showPosts: false,
+      }
+    );
+
+    expect(dataOf(subscription.getResult())).toEqual({
+      users: [{ id: 1, name: 'Alice' }],
+    });
+  });
 });
