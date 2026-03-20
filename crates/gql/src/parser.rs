@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::ast::{
-    Argument, Document, Field, FloatValue, InputValue, ObjectField, OperationDefinition,
+    Argument, Directive, Document, Field, FloatValue, InputValue, ObjectField, OperationDefinition,
     OperationType, SelectionSet, TypeReference, VariableDefinition,
 };
 use crate::error::{GqlError, GqlErrorKind, GqlResult};
@@ -82,7 +82,7 @@ impl<'a> Parser<'a> {
         if self.peek_char() == Some('@') {
             return Err(GqlError::new(
                 GqlErrorKind::Unsupported,
-                "directives are not supported yet",
+                "directives are only supported on fields",
             ));
         }
 
@@ -192,12 +192,7 @@ impl<'a> Parser<'a> {
             Vec::new()
         };
 
-        if self.peek_char() == Some('@') {
-            return Err(GqlError::new(
-                GqlErrorKind::Unsupported,
-                "directives are not supported yet",
-            ));
-        }
+        let directives = self.parse_directives()?;
 
         self.skip_ignored();
         let selection_set = if self.peek_char() == Some('{') {
@@ -210,8 +205,30 @@ impl<'a> Parser<'a> {
             alias,
             name,
             arguments,
+            directives,
             selection_set,
         })
+    }
+
+    fn parse_directives(&mut self) -> GqlResult<Vec<Directive>> {
+        let mut directives = Vec::new();
+        loop {
+            self.skip_ignored();
+            if self.peek_char() != Some('@') {
+                break;
+            }
+
+            self.advance_char();
+            let name = self.parse_name()?;
+            self.skip_ignored();
+            let arguments = if self.peek_char() == Some('(') {
+                self.parse_arguments()?
+            } else {
+                Vec::new()
+            };
+            directives.push(Directive { name, arguments });
+        }
+        Ok(directives)
     }
 
     fn parse_arguments(&mut self) -> GqlResult<Vec<Argument>> {
@@ -354,9 +371,9 @@ impl<'a> Parser<'a> {
         self.expect_char('"')?;
         let mut out = String::new();
         loop {
-            let ch = self
-                .advance_char()
-                .ok_or_else(|| GqlError::new(GqlErrorKind::Syntax, "unterminated string literal"))?;
+            let ch = self.advance_char().ok_or_else(|| {
+                GqlError::new(GqlErrorKind::Syntax, "unterminated string literal")
+            })?;
             match ch {
                 '"' => break,
                 '\\' => {
@@ -439,7 +456,10 @@ impl<'a> Parser<'a> {
             Some(ch) if ch == expected => Ok(()),
             Some(ch) => Err(GqlError::new(
                 GqlErrorKind::Syntax,
-                format!("expected `{}`, found `{}` at offset {}", expected, ch, self.pos),
+                format!(
+                    "expected `{}`, found `{}` at offset {}",
+                    expected, ch, self.pos
+                ),
             )),
             None => Err(GqlError::new(
                 GqlErrorKind::Syntax,
@@ -500,7 +520,12 @@ mod tests {
         assert_eq!(operation.variable_definitions.len(), 2);
         let field = &operation.selection_set.fields[0];
         assert_eq!(field.name, "orders");
-        assert_eq!(field.selection_set.as_ref().unwrap().fields[0].alias.as_deref(), Some("nodeId"));
+        assert_eq!(
+            field.selection_set.as_ref().unwrap().fields[0]
+                .alias
+                .as_deref(),
+            Some("nodeId")
+        );
     }
 
     #[test]
@@ -512,5 +537,24 @@ mod tests {
             InputValue::Object(fields) => assert_eq!(fields.len(), 3),
             other => panic!("unexpected where value: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_field_directives_with_arguments() {
+        let doc = parse_document(
+            "query Feed($showUsers: Boolean!, $withPosts: Boolean!) { users @include(if: $showUsers) { id posts @skip(if: $withPosts) { id } } }",
+        )
+        .unwrap();
+
+        let root_field = &doc.operations[0].selection_set.fields[0];
+        assert_eq!(root_field.name, "users");
+        assert_eq!(root_field.directives.len(), 1);
+        assert_eq!(root_field.directives[0].name, "include");
+        assert_eq!(root_field.directives[0].arguments[0].name, "if");
+
+        let nested_field = &root_field.selection_set.as_ref().unwrap().fields[1];
+        assert_eq!(nested_field.name, "posts");
+        assert_eq!(nested_field.directives.len(), 1);
+        assert_eq!(nested_field.directives[0].name, "skip");
     }
 }

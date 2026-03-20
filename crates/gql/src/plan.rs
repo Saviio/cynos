@@ -14,7 +14,10 @@ use cynos_query::executor::{DataSource, ExecutionError, ExecutionResult, Physica
 use cynos_query::planner::{LogicalPlan, QueryPlanner};
 use cynos_storage::TableCache;
 
-use crate::bind::{BoundCollectionQuery, BoundFilter, BoundRootField, BoundRootFieldKind, JsonPredicate, PredicateOp};
+use crate::bind::{
+    BoundCollectionQuery, BoundFilter, BoundRootField, BoundRootFieldKind, JsonPredicate,
+    PredicateOp,
+};
 use crate::catalog::{GraphqlCatalog, TableMeta};
 use crate::error::{GqlError, GqlErrorKind, GqlResult};
 
@@ -30,9 +33,7 @@ pub fn build_root_field_plan(
 ) -> GqlResult<RootFieldPlan> {
     match &field.kind {
         BoundRootFieldKind::Collection {
-            table_name,
-            query,
-            ..
+            table_name, query, ..
         } => {
             let table = catalog.table(table_name).ok_or_else(|| {
                 GqlError::new(
@@ -90,7 +91,10 @@ pub(crate) fn build_table_query_plan(
             let column = table.column_by_index(spec.column_index).ok_or_else(|| {
                 GqlError::new(
                     GqlErrorKind::Binding,
-                    format!("column index {} was not found on `{}`", spec.column_index, table_name),
+                    format!(
+                        "column index {} was not found on `{}`",
+                        spec.column_index, table_name
+                    ),
                 )
             })?;
             order_by.push((
@@ -141,7 +145,11 @@ pub(crate) fn execute_logical_plan(
         })
 }
 
-fn build_by_pk_plan(table_name: &str, table: &TableMeta, pk_values: &[Value]) -> GqlResult<LogicalPlan> {
+fn build_by_pk_plan(
+    table_name: &str,
+    table: &TableMeta,
+    pk_values: &[Value],
+) -> GqlResult<LogicalPlan> {
     let pk = table.primary_key().ok_or_else(|| {
         GqlError::new(
             GqlErrorKind::Binding,
@@ -177,7 +185,11 @@ fn build_by_pk_plan(table_name: &str, table: &TableMeta, pk_values: &[Value]) ->
     })
 }
 
-fn build_filter_expr(table_name: &str, table: &TableMeta, filter: &BoundFilter) -> GqlResult<AstExpr> {
+fn build_filter_expr(
+    table_name: &str,
+    table: &TableMeta,
+    filter: &BoundFilter,
+) -> GqlResult<AstExpr> {
     match filter {
         BoundFilter::And(filters) => {
             let mut expressions = Vec::with_capacity(filters.len());
@@ -194,15 +206,17 @@ fn build_filter_expr(table_name: &str, table: &TableMeta, filter: &BoundFilter) 
             Ok(or_all(expressions))
         }
         BoundFilter::Column(predicate) => {
-            let column = table.column_by_index(predicate.column_index).ok_or_else(|| {
-                GqlError::new(
-                    GqlErrorKind::Binding,
-                    format!(
-                        "column index {} was not found on `{}`",
-                        predicate.column_index, table_name
-                    ),
-                )
-            })?;
+            let column = table
+                .column_by_index(predicate.column_index)
+                .ok_or_else(|| {
+                    GqlError::new(
+                        GqlErrorKind::Binding,
+                        format!(
+                            "column index {} was not found on `{}`",
+                            predicate.column_index, table_name
+                        ),
+                    )
+                })?;
             let column_expr = AstExpr::column(table_name, &column.name, column.index);
             let mut expressions = Vec::with_capacity(predicate.ops.len());
             for op in &predicate.ops {
@@ -235,7 +249,10 @@ fn build_predicate_expr(column_expr: AstExpr, op: &PredicateOp) -> GqlResult<Ast
     }
 }
 
-fn build_json_predicate_expr(column_expr: AstExpr, predicate: &JsonPredicate) -> GqlResult<AstExpr> {
+fn build_json_predicate_expr(
+    column_expr: AstExpr,
+    predicate: &JsonPredicate,
+) -> GqlResult<AstExpr> {
     let mut expressions = Vec::new();
 
     if let Some(exists) = predicate.exists {
@@ -271,7 +288,10 @@ fn build_json_predicate_expr(column_expr: AstExpr, predicate: &JsonPredicate) ->
                     )
                 })?,
             ),
-            None => AstExpr::eq(column_expr.clone(), AstExpr::literal(jsonb_value_to_literal(expected))),
+            None => AstExpr::eq(
+                column_expr.clone(),
+                AstExpr::literal(jsonb_value_to_literal(expected)),
+            ),
         };
         expressions.push(expression);
     }
@@ -546,6 +566,7 @@ fn register_table_context(cache: &TableCache, ctx: &mut ExecutionContext, table_
 mod tests {
     use super::*;
     use crate::query::PreparedQuery;
+    use alloc::collections::BTreeMap;
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Row};
     use cynos_query::planner::PhysicalPlan;
@@ -649,5 +670,31 @@ mod tests {
         let rows = execute_logical_plan(&cache, &plan.table_name, plan.logical_plan).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0), Some(&Value::Int64(2)));
+    }
+
+    #[test]
+    fn directive_pruning_keeps_remaining_root_field_on_planner_path() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let prepared = PreparedQuery::parse_with_operation(
+            "query Lookup($skipUsers: Boolean!, $id: Long!) { users @skip(if: $skipUsers) { id } usersByPk(pk: { id: $id }) @include(if: true) { id name } }",
+            Some("Lookup"),
+        )
+        .unwrap();
+
+        let mut variables = BTreeMap::new();
+        variables.insert("skipUsers".into(), crate::ast::InputValue::Boolean(true));
+        variables.insert("id".into(), crate::ast::InputValue::Int(2));
+
+        let bound = prepared.bind(&catalog, Some(&variables)).unwrap();
+        assert_eq!(bound.fields.len(), 1);
+
+        let field = &bound.fields[0];
+        let plan = build_root_field_plan(&catalog, field).unwrap();
+        let logical = plan.logical_plan.clone();
+        let ctx = build_execution_context_for_plan(&cache, &plan.table_name, &logical);
+        let physical = QueryPlanner::new(ctx).plan(logical);
+
+        assert!(matches!(physical, PhysicalPlan::IndexGet { .. }));
     }
 }
