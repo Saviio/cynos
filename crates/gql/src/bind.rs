@@ -8,8 +8,13 @@ use cynos_core::{DataType, Value};
 use cynos_jsonb::{JsonbBinary, JsonbObject, JsonbValue};
 use hashbrown::HashSet;
 
-use crate::ast::{Document, Field, InputValue, ObjectField, OperationDefinition, OperationType, SelectionSet};
-use crate::catalog::{ColumnMeta, GraphqlCatalog, RelationMeta, RootFieldKind, TableFieldMeta, TableMeta};
+use crate::ast::{
+    Directive, Document, Field, InputValue, ObjectField, OperationDefinition, OperationType,
+    SelectionSet,
+};
+use crate::catalog::{
+    ColumnMeta, GraphqlCatalog, RelationMeta, RootFieldKind, TableFieldMeta, TableMeta,
+};
 use crate::error::{GqlError, GqlErrorKind, GqlResult};
 
 #[derive(Clone, Debug)]
@@ -211,6 +216,10 @@ fn bind_operation(
 ) -> GqlResult<BoundOperation> {
     let mut fields = Vec::with_capacity(operation.selection_set.fields.len());
     for field in &operation.selection_set.fields {
+        if !should_include_field(field, variables)? {
+            continue;
+        }
+
         if field.name == "__typename" {
             validate_leaf_field(field)?;
             fields.push(BoundRootField {
@@ -220,12 +229,14 @@ fn bind_operation(
             continue;
         }
 
-        let root_field = catalog.root_field(operation.kind, &field.name).ok_or_else(|| {
-            GqlError::new(
-                GqlErrorKind::Validation,
-                format!("unknown root field `{}`", field.name),
-            )
-        })?;
+        let root_field = catalog
+            .root_field(operation.kind, &field.name)
+            .ok_or_else(|| {
+                GqlError::new(
+                    GqlErrorKind::Validation,
+                    format!("unknown root field `{}`", field.name),
+                )
+            })?;
         let table = catalog.table(&root_field.table_name).ok_or_else(|| {
             GqlError::new(
                 GqlErrorKind::Binding,
@@ -254,12 +265,7 @@ fn bind_operation(
                 let arguments = materialize_argument_map(field, variables)?;
                 BoundRootFieldKind::Update {
                     table_name: root_field.table_name.clone(),
-                    query: bind_collection_arguments_from_map(
-                        field,
-                        table,
-                        &arguments,
-                        &["set"],
-                    )?,
+                    query: bind_collection_arguments_from_map(field, table, &arguments, &["set"])?,
                     assignments: bind_assignments_from_map(field, table, &arguments)?,
                     selection: bind_required_selection_set(field, table, catalog, variables)?,
                 }
@@ -303,6 +309,10 @@ fn bind_selection_set(
 ) -> GqlResult<BoundSelectionSet> {
     let mut fields = Vec::with_capacity(selection_set.fields.len());
     for field in &selection_set.fields {
+        if !should_include_field(field, variables)? {
+            continue;
+        }
+
         if field.name == "__typename" {
             validate_leaf_field(field)?;
             fields.push(BoundField::Typename {
@@ -517,7 +527,11 @@ fn bind_assignments_from_map(
     table: &TableMeta,
     arguments: &BTreeMap<String, InputValue>,
 ) -> GqlResult<Vec<BoundColumnAssignment>> {
-    validate_allowed_arguments(field, arguments, &["set", "where", "orderBy", "limit", "offset"])?;
+    validate_allowed_arguments(
+        field,
+        arguments,
+        &["set", "where", "orderBy", "limit", "offset"],
+    )?;
 
     let set_value = arguments.get("set").ok_or_else(|| {
         GqlError::new(
@@ -567,12 +581,24 @@ fn materialize_argument_map(
     field: &Field,
     variables: &VariableValues,
 ) -> GqlResult<BTreeMap<String, InputValue>> {
+    materialize_argument_map_with_context(&field.arguments, "field", &field.name, variables)
+}
+
+fn materialize_argument_map_with_context(
+    source_arguments: &[crate::ast::Argument],
+    owner_kind: &str,
+    owner_name: &str,
+    variables: &VariableValues,
+) -> GqlResult<BTreeMap<String, InputValue>> {
     let mut arguments = BTreeMap::new();
-    for argument in &field.arguments {
+    for argument in source_arguments.iter() {
         if arguments.contains_key(&argument.name) {
             return Err(GqlError::new(
                 GqlErrorKind::Validation,
-                format!("duplicate argument `{}` on field `{}`", argument.name, field.name),
+                format!(
+                    "duplicate argument `{}` on {} `{}`",
+                    argument.name, owner_kind, owner_name
+                ),
             ));
         }
         arguments.insert(
@@ -583,7 +609,70 @@ fn materialize_argument_map(
     Ok(arguments)
 }
 
-fn materialize_input_value(value: &InputValue, variables: &VariableValues) -> GqlResult<InputValue> {
+fn should_include_field(field: &Field, variables: &VariableValues) -> GqlResult<bool> {
+    let mut include = true;
+    let mut seen = HashSet::new();
+
+    for directive in &field.directives {
+        if !seen.insert(directive.name.as_str()) {
+            return Err(GqlError::new(
+                GqlErrorKind::Validation,
+                format!(
+                    "directive `@{}` can only appear once on field `{}`",
+                    directive.name, field.name
+                ),
+            ));
+        }
+
+        match directive.name.as_str() {
+            "include" => {
+                include &= directive_if_argument(directive, field, variables)?;
+            }
+            "skip" => {
+                if directive_if_argument(directive, field, variables)? {
+                    return Ok(false);
+                }
+            }
+            other => {
+                return Err(GqlError::new(
+                    GqlErrorKind::Unsupported,
+                    format!("directive `@{}` is not supported", other),
+                ))
+            }
+        }
+    }
+
+    Ok(include)
+}
+
+fn directive_if_argument(
+    directive: &Directive,
+    field: &Field,
+    variables: &VariableValues,
+) -> GqlResult<bool> {
+    let arguments = materialize_argument_map_with_context(
+        &directive.arguments,
+        "directive",
+        &directive.name,
+        variables,
+    )?;
+    validate_allowed_directive_arguments(field, directive, &arguments, &["if"])?;
+    let if_value = arguments.get("if").ok_or_else(|| {
+        GqlError::new(
+            GqlErrorKind::Validation,
+            format!(
+                "directive `@{}` on field `{}` requires an `if` argument",
+                directive.name, field.name
+            ),
+        )
+    })?;
+    coerce_boolean(if_value)
+}
+
+fn materialize_input_value(
+    value: &InputValue,
+    variables: &VariableValues,
+) -> GqlResult<InputValue> {
     match value {
         InputValue::Variable(name) => variables.get(name).cloned().ok_or_else(|| {
             GqlError::new(
@@ -624,10 +713,16 @@ fn bind_where(value: &InputValue, table: &TableMeta) -> GqlResult<Option<BoundFi
                 let column = table.column(column_name).ok_or_else(|| {
                     GqlError::new(
                         GqlErrorKind::Validation,
-                        format!("unknown filter column `{}` on `{}`", column_name, table.graphql_name),
+                        format!(
+                            "unknown filter column `{}` on `{}`",
+                            column_name, table.graphql_name
+                        ),
                     )
                 })?;
-                predicates.push(BoundFilter::Column(bind_column_predicate(column, &field.value)?));
+                predicates.push(BoundFilter::Column(bind_column_predicate(
+                    column,
+                    &field.value,
+                )?));
             }
         }
     }
@@ -671,7 +766,9 @@ fn bind_column_predicate(column: &ColumnMeta, value: &InputValue) -> GqlResult<C
 
     match value {
         InputValue::Object(fields) => bind_column_predicate_object(&mut predicate, fields)?,
-        other => predicate.ops.push(PredicateOp::Eq(coerce_value(other, column.data_type)?)),
+        other => predicate
+            .ops
+            .push(PredicateOp::Eq(coerce_value(other, column.data_type)?)),
     }
 
     if predicate.ops.is_empty() {
@@ -693,7 +790,9 @@ fn bind_column_predicate_object(
 
     for field in fields {
         match field.name.as_str() {
-            "isNull" => predicate.ops.push(PredicateOp::IsNull(coerce_boolean(&field.value)?)),
+            "isNull" => predicate
+                .ops
+                .push(PredicateOp::IsNull(coerce_boolean(&field.value)?)),
             "eq" if predicate.data_type == DataType::Jsonb => {
                 saw_json_specific = true;
                 json_predicate.eq = Some(input_to_jsonb_value(&field.value)?);
@@ -728,31 +827,38 @@ fn bind_column_predicate_object(
                 saw_json_specific = true;
                 json_predicate.path = Some(coerce_string(&field.value)?);
             }
-            "eq" => predicate
-                .ops
-                .push(PredicateOp::Eq(coerce_value(&field.value, predicate.data_type)?)),
-            "ne" => predicate
-                .ops
-                .push(PredicateOp::Ne(coerce_value(&field.value, predicate.data_type)?)),
-            "in" => predicate
-                .ops
-                .push(PredicateOp::In(coerce_value_list(&field.value, predicate.data_type)?)),
+            "eq" => predicate.ops.push(PredicateOp::Eq(coerce_value(
+                &field.value,
+                predicate.data_type,
+            )?)),
+            "ne" => predicate.ops.push(PredicateOp::Ne(coerce_value(
+                &field.value,
+                predicate.data_type,
+            )?)),
+            "in" => predicate.ops.push(PredicateOp::In(coerce_value_list(
+                &field.value,
+                predicate.data_type,
+            )?)),
             "notIn" => predicate.ops.push(PredicateOp::NotIn(coerce_value_list(
                 &field.value,
                 predicate.data_type,
             )?)),
-            "gt" => predicate
-                .ops
-                .push(PredicateOp::Gt(coerce_value(&field.value, predicate.data_type)?)),
-            "gte" => predicate
-                .ops
-                .push(PredicateOp::Gte(coerce_value(&field.value, predicate.data_type)?)),
-            "lt" => predicate
-                .ops
-                .push(PredicateOp::Lt(coerce_value(&field.value, predicate.data_type)?)),
-            "lte" => predicate
-                .ops
-                .push(PredicateOp::Lte(coerce_value(&field.value, predicate.data_type)?)),
+            "gt" => predicate.ops.push(PredicateOp::Gt(coerce_value(
+                &field.value,
+                predicate.data_type,
+            )?)),
+            "gte" => predicate.ops.push(PredicateOp::Gte(coerce_value(
+                &field.value,
+                predicate.data_type,
+            )?)),
+            "lt" => predicate.ops.push(PredicateOp::Lt(coerce_value(
+                &field.value,
+                predicate.data_type,
+            )?)),
+            "lte" => predicate.ops.push(PredicateOp::Lte(coerce_value(
+                &field.value,
+                predicate.data_type,
+            )?)),
             "between" => {
                 let values = coerce_value_list(&field.value, predicate.data_type)?;
                 if values.len() != 2 {
@@ -766,13 +872,16 @@ fn bind_column_predicate_object(
                     .push(PredicateOp::Between(values[0].clone(), values[1].clone()));
             }
             "like" => {
-                if predicate.data_type != DataType::String && predicate.data_type != DataType::Bytes {
+                if predicate.data_type != DataType::String && predicate.data_type != DataType::Bytes
+                {
                     return Err(GqlError::new(
                         GqlErrorKind::Validation,
                         "`like` is only supported on String and Bytes columns",
                     ));
                 }
-                predicate.ops.push(PredicateOp::Like(coerce_string(&field.value)?));
+                predicate
+                    .ops
+                    .push(PredicateOp::Like(coerce_string(&field.value)?));
             }
             other => {
                 return Err(GqlError::new(
@@ -802,7 +911,10 @@ fn bind_order_by(value: &InputValue, table: &TableMeta) -> GqlResult<Vec<OrderSp
             GqlError::new(GqlErrorKind::Validation, "orderBy entry requires a `field`")
         })?;
         let direction = find_object_field(fields, "direction").ok_or_else(|| {
-            GqlError::new(GqlErrorKind::Validation, "orderBy entry requires a `direction`")
+            GqlError::new(
+                GqlErrorKind::Validation,
+                "orderBy entry requires a `direction`",
+            )
         })?;
         let column = resolve_order_column(table, field_name)?;
         let descending = match coerce_string_or_enum(direction)?.as_str() {
@@ -862,10 +974,36 @@ fn validate_allowed_arguments(
     allowed: &[&str],
 ) -> GqlResult<()> {
     for name in arguments.keys() {
-        if !allowed.iter().any(|allowed_name| *allowed_name == name.as_str()) {
+        if !allowed
+            .iter()
+            .any(|allowed_name| *allowed_name == name.as_str())
+        {
             return Err(GqlError::new(
                 GqlErrorKind::Validation,
                 format!("field `{}` does not accept argument `{}`", field.name, name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_allowed_directive_arguments(
+    field: &Field,
+    directive: &Directive,
+    arguments: &BTreeMap<String, InputValue>,
+    allowed: &[&str],
+) -> GqlResult<()> {
+    for name in arguments.keys() {
+        if !allowed
+            .iter()
+            .any(|allowed_name| *allowed_name == name.as_str())
+        {
+            return Err(GqlError::new(
+                GqlErrorKind::Validation,
+                format!(
+                    "directive `@{}` on field `{}` does not accept argument `{}`",
+                    directive.name, field.name, name
+                ),
             ));
         }
     }
@@ -997,9 +1135,11 @@ fn coerce_value(value: &InputValue, data_type: DataType) -> GqlResult<Value> {
             InputValue::Null => Ok(Value::Null),
             InputValue::Int(value) => Ok(Value::DateTime(*value)),
             InputValue::Float(value) => Ok(Value::DateTime(value.as_f64() as i64)),
-            InputValue::String(value) => Ok(Value::DateTime(i64::from_str(value).map_err(|_| {
-                GqlError::new(GqlErrorKind::Validation, "invalid DateTime value")
-            })?)),
+            InputValue::String(value) => {
+                Ok(Value::DateTime(i64::from_str(value).map_err(|_| {
+                    GqlError::new(GqlErrorKind::Validation, "invalid DateTime value")
+                })?))
+            }
             _ => type_error(data_type),
         },
         DataType::Bytes => match value {
@@ -1042,7 +1182,9 @@ fn input_to_jsonb_value(value: &InputValue) -> GqlResult<JsonbValue> {
         InputValue::Boolean(value) => Ok(JsonbValue::Bool(*value)),
         InputValue::Int(value) => Ok(JsonbValue::Number(*value as f64)),
         InputValue::Float(value) => Ok(JsonbValue::Number(value.as_f64())),
-        InputValue::String(value) | InputValue::Enum(value) => Ok(JsonbValue::String(value.clone())),
+        InputValue::String(value) | InputValue::Enum(value) => {
+            Ok(JsonbValue::String(value.clone()))
+        }
         InputValue::List(values) => {
             let mut items = Vec::with_capacity(values.len());
             for value in values {
@@ -1083,7 +1225,10 @@ fn expect_list<'a>(value: &'a InputValue, name: &str) -> GqlResult<&'a [InputVal
 }
 
 fn find_object_field<'a>(fields: &'a [ObjectField], name: &str) -> Option<&'a InputValue> {
-    fields.iter().find(|field| field.name == name).map(|field| &field.value)
+    fields
+        .iter()
+        .find(|field| field.name == name)
+        .map(|field| &field.value)
 }
 
 fn to_order_enum_value(name: &str) -> String {

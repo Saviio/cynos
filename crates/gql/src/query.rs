@@ -79,7 +79,8 @@ pub fn execute_operation(
     variables: Option<&VariableValues>,
     operation_name: Option<&str>,
 ) -> GqlResult<OperationOutcome> {
-    PreparedQuery::parse_with_operation(query, operation_name)?.execute_mut(cache, catalog, variables)
+    PreparedQuery::parse_with_operation(query, operation_name)?
+        .execute_mut(cache, catalog, variables)
 }
 
 #[cfg(test)]
@@ -197,6 +198,10 @@ mod tests {
             .unwrap_or_else(|| panic!("missing field `{name}`"))
     }
 
+    fn has_field(fields: &[ResponseField], name: &str) -> bool {
+        fields.iter().any(|field| field.name == name)
+    }
+
     fn int64(value: &ResponseValue) -> i64 {
         match value {
             ResponseValue::Scalar(Value::Int64(value)) => *value,
@@ -244,7 +249,10 @@ mod tests {
 
         let second = object_fields(&orders[1]);
         assert_eq!(int64(field(second, "id")), 12);
-        assert_eq!(string(field(object_fields(field(second, "buyer")), "name")), "Bob");
+        assert_eq!(
+            string(field(object_fields(field(second, "buyer")), "name")),
+            "Bob"
+        );
     }
 
     #[test]
@@ -292,7 +300,10 @@ mod tests {
         let inserted_root = object_fields(&inserted.response.data);
         let inserted_users = list_items(field(inserted_root, "insertUsers"));
         assert_eq!(inserted_users.len(), 1);
-        assert_eq!(string(field(object_fields(&inserted_users[0]), "name")), "Cara");
+        assert_eq!(
+            string(field(object_fields(&inserted_users[0]), "name")),
+            "Cara"
+        );
         assert_eq!(inserted.changes.len(), 1);
 
         let updated = execute_operation(
@@ -306,7 +317,10 @@ mod tests {
         let updated_root = object_fields(&updated.response.data);
         let updated_users = list_items(field(updated_root, "updateUsers"));
         assert_eq!(updated_users.len(), 1);
-        assert_eq!(string(field(object_fields(&updated_users[0]), "name")), "Caroline");
+        assert_eq!(
+            string(field(object_fields(&updated_users[0]), "name")),
+            "Caroline"
+        );
 
         let deleted = execute_operation(
             &mut cache,
@@ -319,14 +333,69 @@ mod tests {
         let deleted_root = object_fields(&deleted.response.data);
         let deleted_users = list_items(field(deleted_root, "deleteUsers"));
         assert_eq!(deleted_users.len(), 1);
-        assert_eq!(string(field(object_fields(&deleted_users[0]), "name")), "Caroline");
+        assert_eq!(
+            string(field(object_fields(&deleted_users[0]), "name")),
+            "Caroline"
+        );
 
-        let after = execute_query(&cache, &catalog, "{ users(orderBy: [{ field: ID, direction: ASC }]) { id } }", None, None)
-            .unwrap();
+        let after = execute_query(
+            &cache,
+            &catalog,
+            "{ users(orderBy: [{ field: ID, direction: ASC }]) { id } }",
+            None,
+            None,
+        )
+        .unwrap();
         let after_root = object_fields(&after.data);
         let users = list_items(field(after_root, "users"));
         assert_eq!(users.len(), 2);
         assert_eq!(int64(field(object_fields(&users[0]), "id")), 1);
         assert_eq!(int64(field(object_fields(&users[1]), "id")), 2);
+    }
+
+    #[test]
+    fn directives_prune_root_and_nested_fields_after_variable_resolution() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let query = PreparedQuery::parse_with_operation(
+            "query Feed($showUsers: Boolean!, $showName: Boolean!, $showOrders: Boolean!) { users @include(if: $showUsers) { id name @include(if: $showName) orders @skip(if: $showOrders) { id total } } orders @skip(if: $showUsers) { id } }",
+            Some("Feed"),
+        )
+        .unwrap();
+
+        let mut variables = BTreeMap::new();
+        variables.insert("showUsers".into(), InputValue::Boolean(true));
+        variables.insert("showName".into(), InputValue::Boolean(false));
+        variables.insert("showOrders".into(), InputValue::Boolean(true));
+
+        let response = query.execute(&cache, &catalog, Some(&variables)).unwrap();
+        let root = object_fields(&response.data);
+        assert_eq!(root.len(), 1);
+        assert!(has_field(root, "users"));
+        assert!(!has_field(root, "orders"));
+
+        let users = list_items(field(root, "users"));
+        assert_eq!(users.len(), 2);
+        let first_user = object_fields(&users[0]);
+        assert!(has_field(first_user, "id"));
+        assert!(!has_field(first_user, "name"));
+        assert!(!has_field(first_user, "orders"));
+    }
+
+    #[test]
+    fn directives_can_prune_all_root_fields_for_queries() {
+        let cache = build_cache();
+        let catalog = GraphqlCatalog::from_table_cache(&cache);
+        let response = execute_query(
+            &cache,
+            &catalog,
+            "{ users @skip(if: true) { id } }",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let root = object_fields(&response.data);
+        assert!(root.is_empty());
     }
 }
