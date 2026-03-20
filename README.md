@@ -3,7 +3,7 @@
 
 > Warning: Cynos is still under active development and is not production-ready. APIs, crate boundaries, and performance characteristics may change.
 
-Cynos is an embedded in-memory relational engine built for low-latency live queries, incremental maintenance, and efficient WASM/JS delivery.
+Cynos is an embedded in-memory relational engine built for low-latency live queries, prepared execution, incremental maintenance, and efficient WASM/JS delivery.
 
 Cynos is a Rust workspace for an in-memory relational engine, a rule/heuristic query planner, incremental dataflow, reactive subscriptions, and a WASM-backed JavaScript/TypeScript package.
 
@@ -17,6 +17,7 @@ The public JS package lives in `js/packages/core` as `@cynos/core`. The Rust cra
   - `observe()`: cached query execution, callback receives the full current result set when it changes.
   - `changes()`: cached query execution, callback receives the full current result set immediately and on later changes.
   - `trace()`: incremental view maintenance (IVM), callback receives `{ added, removed }` deltas for incrementalizable queries.
+- Prepared query handles via `prepare()`, which reuse the compiled physical plan and expose `exec()`, `execBinary()`, and `getSchemaLayout()` for repeated execution.
 - Compiled single-table execution fast paths that can fuse scan/filter/project work and apply row-local reactive patches for simple subscriptions instead of always re-running the full query.
 - Binary query results via `execBinary()` + `getSchemaLayout()` + `ResultSet` for low-overhead WASM-to-JS transfer.
 - JSONB building blocks including a compact binary codec, a JSONPath subset parser/evaluator, JSONB operators, and extraction helpers for GIN indexing.
@@ -41,26 +42,26 @@ Core advantages:
 - The WASM/JS boundary is optimized too: `execBinary()` plus `SchemaLayout` can avoid most JS object materialization cost on larger results.
 - The workspace stays modular: storage, planner, indexes, JSONB, incremental dataflow, and host bindings are separated, with lower layers kept largely `no_std + alloc` friendly.
 
-Representative recent local measurements, on Node.js + WASM with both 10K and 100K row/document datasets, are shown below as workload-specific reference points rather than universal claims:
+Representative recent local measurements, on Node.js + WASM with both 10K and 100K row/document datasets, are shown below as workload-specific reference points rather than universal claims. The main relational table uses aligned semantics across Cynos, PGlite, and SQLite: prepared query reuse plus full JS object materialization.
 
 | Workload | Cynos | Representative comparison | What it suggests |
 | --- | ---: | ---: | --- |
-| Relational join (`users JOIN departments ... LIMIT 1000`) | `6.34 ms` at 10K, `7.79 ms` at 100K | PGlite `9.09 ms` at 10K, `10.15 ms` at 100K | Cynos is already competitive on embedded relational work, not only on live-query APIs |
-| Wide scan (`LIMIT 5000`) via plain `exec()` vs `execBinary()` | `18.91 ms -> 0.86 ms` at 10K, `17.16 ms -> 0.80 ms` at 100K | same Cynos query, different transport path | Binary delivery remains one of Cynos's clearest advantages in WASM embeddings |
-| Live update latency | `changes(): 0.461 ms`, `trace(): 0.021 ms` at 10K; `changes(): 3.54 ms`, `trace(): 0.019 ms` at 100K | PGlite live query `2.69 ms` at 10K, `8.10 ms` at 100K | Cynos is especially strong when live queries are part of the hot path, and `trace()` stays close to constant here |
-| Complex JSON query (`category + status + priority ORDER BY updatedAt DESC LIMIT 20`) | `0.444 ms` at 10K, `0.376 ms` at 100K | PGlite `0.311 ms` at 10K, `0.315 ms` at 100K | Cynos now lands in the same practical range while keeping JSONB querying and reactive delivery in one engine |
-| Mutation-driven requery (`insert + complex JSON query`) | `0.369 ms` at 10K, `0.345 ms` at 100K | PGlite `0.406 ms` at 10K, `0.444 ms` at 100K | The re-query path stays competitive even when the query includes nested JSON predicates and ordering |
-| Approximate compressed runtime assets used in the local harness | `~315 KiB gzip` | sql.js `~331 KiB gzip`; PGlite core+live ESM assets `~2.88 MiB gzip` | Cynos stays relatively compact for a relational + reactive WASM runtime, especially relative to a PostgreSQL-compatible stack |
+| Point lookup (`id` near the 90th percentile) | `0.013 ms` at 10K, `0.006 ms` at 100K | PGlite `0.209 ms` at 10K, `1.35 ms` at 100K; SQLite `0.020 ms` at 10K, `0.012 ms` at 100K | Cynos is already very competitive on repeated embedded reads, not only on subscriptions |
+| Relational join (`users JOIN departments ... LIMIT 1000`) | `6.10 ms` at 10K, `6.37 ms` at 100K | PGlite `8.11 ms` at 10K, `10.60 ms` at 100K; SQLite `3.22 ms` at 10K, `5.07 ms` at 100K | Cynos is competitive on embedded relational work while staying purpose-built for reactive delivery |
+| Wide scan (`LIMIT 5000`) via object rows vs `execBinary()` only | `16.45 ms -> 0.836 ms` at 10K, `17.16 ms -> 0.810 ms` at 100K | same Cynos query, different transport/materialization path | The WASM/JS boundary is a major part of end-to-end cost, and `execBinary()` remains one of Cynos's clearest advantages |
+| Live update latency | `changes(): 0.353 ms`, `trace(): 0.021 ms` at 10K; `changes(): 4.35 ms`, `trace(): 0.031 ms` at 100K | PGlite live query `2.63 ms` at 10K, `9.69 ms` at 100K | Cynos is especially strong when live queries are part of the hot path, and `trace()` stays close to constant here |
+| JSON filter (`metadata.category = tech LIMIT 100`) | `0.229 ms` at 10K, `0.483 ms` at 100K | PGlite `0.760 ms` at 10K, `1.76 ms` at 100K; SQLite `0.219 ms` at 10K, `0.282 ms` at 100K | Cynos already handles structured JSON predicates in the same practical range as embedded SQL/WASM peers |
+| Mutation-driven requery (`insert + complex JSON query`) | `0.318 ms` at 10K, `0.326 ms` at 100K | PGlite `0.422 ms` at 10K, `0.637 ms` at 100K; SQLite `0.118 ms` at 10K, `0.205 ms` at 100K | Cynos's re-query path remains competitive even when the query includes nested JSON predicates and ordering |
 
 A few important caveats to keep the comparison fair:
 
-- In the same local harness, SQLite (`sql.js`) remained faster on very small point lookups, scalar JSON reads, and some aggregate-heavy paths.
+- In the same local harness, SQLite (`sql.js`) remained faster on some wide scans, aggregate-heavy paths, and several JSON query shapes.
 - RxDB remained faster on warm cached document reads; Cynos's advantage is the unified relational + JSONB + reactive engine, not cache-hit document lookup latency alone.
-- On the current 10K/100K document benchmark, Cynos's metadata index is still workload-sensitive: it helps some JSON query shapes materially, but the 100K compound path is not yet a universal win and remains a useful optimizer/index-planning regression check.
-- The compressed footprint row above compares the concrete runtime assets used in the local harness, not every possible bundle configuration; actual shipped size depends on packaging, tree-shaking, and which optional features are included.
+- The benchmark now separates "prepared query + object rows" from lower-overhead array/binary paths, because otherwise result materialization can dominate the comparison and blur what is actually executor cost.
+- On the current 10K/100K document benchmark, Cynos's metadata index is still workload-sensitive: it helps some 10K JSON filters materially, but the current 100K compound/indexed paths are not yet wins and remain useful optimizer/index-planning regression checks.
 - PGlite remains the better fit when PostgreSQL compatibility and ecosystem reuse are the primary requirements.
 
-The cross-engine WASM comparison harness that produced these numbers lives in `scripts/engine_compare.mjs` and currently runs both 10K and 100K scenarios.
+The cross-engine WASM comparison harness that produced these numbers lives in `scripts/engine_compare.mjs` and currently runs both 10K and 100K scenarios with aligned prepared-query semantics for the main relational comparisons.
 
 Best fit:
 
@@ -168,6 +169,7 @@ Notes:
 
 - Table builders must be passed to `db.registerTable(...)`. Calling `createTable(...).column(...);` alone does not install the schema.
 - `select()` accepts `'*'`, a single column name, an array of column names, or multiple variadic column arguments.
+- `prepare()` returns a reusable handle with `exec()`, `execBinary()`, and `getSchemaLayout()` when the same query shape runs repeatedly.
 - For joins, use column references on both sides, for example `col('orders.user_id').eq(col('users.id'))`.
 
 ## Reactive Modes

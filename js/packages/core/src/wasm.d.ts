@@ -576,6 +576,24 @@ export class JsonbColumn {
     exists(): Expr;
 }
 
+export class PreparedSelectQuery {
+    private constructor();
+    free(): void;
+    [Symbol.dispose](): void;
+    /**
+     * Executes the prepared query and returns JS objects.
+     */
+    exec(): Promise<any>;
+    /**
+     * Executes the prepared query and returns a binary result buffer.
+     */
+    execBinary(): Promise<BinaryResult>;
+    /**
+     * Gets the schema layout for binary decoding.
+     */
+    getSchemaLayout(): SchemaLayout;
+}
+
 /**
  * Pre-computed layout for binary encoding/decoding
  */
@@ -715,6 +733,10 @@ export class SelectBuilder {
      */
     orderBy(column: string, order: JsSortOrder): SelectBuilder;
     /**
+     * Compiles the current query into a reusable prepared handle.
+     */
+    prepare(): PreparedSelectQuery;
+    /**
      * Adds a STDDEV(column) aggregate.
      */
     stddev(column: string): SelectBuilder;
@@ -802,6 +824,7 @@ export interface InitOutput {
     readonly __wbg_jstable_free: (a: number, b: number) => void;
     readonly __wbg_jstablebuilder_free: (a: number, b: number) => void;
     readonly __wbg_jstransaction_free: (a: number, b: number) => void;
+    readonly __wbg_preparedselectquery_free: (a: number, b: number) => void;
     readonly __wbg_selectbuilder_free: (a: number, b: number) => void;
     readonly __wbg_set_columnoptions_auto_increment: (a: number, b: number) => void;
     readonly __wbg_set_columnoptions_nullable: (a: number, b: number) => void;
@@ -904,6 +927,9 @@ export interface InitOutput {
     readonly jstransaction_rollback: (a: number, b: number) => void;
     readonly jstransaction_state: (a: number, b: number) => void;
     readonly jstransaction_update: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly preparedselectquery_exec: (a: number) => number;
+    readonly preparedselectquery_execBinary: (a: number) => number;
+    readonly preparedselectquery_getSchemaLayout: (a: number) => number;
     readonly selectbuilder_avg: (a: number, b: number, c: number) => number;
     readonly selectbuilder_changes: (a: number, b: number) => void;
     readonly selectbuilder_count: (a: number) => number;
@@ -924,6 +950,7 @@ export interface InitOutput {
     readonly selectbuilder_observe: (a: number, b: number) => void;
     readonly selectbuilder_offset: (a: number, b: number) => number;
     readonly selectbuilder_orderBy: (a: number, b: number, c: number, d: number) => number;
+    readonly selectbuilder_prepare: (a: number, b: number) => void;
     readonly selectbuilder_stddev: (a: number, b: number, c: number) => number;
     readonly selectbuilder_sum: (a: number, b: number, c: number) => number;
     readonly selectbuilder_trace: (a: number, b: number) => void;
@@ -951,10 +978,10 @@ export interface InitOutput {
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
     readonly __wasm_bindgen_func_elem_75: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2064: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_4893: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_2071: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_1006: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2116: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_4945: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_2123: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1015: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

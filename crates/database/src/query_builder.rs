@@ -4,15 +4,13 @@
 //! database queries.
 
 use crate::binary_protocol::{SchemaLayout, SchemaLayoutCache};
-use crate::convert::{
-    joined_rows_to_js_array, js_array_to_rows, js_to_value, projected_rows_to_js_array,
-    rows_to_js_array,
-};
+use crate::convert::{js_array_to_rows, js_to_value, projected_rows_to_js_array, rows_to_js_array};
 use crate::dataflow_compiler::compile_to_dataflow;
 use crate::expr::{Expr, ExprInner};
 use crate::query_engine::{
     compile_cached_plan, compile_plan, execute_compiled_physical_plan,
     execute_compiled_physical_plan_with_summary, execute_physical_plan, execute_plan, explain_plan,
+    CompiledPhysicalPlan,
 };
 use crate::reactive_bridge::{
     JsChangesStream, JsIvmObservableQuery, JsObservableQuery, QueryRegistry, ReQueryObservable,
@@ -51,6 +49,29 @@ pub struct SelectBuilder {
     group_by_cols: Vec<String>,
     aggregates: Vec<(AggregateFunc, Option<String>)>, // (func, column_name or None for COUNT(*))
     frozen_base: Option<FrozenQueryBase>,
+}
+
+#[wasm_bindgen]
+pub struct PreparedSelectQuery {
+    cache: Rc<RefCell<TableCache>>,
+    compiled_plan: CompiledPhysicalPlan,
+    result_mapper: QueryResultMapper,
+    binary_layout: SchemaLayout,
+}
+
+#[derive(Clone)]
+enum QueryResultMapper {
+    Full { schema: Table },
+    Columns { column_names: Vec<String> },
+}
+
+impl QueryResultMapper {
+    fn map_rows(&self, rows: &[Rc<Row>]) -> JsValue {
+        match self {
+            Self::Full { schema } => rows_to_js_array(rows, schema),
+            Self::Columns { column_names } => projected_rows_to_js_array(rows, column_names),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -870,6 +891,30 @@ impl SelectBuilder {
         }
     }
 
+    fn uses_full_row_mapping(&self) -> bool {
+        self.frozen_base.is_none()
+            && self.joins.is_empty()
+            && self.group_by_cols.is_empty()
+            && self.aggregates.is_empty()
+            && self.parse_columns().is_none()
+    }
+
+    fn build_result_mapper(&self, schema: &Table) -> Result<QueryResultMapper, JsValue> {
+        if self.uses_full_row_mapping() {
+            Ok(QueryResultMapper::Full {
+                schema: schema.clone(),
+            })
+        } else {
+            Ok(QueryResultMapper::Columns {
+                column_names: self.describe_output()?.column_names(),
+            })
+        }
+    }
+
+    fn map_rows_to_js(&self, rows: &[Rc<Row>], schema: &Table) -> Result<JsValue, JsValue> {
+        Ok(self.build_result_mapper(schema)?.map_rows(rows))
+    }
+
     /// Gets column info for JOIN conditions, checking both the main table and the join table.
     /// Returns (table_name, column_index, data_type).
     ///
@@ -1257,32 +1302,41 @@ impl SelectBuilder {
         // Execute using query engine (with index optimization)
         let rows = execute_plan(&cache, table_name, plan)
             .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
-
-        if self.frozen_base.is_some() {
-            let output = self.describe_output()?;
-            return Ok(projected_rows_to_js_array(&rows, &output.column_names()));
-        }
-
         let schema = store.schema().clone();
+        self.map_rows_to_js(&rows, &schema)
+    }
 
-        if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
-            let output = self.describe_output()?;
-            Ok(projected_rows_to_js_array(&rows, &output.column_names()))
-        } else if let Some(cols) = self.parse_columns() {
-            Ok(projected_rows_to_js_array(&rows, &cols))
-        } else if !self.joins.is_empty() {
-            let mut schemas: Vec<&Table> = Vec::with_capacity(1 + self.joins.len());
-            schemas.push(store.schema());
-            for join in &self.joins {
-                let join_store = cache.get_table(&join.table).ok_or_else(|| {
-                    JsValue::from_str(&alloc::format!("Join table not found: {}", join.table))
-                })?;
-                schemas.push(join_store.schema());
-            }
-            Ok(joined_rows_to_js_array(&rows, &schemas))
-        } else {
-            Ok(rows_to_js_array(&rows, &schema))
-        }
+    /// Compiles the current query into a reusable prepared handle.
+    pub fn prepare(&self) -> Result<PreparedSelectQuery, JsValue> {
+        let table_name = self
+            .from_table
+            .as_ref()
+            .ok_or_else(|| JsValue::from_str("FROM table not specified"))?;
+
+        let cache = self.cache.borrow();
+        let store = cache
+            .get_table(table_name)
+            .ok_or_else(|| JsValue::from_str(&alloc::format!("Table not found: {}", table_name)))?;
+
+        let plan = self.build_logical_plan(table_name);
+        let fingerprint = compute_plan_fingerprint(&plan);
+        let result_mapper = self.build_result_mapper(store.schema())?;
+        let binary_layout = self.binary_output_layout(table_name, store.schema())?;
+        let compiled_plan = {
+            let mut plan_cache = self.plan_cache.borrow_mut();
+            plan_cache
+                .get_or_insert_compiled_with(fingerprint, || {
+                    compile_cached_plan(&cache, table_name, plan)
+                })
+                .clone()
+        };
+
+        Ok(PreparedSelectQuery {
+            cache: self.cache.clone(),
+            compiled_plan,
+            result_mapper,
+            binary_layout,
+        })
     }
 
     /// Explains the query plan without executing it.
@@ -1579,6 +1633,36 @@ impl SelectBuilder {
         let buffer = encoder.finish();
 
         Ok(crate::binary_protocol::BinaryResult::new(buffer))
+    }
+}
+
+#[wasm_bindgen]
+impl PreparedSelectQuery {
+    /// Executes the prepared query and returns JS objects.
+    pub async fn exec(&self) -> Result<JsValue, JsValue> {
+        let cache = self.cache.borrow();
+        let rows = execute_compiled_physical_plan(&cache, &self.compiled_plan)
+            .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
+        Ok(self.result_mapper.map_rows(&rows))
+    }
+
+    /// Executes the prepared query and returns a binary result buffer.
+    #[wasm_bindgen(js_name = execBinary)]
+    pub async fn exec_binary(&self) -> Result<crate::binary_protocol::BinaryResult, JsValue> {
+        let cache = self.cache.borrow();
+        let rows = execute_compiled_physical_plan(&cache, &self.compiled_plan)
+            .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
+
+        let mut encoder =
+            crate::binary_protocol::BinaryEncoder::new(self.binary_layout.clone(), rows.len());
+        encoder.encode_rows(&rows);
+        Ok(crate::binary_protocol::BinaryResult::new(encoder.finish()))
+    }
+
+    /// Gets the schema layout for binary decoding.
+    #[wasm_bindgen(js_name = getSchemaLayout)]
+    pub fn get_schema_layout(&self) -> crate::binary_protocol::SchemaLayout {
+        self.binary_layout.clone()
     }
 }
 

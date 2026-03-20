@@ -158,6 +158,125 @@ function formatCountLabel(count) {
   return count.toLocaleString();
 }
 
+const USER_JOIN_CYNOS_COLUMNS = [
+  'users.id',
+  'users.age',
+  'users.dept_id',
+  'users.score',
+  'users.active',
+  'users.tier',
+  'users.name',
+  'users.city',
+  'departments.name',
+  'departments.region',
+];
+
+const USER_JOIN_SQL_SELECT = `
+  select
+    u.id as id,
+    u.age as age,
+    u.dept_id as dept_id,
+    u.score as score,
+    u.active as active,
+    u.tier as tier,
+    u.name as "users.name",
+    u.city as city,
+    d.name as "departments.name",
+    d.region as region
+  from users u
+  join departments d on u.dept_id = d.id
+  where u.age > $1
+  limit 1000
+`;
+
+const USER_JOIN_SQLITE_SELECT = `
+  select
+    u.id as id,
+    u.age as age,
+    u.dept_id as dept_id,
+    u.score as score,
+    u.active as active,
+    u.tier as tier,
+    u.name as "users.name",
+    u.city as city,
+    d.name as "departments.name",
+    d.region as region
+  from users u
+  join departments d on u.dept_id = d.id
+  where u.age > ?
+  limit 1000
+`;
+
+let preparedStatementCounter = 0;
+
+function nextPreparedStatementName(prefix) {
+  preparedStatementCounter += 1;
+  return `${prefix}_${preparedStatementCounter}`;
+}
+
+function sqlLiteral(value) {
+  if (value == null) return 'null';
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error(`Cannot serialize non-finite SQL literal: ${value}`);
+    }
+    return String(value);
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'true' : 'false';
+  }
+  if (typeof value === 'string') {
+    return sqlString(value);
+  }
+  throw new Error(`Unsupported SQL literal type: ${typeof value}`);
+}
+
+async function preparePGliteStatement(db, prefix, prepareSql) {
+  const name = nextPreparedStatementName(prefix);
+  await db.exec(prepareSql.replaceAll('__NAME__', name));
+
+  return {
+    async execObject(params = [], mapRow) {
+      const result = await db.query(
+        `execute ${name}${params.length ? `(${params.map(sqlLiteral).join(', ')})` : ''}`,
+        [],
+        { rowMode: 'object' },
+      );
+      return mapRow ? result.rows.map(mapRow) : result.rows;
+    },
+    async execArray(params = []) {
+      const result = await db.query(
+        `execute ${name}${params.length ? `(${params.map(sqlLiteral).join(', ')})` : ''}`,
+        [],
+        { rowMode: 'array' },
+      );
+      return result.rows;
+    },
+  };
+}
+
+function executeSqliteStatement(stmt, params = [], { objectMode = true, mapRow } = {}) {
+  stmt.bind(params);
+  const rows = [];
+  while (stmt.step()) {
+    const row = objectMode ? stmt.getAsObject() : stmt.get();
+    rows.push(mapRow ? mapRow(row) : row);
+  }
+  stmt.reset();
+  return rows;
+}
+
+function normalizeDocumentRow(row) {
+  if (!row || typeof row !== 'object') return row;
+  if (typeof row.metadata === 'string') {
+    return {
+      ...row,
+      metadata: JSON.parse(row.metadata),
+    };
+  }
+  return row;
+}
+
 function makeUsers(userCount, deptCount) {
   const tiers = ['bronze', 'silver', 'gold', 'platinum'];
   const cities = ['shanghai', 'beijing', 'shenzhen', 'hangzhou', 'chengdu'];
@@ -636,22 +755,24 @@ async function withRxdbDocuments(fixture, fn) {
 
 async function measureCynos(fixture) {
   return withCynos(fixture, async (db) => {
-    const pointQuery = db.select('*').from('users').where(col('id').eq(fixture.pointLookupId));
-    const filter100Query = db.select('*').from('users').where(col('age').gt(60)).limit(100);
-    const scan5000Query = db.select('*').from('users').limit(5000);
+    const pointQuery = db.select('*').from('users').where(col('id').eq(fixture.pointLookupId)).prepare();
+    const filter100Query = db.select('*').from('users').where(col('age').gt(60)).limit(100).prepare();
+    const scan5000Query = db.select('*').from('users').limit(5000).prepare();
     const orderedRange500Query = db
       .select('*')
       .from('users')
       .where(col('age').between(30, 40))
       .orderBy('id', JsSortOrder.Asc)
-      .limit(500);
+      .limit(500)
+      .prepare();
     const join1000Query = db
-      .select('*')
+      .select(USER_JOIN_CYNOS_COLUMNS)
       .from('users')
       .innerJoin('departments', col('dept_id').eq('id'))
       .where(col('age').gt(60))
-      .limit(1000);
-    const aggregateQuery = db.select('*').from('users').groupBy('dept_id').count();
+      .limit(1000)
+      .prepare();
+    const aggregateQuery = db.select('*').from('users').groupBy('dept_id').count().prepare();
 
     const point = await benchmark(async () => {
       const rows = await pointQuery.exec();
@@ -722,6 +843,15 @@ async function measureCynos(fixture) {
       rs.free();
     });
 
+    const objectMaterialization = {
+      pointObject: point,
+      pointBinaryDecode: pointBinaryDecode,
+      pointBinaryOnly: pointBinaryOnly,
+      scan5000Object: scan5000,
+      scan5000BinaryDecode: scan5000BinaryDecode,
+      scan5000BinaryOnly: scan5000BinaryOnly,
+    };
+
     const pointBuffer = await pointQuery.execBinary();
     const pointBinaryBytes = pointBuffer.len();
     pointBuffer.free();
@@ -752,6 +882,7 @@ async function measureCynos(fixture) {
       scan5000BinaryOnly,
       scan5000BinaryDecode,
       scan5000BinaryBytes,
+      objectMaterialization,
       liveChanges,
       liveTrace,
     };
@@ -814,42 +945,87 @@ async function measureCynosLive(db, fixture, mode, baseOffset) {
 
 async function measurePGlite(fixture) {
   return withPGlite(fixture, async (db) => {
+    const pointStmt = await preparePGliteStatement(
+      db,
+      'cmp_point',
+      'prepare __NAME__(integer) as select * from users where id = $1',
+    );
+    const filterStmt = await preparePGliteStatement(
+      db,
+      'cmp_filter',
+      'prepare __NAME__(integer) as select * from users where age > $1 limit 100',
+    );
+    const scanStmt = await preparePGliteStatement(
+      db,
+      'cmp_scan',
+      'prepare __NAME__ as select * from users limit 5000',
+    );
+    const orderedRangeStmt = await preparePGliteStatement(
+      db,
+      'cmp_ordered',
+      'prepare __NAME__(integer, integer) as select * from users where age between $1 and $2 order by id asc limit 500',
+    );
+    const joinStmt = await preparePGliteStatement(
+      db,
+      'cmp_join',
+      `prepare __NAME__(integer) as ${USER_JOIN_SQL_SELECT}`,
+    );
+    const aggregateStmt = await preparePGliteStatement(
+      db,
+      'cmp_aggregate',
+      'prepare __NAME__ as select dept_id, count(*) as count from users group by dept_id',
+    );
+
     const point = await benchmark(async () => {
-      const result = await db.query('select * from users where id = $1', [fixture.pointLookupId]);
-      if (result.rows.length !== 1) throw new Error(`unexpected PGlite point rows: ${result.rows.length}`);
+      const rows = await pointStmt.execObject([fixture.pointLookupId]);
+      if (rows.length !== 1) throw new Error(`unexpected PGlite point rows: ${rows.length}`);
     });
     const filter100 = await benchmark(async () => {
-      const result = await db.query('select * from users where age > $1 limit 100', [60]);
-      if (result.rows.length !== 100) throw new Error(`unexpected PGlite filter rows: ${result.rows.length}`);
+      const rows = await filterStmt.execObject([60]);
+      if (rows.length !== 100) throw new Error(`unexpected PGlite filter rows: ${rows.length}`);
     });
     const scan5000 = await benchmark(async () => {
-      const result = await db.query('select * from users limit 5000');
-      if (result.rows.length !== 5000) throw new Error(`unexpected PGlite scan rows: ${result.rows.length}`);
+      const rows = await scanStmt.execObject();
+      if (rows.length !== 5000) throw new Error(`unexpected PGlite scan rows: ${rows.length}`);
     });
     const orderedRange500 = await benchmark(async () => {
-      const result = await db.query(
-        'select * from users where age between $1 and $2 order by id asc limit 500',
-        [30, 40],
-      );
-      if (result.rows.length !== 500) throw new Error(`unexpected PGlite ordered range rows: ${result.rows.length}`);
+      const rows = await orderedRangeStmt.execObject([30, 40]);
+      if (rows.length !== 500) throw new Error(`unexpected PGlite ordered range rows: ${rows.length}`);
     });
     const join1000 = await benchmark(async () => {
-      const result = await db.query(
-        `select u.*, d.name as dept_name, d.region as dept_region
-         from users u
-         join departments d on u.dept_id = d.id
-         where u.age > $1
-         limit 1000`,
-        [60],
-      );
-      if (result.rows.length !== 1000) throw new Error(`unexpected PGlite join rows: ${result.rows.length}`);
+      const rows = await joinStmt.execObject([60]);
+      if (rows.length !== 1000) throw new Error(`unexpected PGlite join rows: ${rows.length}`);
     });
     const aggregate = await benchmark(async () => {
-      const result = await db.query('select dept_id, count(*) as count from users group by dept_id');
-      if (result.rows.length !== fixture.deptCount) throw new Error(`unexpected PGlite aggregate rows: ${result.rows.length}`);
+      const rows = await aggregateStmt.execObject();
+      if (rows.length !== fixture.deptCount) throw new Error(`unexpected PGlite aggregate rows: ${rows.length}`);
     });
+
+    const pointArray = await benchmark(async () => {
+      const rows = await pointStmt.execArray([fixture.pointLookupId]);
+      if (rows.length !== 1) throw new Error(`unexpected PGlite point array rows: ${rows.length}`);
+    });
+    const scan5000Array = await benchmark(async () => {
+      const rows = await scanStmt.execArray();
+      if (rows.length !== 5000) throw new Error(`unexpected PGlite scan array rows: ${rows.length}`);
+    });
+
     const liveQuery = await measurePGliteLive(db, fixture);
-    return { point, filter100, scan5000, orderedRange500, join1000, aggregate, liveQuery };
+    return {
+      point,
+      filter100,
+      scan5000,
+      orderedRange500,
+      join1000,
+      aggregate,
+      objectMaterialization: {
+        pointObject: point,
+        pointArray,
+        scan5000Object: scan5000,
+        scan5000Array,
+      },
+      liveQuery,
+    };
   });
 }
 
@@ -910,69 +1086,41 @@ async function measureSqlite(fixture) {
     const filterStmt = db.prepare('select * from users where age > ? limit 100');
     const scanStmt = db.prepare('select * from users limit 5000');
     const orderedRangeStmt = db.prepare('select * from users where age between ? and ? order by id asc limit 500');
-    const joinStmt = db.prepare(`
-      select u.*, d.name as dept_name, d.region as dept_region
-      from users u
-      join departments d on u.dept_id = d.id
-      where u.age > ?
-      limit 1000
-    `);
+    const joinStmt = db.prepare(USER_JOIN_SQLITE_SELECT);
     const aggStmt = db.prepare('select dept_id, count(*) as count from users group by dept_id');
 
     const point = await benchmark(async () => {
-      pointStmt.bind([fixture.pointLookupId]);
-      const rows = [];
-      while (pointStmt.step()) rows.push(pointStmt.getAsObject());
-      pointStmt.reset();
+      const rows = executeSqliteStatement(pointStmt, [fixture.pointLookupId]);
       if (rows.length !== 1) throw new Error(`unexpected SQLite point rows: ${rows.length}`);
     });
     const filter100 = await benchmark(async () => {
-      filterStmt.bind([60]);
-      let count = 0;
-      while (filterStmt.step()) {
-        filterStmt.get();
-        count += 1;
-      }
-      filterStmt.reset();
-      if (count !== 100) throw new Error(`unexpected SQLite filter rows: ${count}`);
+      const rows = executeSqliteStatement(filterStmt, [60]);
+      if (rows.length !== 100) throw new Error(`unexpected SQLite filter rows: ${rows.length}`);
     });
     const scan5000 = await benchmark(async () => {
-      let count = 0;
-      while (scanStmt.step()) {
-        scanStmt.get();
-        count += 1;
-      }
-      scanStmt.reset();
-      if (count !== 5000) throw new Error(`unexpected SQLite scan rows: ${count}`);
+      const rows = executeSqliteStatement(scanStmt);
+      if (rows.length !== 5000) throw new Error(`unexpected SQLite scan rows: ${rows.length}`);
     });
     const orderedRange500 = await benchmark(async () => {
-      orderedRangeStmt.bind([30, 40]);
-      let count = 0;
-      while (orderedRangeStmt.step()) {
-        orderedRangeStmt.get();
-        count += 1;
-      }
-      orderedRangeStmt.reset();
-      if (count !== 500) throw new Error(`unexpected SQLite ordered range rows: ${count}`);
+      const rows = executeSqliteStatement(orderedRangeStmt, [30, 40]);
+      if (rows.length !== 500) throw new Error(`unexpected SQLite ordered range rows: ${rows.length}`);
     });
     const join1000 = await benchmark(async () => {
-      joinStmt.bind([60]);
-      let count = 0;
-      while (joinStmt.step()) {
-        joinStmt.get();
-        count += 1;
-      }
-      joinStmt.reset();
-      if (count !== 1000) throw new Error(`unexpected SQLite join rows: ${count}`);
+      const rows = executeSqliteStatement(joinStmt, [60]);
+      if (rows.length !== 1000) throw new Error(`unexpected SQLite join rows: ${rows.length}`);
     });
     const aggregate = await benchmark(async () => {
-      let count = 0;
-      while (aggStmt.step()) {
-        aggStmt.get();
-        count += 1;
-      }
-      aggStmt.reset();
-      if (count !== fixture.deptCount) throw new Error(`unexpected SQLite aggregate rows: ${count}`);
+      const rows = executeSqliteStatement(aggStmt);
+      if (rows.length !== fixture.deptCount) throw new Error(`unexpected SQLite aggregate rows: ${rows.length}`);
+    });
+
+    const pointArray = await benchmark(async () => {
+      const rows = executeSqliteStatement(pointStmt, [fixture.pointLookupId], { objectMode: false });
+      if (rows.length !== 1) throw new Error(`unexpected SQLite point array rows: ${rows.length}`);
+    });
+    const scan5000Array = await benchmark(async () => {
+      const rows = executeSqliteStatement(scanStmt, [], { objectMode: false });
+      if (rows.length !== 5000) throw new Error(`unexpected SQLite scan array rows: ${rows.length}`);
     });
 
     pointStmt.free();
@@ -981,7 +1129,20 @@ async function measureSqlite(fixture) {
     orderedRangeStmt.free();
     joinStmt.free();
     aggStmt.free();
-    return { point, filter100, scan5000, orderedRange500, join1000, aggregate };
+    return {
+      point,
+      filter100,
+      scan5000,
+      orderedRange500,
+      join1000,
+      aggregate,
+      objectMaterialization: {
+        pointObject: point,
+        pointArray,
+        scan5000Object: scan5000,
+        scan5000Array,
+      },
+    };
   });
 }
 
@@ -1088,20 +1249,23 @@ function makeCynosDocumentQueries(db) {
 
 async function measureCynosDocumentQueries(db) {
   const { jsonSingleQuery, jsonCompoundQuery, complexSortedQuery } = makeCynosDocumentQueries(db);
-  const jsonSingleExpected = (await jsonSingleQuery.exec()).length;
-  const jsonCompoundExpected = (await jsonCompoundQuery.exec()).length;
-  const complexSortedExpected = (await complexSortedQuery.exec()).length;
+  const preparedJsonSingle = jsonSingleQuery.prepare();
+  const preparedJsonCompound = jsonCompoundQuery.prepare();
+  const preparedComplexSorted = complexSortedQuery.prepare();
+  const jsonSingleExpected = (await preparedJsonSingle.exec()).length;
+  const jsonCompoundExpected = (await preparedJsonCompound.exec()).length;
+  const complexSortedExpected = (await preparedComplexSorted.exec()).length;
 
   const jsonSingle = await benchmark(async () => {
-    const rows = await jsonSingleQuery.exec();
+    const rows = await preparedJsonSingle.exec();
     if (rows.length !== jsonSingleExpected) throw new Error(`unexpected Cynos JSON single rows: ${rows.length}`);
   });
   const jsonCompound = await benchmark(async () => {
-    const rows = await jsonCompoundQuery.exec();
+    const rows = await preparedJsonCompound.exec();
     if (rows.length !== jsonCompoundExpected) throw new Error(`unexpected Cynos JSON compound rows: ${rows.length}`);
   });
   const complexSorted = await benchmark(async () => {
-    const rows = await complexSortedQuery.exec();
+    const rows = await preparedComplexSorted.exec();
     if (rows.length !== complexSortedExpected) throw new Error(`unexpected Cynos JSON sorted rows: ${rows.length}`);
   });
 
@@ -1159,7 +1323,8 @@ async function measureCynosDocumentMutation(db, fixture) {
         .and(col('metadata').get('$.priority').eq(1))
     )
     .orderBy('updated_at', JsSortOrder.Desc)
-    .limit(20);
+    .limit(20)
+    .prepare();
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
     const row = makeMatchingDocument(fixture.docCount + 1_000 + i);
@@ -1305,50 +1470,59 @@ async function measureRxdbDocuments(fixture) {
 
 async function measurePGliteDocuments(fixture) {
   return withPGliteDocuments(fixture, async (db) => {
-    const jsonSingleSql = `
-      select *
-      from documents
-      where metadata->>'category' = $1
-      limit 100
-    `;
-    const jsonCompoundSql = `
-      select *
-      from documents
-      where metadata->>'category' = $1
-        and metadata->>'status' = $2
-        and ((metadata->>'priority')::int) = $3
-      limit 100
-    `;
-    const complexSortedSql = `
-      select *
-      from documents
-      where metadata->>'category' = $1
-        and metadata->>'status' = $2
-        and ((metadata->>'priority')::int) = $3
-      order by updated_at desc
-      limit 20
-    `;
+    const jsonSingleStmt = await preparePGliteStatement(
+      db,
+      'cmp_docs_single',
+      `prepare __NAME__(text) as
+        select *
+        from documents
+        where metadata->>'category' = $1
+        limit 100`,
+    );
+    const jsonCompoundStmt = await preparePGliteStatement(
+      db,
+      'cmp_docs_compound',
+      `prepare __NAME__(text, text, integer) as
+        select *
+        from documents
+        where metadata->>'category' = $1
+          and metadata->>'status' = $2
+          and ((metadata->>'priority')::int) = $3
+        limit 100`,
+    );
+    const complexSortedStmt = await preparePGliteStatement(
+      db,
+      'cmp_docs_sorted',
+      `prepare __NAME__(text, text, integer) as
+        select *
+        from documents
+        where metadata->>'category' = $1
+          and metadata->>'status' = $2
+          and ((metadata->>'priority')::int) = $3
+        order by updated_at desc
+        limit 20`,
+    );
 
-    const jsonSingleExpected = (await db.query(jsonSingleSql, ['tech'])).rows.length;
-    const jsonCompoundExpected = (await db.query(jsonCompoundSql, ['tech', 'published', 1])).rows.length;
-    const complexSortedExpected = (await db.query(complexSortedSql, ['tech', 'published', 1])).rows.length;
+    const jsonSingleExpected = (await jsonSingleStmt.execObject(['tech'], normalizeDocumentRow)).length;
+    const jsonCompoundExpected = (await jsonCompoundStmt.execObject(['tech', 'published', 1], normalizeDocumentRow)).length;
+    const complexSortedExpected = (await complexSortedStmt.execObject(['tech', 'published', 1], normalizeDocumentRow)).length;
 
     const jsonSingle = await benchmark(async () => {
-      const result = await db.query(jsonSingleSql, ['tech']);
-      if (result.rows.length !== jsonSingleExpected) {
-        throw new Error(`unexpected PGlite JSON single rows: ${result.rows.length}`);
+      const rows = await jsonSingleStmt.execObject(['tech'], normalizeDocumentRow);
+      if (rows.length !== jsonSingleExpected) {
+        throw new Error(`unexpected PGlite JSON single rows: ${rows.length}`);
       }
     });
     const jsonCompound = await benchmark(async () => {
-      const result = await db.query(jsonCompoundSql, ['tech', 'published', 1]);
-      if (result.rows.length !== jsonCompoundExpected) {
-        throw new Error(`unexpected PGlite JSON compound rows: ${result.rows.length}`);
+      const rows = await jsonCompoundStmt.execObject(['tech', 'published', 1], normalizeDocumentRow);
+      if (rows.length !== jsonCompoundExpected) {
+        throw new Error(`unexpected PGlite JSON compound rows: ${rows.length}`);
       }
     });
     const complexSorted = await benchmark(async () => {
-      const result = await db.query(complexSortedSql, ['tech', 'published', 1]);
-      if (result.rows.length !== complexSortedExpected) {
-        throw new Error(`unexpected PGlite JSON sorted rows: ${result.rows.length}`);
+      const rows = await complexSortedStmt.execObject(['tech', 'published', 1], normalizeDocumentRow);
+      if (rows.length !== complexSortedExpected) {
+        throw new Error(`unexpected PGlite JSON sorted rows: ${rows.length}`);
       }
     });
 
@@ -1364,15 +1538,18 @@ async function measurePGliteDocuments(fixture) {
 }
 
 async function measurePGliteDocumentMutation(db, fixture) {
-  const sql = `
-    select *
-    from documents
-    where metadata->>'category' = $1
-      and metadata->>'status' = $2
-      and ((metadata->>'priority')::int) = $3
-    order by updated_at desc
-    limit 20
-  `;
+  const query = await preparePGliteStatement(
+    db,
+    'cmp_docs_mutation',
+    `prepare __NAME__(text, text, integer) as
+      select *
+      from documents
+      where metadata->>'category' = $1
+        and metadata->>'status' = $2
+        and ((metadata->>'priority')::int) = $3
+      order by updated_at desc
+      limit 20`,
+  );
 
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
     const row = makeMatchingDocument(fixture.docCount + 7_000 + i);
@@ -1380,8 +1557,8 @@ async function measurePGliteDocumentMutation(db, fixture) {
       'insert into documents(id, title, updated_at, metadata) values ($1, $2, $3, $4::jsonb)',
       [row.id, row.title, row.updated_at, JSON.stringify(row.metadata)],
     );
-    const result = await db.query(sql, ['tech', 'published', 1]);
-    if (Number(result.rows[0]?.updated_at) !== row.updated_at) {
+    const rows = await query.execObject(['tech', 'published', 1], normalizeDocumentRow);
+    if (rows[0]?.updated_at !== row.updated_at) {
       throw new Error('unexpected PGlite mutation warmup ordering');
     }
   }
@@ -1394,8 +1571,8 @@ async function measurePGliteDocumentMutation(db, fixture) {
       'insert into documents(id, title, updated_at, metadata) values ($1, $2, $3, $4::jsonb)',
       [row.id, row.title, row.updated_at, JSON.stringify(row.metadata)],
     );
-    const result = await db.query(sql, ['tech', 'published', 1]);
-    if (Number(result.rows[0]?.updated_at) !== row.updated_at) {
+    const rows = await query.execObject(['tech', 'published', 1], normalizeDocumentRow);
+    if (rows[0]?.updated_at !== row.updated_at) {
       throw new Error('unexpected PGlite mutation ordering');
     }
     samples.push(performance.now() - start);
@@ -1434,21 +1611,45 @@ async function measureSqliteDocuments(fixture) {
       limit 20
     `);
 
-    const jsonSingleExpected = countSqliteRows(jsonSingleStmt, ['tech']);
-    const jsonCompoundExpected = countSqliteRows(jsonCompoundStmt, ['tech', 'published', 1]);
-    const complexSortedExpected = countSqliteRows(complexSortedStmt, ['tech', 'published', 1]);
+    const jsonSingleExpected = executeSqliteStatement(
+      jsonSingleStmt,
+      ['tech'],
+      { mapRow: normalizeDocumentRow },
+    ).length;
+    const jsonCompoundExpected = executeSqliteStatement(
+      jsonCompoundStmt,
+      ['tech', 'published', 1],
+      { mapRow: normalizeDocumentRow },
+    ).length;
+    const complexSortedExpected = executeSqliteStatement(
+      complexSortedStmt,
+      ['tech', 'published', 1],
+      { mapRow: normalizeDocumentRow },
+    ).length;
 
     const jsonSingle = await benchmark(async () => {
-      const count = countSqliteRows(jsonSingleStmt, ['tech']);
-      if (count !== jsonSingleExpected) throw new Error(`unexpected SQLite JSON single rows: ${count}`);
+      const rows = executeSqliteStatement(
+        jsonSingleStmt,
+        ['tech'],
+        { mapRow: normalizeDocumentRow },
+      );
+      if (rows.length !== jsonSingleExpected) throw new Error(`unexpected SQLite JSON single rows: ${rows.length}`);
     });
     const jsonCompound = await benchmark(async () => {
-      const count = countSqliteRows(jsonCompoundStmt, ['tech', 'published', 1]);
-      if (count !== jsonCompoundExpected) throw new Error(`unexpected SQLite JSON compound rows: ${count}`);
+      const rows = executeSqliteStatement(
+        jsonCompoundStmt,
+        ['tech', 'published', 1],
+        { mapRow: normalizeDocumentRow },
+      );
+      if (rows.length !== jsonCompoundExpected) throw new Error(`unexpected SQLite JSON compound rows: ${rows.length}`);
     });
     const complexSorted = await benchmark(async () => {
-      const count = countSqliteRows(complexSortedStmt, ['tech', 'published', 1]);
-      if (count !== complexSortedExpected) throw new Error(`unexpected SQLite JSON sorted rows: ${count}`);
+      const rows = executeSqliteStatement(
+        complexSortedStmt,
+        ['tech', 'published', 1],
+        { mapRow: normalizeDocumentRow },
+      );
+      if (rows.length !== complexSortedExpected) throw new Error(`unexpected SQLite JSON sorted rows: ${rows.length}`);
     });
 
     const mutationDriven = await measureSqliteDocumentMutation(db, fixture);
@@ -1464,17 +1665,6 @@ async function measureSqliteDocuments(fixture) {
       mutationDriven,
     };
   });
-}
-
-function countSqliteRows(stmt, params) {
-  stmt.bind(params);
-  let count = 0;
-  while (stmt.step()) {
-    stmt.get();
-    count += 1;
-  }
-  stmt.reset();
-  return count;
 }
 
 async function measureSqliteDocumentMutation(db, fixture) {
@@ -1494,13 +1684,15 @@ async function measureSqliteDocumentMutation(db, fixture) {
   for (let i = 0; i < LIVE_WARMUP_UPDATES; i++) {
     const row = makeMatchingDocument(fixture.docCount + 9_000 + i);
     insert.run([row.id, row.title, row.updated_at, JSON.stringify(row.metadata)]);
-    query.bind(['tech', 'published', 1]);
-    if (!query.step()) {
-      query.reset();
+    const rows = executeSqliteStatement(
+      query,
+      ['tech', 'published', 1],
+      { mapRow: normalizeDocumentRow },
+    );
+    const current = rows[0];
+    if (!current) {
       throw new Error('unexpected empty SQLite mutation warmup result');
     }
-    const current = query.getAsObject();
-    query.reset();
     if (current.updated_at !== row.updated_at) {
       throw new Error('unexpected SQLite mutation warmup ordering');
     }
@@ -1511,13 +1703,15 @@ async function measureSqliteDocumentMutation(db, fixture) {
     const row = makeMatchingDocument(fixture.docCount + 9_000 + LIVE_WARMUP_UPDATES + i);
     const start = performance.now();
     insert.run([row.id, row.title, row.updated_at, JSON.stringify(row.metadata)]);
-    query.bind(['tech', 'published', 1]);
-    if (!query.step()) {
-      query.reset();
+    const rows = executeSqliteStatement(
+      query,
+      ['tech', 'published', 1],
+      { mapRow: normalizeDocumentRow },
+    );
+    const current = rows[0];
+    if (!current) {
       throw new Error('unexpected empty SQLite mutation result');
     }
-    const current = query.getAsObject();
-    query.reset();
     if (current.updated_at !== row.updated_at) {
       throw new Error('unexpected SQLite mutation ordering');
     }
@@ -1781,7 +1975,9 @@ function renderDatasetSection(lines, datasetRun) {
   lines.push(`| SQLite (sql.js) | ${fmtMs(insert.sqlite)} |`);
   lines.push(`| RxDB | ${fmtMs(insert.rxdb)} |`);
   lines.push('');
-  lines.push('### WASM Relational Engine Benchmarks');
+  lines.push('### Prepared Relational Queries (Object Materialized)');
+  lines.push('');
+  lines.push('Each engine reuses a prepared query path and materializes full JS objects for the main numbers below.');
   lines.push('');
   lines.push('| Benchmark | Cynos | PGlite | SQLite (sql.js) |');
   lines.push('| --- | ---: | ---: | ---: |');
@@ -1796,15 +1992,20 @@ function renderDatasetSection(lines, datasetRun) {
     lines.push(`Note: the current local Cynos JS/WASM build returned ${cynos.joinProbeRowCount} rows for the join workload, so I left the Cynos join cell as correctness-invalid instead of publishing a misleading timing.`);
   }
   lines.push('');
-  lines.push('### Cynos Transport Breakdown');
+  lines.push('### Object Materialization / Lower-Overhead Paths');
   lines.push('');
-  lines.push('This section is where Cynos has a design-specific path that the others do not: `execBinary()` lets the engine return a compact WASM buffer instead of eagerly materializing JS objects.');
+  lines.push('This section keeps the same prepared queries but changes the result shape: object rows vs lower-overhead array/binary paths.');
   lines.push('');
-  lines.push('| Workload | `exec()` | `execBinary()` only | `execBinary()` + `toArray()` | Binary size | `exec()` vs binary-only | `exec()` vs binary+decode |');
-  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: |');
-  lines.push(`| Point lookup (1 row) | ${fmtMs(cynos.point.median)} | ${fmtMs(cynos.pointBinaryOnly.median)} | ${fmtMs(cynos.pointBinaryDecode.median)} | ${fmtBytes(cynos.pointBinaryBytes)} | ${fmtX(cynos.point.median / cynos.pointBinaryOnly.median)} | ${fmtX(cynos.point.median / cynos.pointBinaryDecode.median)} |`);
-  lines.push(`| Indexed filter (100 rows) | ${fmtMs(cynos.filter100.median)} | ${fmtMs(cynos.filter100BinaryOnly.median)} | ${fmtMs(cynos.filter100BinaryDecode.median)} | ${fmtBytes(cynos.filter100BinaryBytes)} | ${fmtX(cynos.filter100.median / cynos.filter100BinaryOnly.median)} | ${fmtX(cynos.filter100.median / cynos.filter100BinaryDecode.median)} |`);
-  lines.push(`| Wide scan (5000 rows) | ${fmtMs(cynos.scan5000.median)} | ${fmtMs(cynos.scan5000BinaryOnly.median)} | ${fmtMs(cynos.scan5000BinaryDecode.median)} | ${fmtBytes(cynos.scan5000BinaryBytes)} | ${fmtX(cynos.scan5000.median / cynos.scan5000BinaryOnly.median)} | ${fmtX(cynos.scan5000.median / cynos.scan5000BinaryDecode.median)} |`);
+  lines.push('| Workload | Cynos object | Cynos binary+decode | Cynos binary-only | PGlite object | PGlite array | SQLite object | SQLite array |');
+  lines.push('| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |');
+  lines.push(`| Point lookup (1 row) | ${fmtMs(cynos.objectMaterialization.pointObject.median)} | ${fmtMs(cynos.objectMaterialization.pointBinaryDecode.median)} | ${fmtMs(cynos.objectMaterialization.pointBinaryOnly.median)} | ${fmtMs(pglite.objectMaterialization.pointObject.median)} | ${fmtMs(pglite.objectMaterialization.pointArray.median)} | ${fmtMs(sqlite.objectMaterialization.pointObject.median)} | ${fmtMs(sqlite.objectMaterialization.pointArray.median)} |`);
+  lines.push(`| Wide scan (5000 rows) | ${fmtMs(cynos.objectMaterialization.scan5000Object.median)} | ${fmtMs(cynos.objectMaterialization.scan5000BinaryDecode.median)} | ${fmtMs(cynos.objectMaterialization.scan5000BinaryOnly.median)} | ${fmtMs(pglite.objectMaterialization.scan5000Object.median)} | ${fmtMs(pglite.objectMaterialization.scan5000Array.median)} | ${fmtMs(sqlite.objectMaterialization.scan5000Object.median)} | ${fmtMs(sqlite.objectMaterialization.scan5000Array.median)} |`);
+  lines.push('');
+  lines.push('| Cynos binary payload | Size | Object vs binary-only | Object vs binary+decode |');
+  lines.push('| --- | ---: | ---: | ---: |');
+  lines.push(`| Point lookup (1 row) | ${fmtBytes(cynos.pointBinaryBytes)} | ${fmtX(cynos.objectMaterialization.pointObject.median / cynos.objectMaterialization.pointBinaryOnly.median)} | ${fmtX(cynos.objectMaterialization.pointObject.median / cynos.objectMaterialization.pointBinaryDecode.median)} |`);
+  lines.push(`| Indexed filter (100 rows) | ${fmtBytes(cynos.filter100BinaryBytes)} | ${fmtX(cynos.filter100.median / cynos.filter100BinaryOnly.median)} | ${fmtX(cynos.filter100.median / cynos.filter100BinaryDecode.median)} |`);
+  lines.push(`| Wide scan (5000 rows) | ${fmtBytes(cynos.scan5000BinaryBytes)} | ${fmtX(cynos.objectMaterialization.scan5000Object.median / cynos.objectMaterialization.scan5000BinaryOnly.median)} | ${fmtX(cynos.objectMaterialization.scan5000Object.median / cynos.objectMaterialization.scan5000BinaryDecode.median)} |`);
   lines.push('');
   lines.push('### Reactive / Live Query Latency');
   lines.push('');
@@ -1869,6 +2070,9 @@ function buildReport(datasetRuns, versions) {
   lines.push(`- Dataset sizes in this run: ${sizeSummary}. Each size uses ${DEPT_COUNT} departments and a same-size nested-document dataset.`);
   lines.push(`- Point lookup targets the 90th-percentile id for each size, so the lookup remains meaningful at both 10K and 100K scales.`);
   lines.push(`- User rows are intentionally wider than the first draft: integers + float + boolean + multiple strings, so JS/WASM result materialization cost shows up more clearly.`);
+  lines.push('- Main Cynos / PGlite / SQLite relational numbers now use aligned semantics: prepared query reuse plus full JS object materialization of the same selected columns.');
+  lines.push('- The join workload is explicitly aligned across engines, including duplicate-name handling, instead of comparing `SELECT *` on one side against a narrower projected join on another.');
+  lines.push('- SQLite document rows normalize `metadata` into parsed JS objects so the document benchmarks match Cynos/PGlite result semantics instead of comparing structured objects against raw JSON text.');
   lines.push('- Document rows intentionally use nested metadata, multi-predicate filters, sort+limit, and mutation-driven requery so the JSON section is not just measuring warm-cache steady-state reads.');
   lines.push('- JSON query indexes are enabled in the main document comparison for each engine where applicable; Cynos also gets a separate index on/off isolation section.');
   lines.push(`- Each query benchmark uses ${WARMUP_ROUNDS} warmup runs, then ${QUERY_REPEATS} measured runs; tables below report median latency.`);
@@ -1906,8 +2110,9 @@ function buildReport(datasetRuns, versions) {
   lines.push('');
   lines.push('- The 10K runs are useful as a fast sanity-check, but the 100K runs are usually the better guide for sustained scan, join, JSON, and reactive costs.');
   lines.push('- Cynos is not trying to beat every mature SQL engine on every scalar query. In this harness, SQLite(sql.js) remains excellent on very small point lookups, scalar JSON reads, and some aggregate-heavy paths.');
+  lines.push('- Once the query semantics are aligned, the cross-engine object-materialization table is often as important as the raw relational table: some apparent “query speed” differences were really result-shape differences.');
   lines.push('- Cynos becomes more differentiated once you care about one engine doing joins, aggregates, structured JSON queries, and reactive updates together inside a compact embedded runtime.');
-  lines.push('- `execBinary()` is the clearest Cynos-specific advantage in JS/WASM embeddings: when result sets get wider or larger, it cuts object materialization cost and can materially outperform plain `exec()`.');
+  lines.push('- `execBinary()` is still the clearest Cynos-specific advantage in JS/WASM embeddings: when result sets get wider or larger, it can skip or defer JS object materialization entirely.');
   lines.push('- Relative to PGlite, Cynos trades SQL breadth and Postgres compatibility for a tighter app-runtime execution path and much cheaper live-query updates in this workload.');
   lines.push('- Relative to SQLite and PGlite, Cynos can expose structured JSON query plus fine-grained reactive APIs without switching to a separate sync or query layer.');
   lines.push('- Relative to RxDB, the real Cynos advantage is not “single flat query faster on warm cache”; it is that the same engine can do relational joins, aggregates, JSONB path filters, binary result transport, and delta-style reactivity without switching query models.');

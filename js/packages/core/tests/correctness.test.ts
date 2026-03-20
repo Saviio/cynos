@@ -69,7 +69,9 @@ function deepEqual(a: any, b: any): boolean {
  * 执行查询并验证 exec() 和 execBinary() 结果一致
  * @returns exec() 的结果
  */
-async function execAndVerifyBinary(query: SelectBuilder): Promise<any[]> {
+type BinaryVerifiableQuery = Pick<SelectBuilder, 'exec' | 'execBinary' | 'getSchemaLayout'>;
+
+async function execAndVerifyBinary(query: BinaryVerifiableQuery): Promise<any[]> {
   // 执行 JSON 查询
   const jsonResult = await query.exec();
 
@@ -478,6 +480,50 @@ describe('2. SELECT 查询', () => {
     db.registerTable(builder);
     return db;
   }
+
+  describe('2.0 Prepared query', () => {
+    it('应该复用 prepared query 执行复杂投影查询', async () => {
+      const db = createUsersDb('prepared_query_1');
+      await db.insert('users').values(testUsers).exec();
+
+      const query = db.select(['name', 'city', 'score'])
+        .from('users')
+        .where(col('age').gt(25))
+        .orderBy('score', JsSortOrder.Desc)
+        .limit(3);
+
+      const expected = await query.exec();
+      const prepared = query.prepare();
+      const preparedResult = await execAndVerifyBinary(prepared);
+
+      expect(preparedResult).toEqual(expected);
+    });
+
+    it('应该支持 prepared union all 查询', async () => {
+      const db = createUsersDb('prepared_query_2');
+      await db.insert('users').values(testUsers).exec();
+
+      const left = db.select(['name', 'city'])
+        .from('users')
+        .where(col('city').eq('Beijing'));
+      const right = db.select(['name', 'city'])
+        .from('users')
+        .where(col('city').eq('Shanghai'));
+
+      const query = left.unionAll(right);
+      const expected = await query.exec();
+      const prepared = query.prepare();
+      const preparedResult = await execAndVerifyBinary(prepared);
+
+      expect(preparedResult).toEqual(expected);
+      expect(preparedResult.map((row: any) => row.city)).toEqual([
+        'Beijing',
+        'Beijing',
+        'Shanghai',
+        'Shanghai',
+      ]);
+    });
+  });
 
   describe('2.1 Filter 过滤条件', () => {
     describe('2.1.1 eq - 等于', () => {

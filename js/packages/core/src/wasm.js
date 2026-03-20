@@ -1637,6 +1637,51 @@ export class JsonbColumn {
 }
 if (Symbol.dispose) JsonbColumn.prototype[Symbol.dispose] = JsonbColumn.prototype.free;
 
+export class PreparedSelectQuery {
+    static __wrap(ptr) {
+        ptr = ptr >>> 0;
+        const obj = Object.create(PreparedSelectQuery.prototype);
+        obj.__wbg_ptr = ptr;
+        PreparedSelectQueryFinalization.register(obj, obj.__wbg_ptr, obj);
+        return obj;
+    }
+    __destroy_into_raw() {
+        const ptr = this.__wbg_ptr;
+        this.__wbg_ptr = 0;
+        PreparedSelectQueryFinalization.unregister(this);
+        return ptr;
+    }
+    free() {
+        const ptr = this.__destroy_into_raw();
+        wasm.__wbg_preparedselectquery_free(ptr, 0);
+    }
+    /**
+     * Executes the prepared query and returns JS objects.
+     * @returns {Promise<any>}
+     */
+    exec() {
+        const ret = wasm.preparedselectquery_exec(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * Executes the prepared query and returns a binary result buffer.
+     * @returns {Promise<BinaryResult>}
+     */
+    execBinary() {
+        const ret = wasm.preparedselectquery_execBinary(this.__wbg_ptr);
+        return takeObject(ret);
+    }
+    /**
+     * Gets the schema layout for binary decoding.
+     * @returns {SchemaLayout}
+     */
+    getSchemaLayout() {
+        const ret = wasm.preparedselectquery_getSchemaLayout(this.__wbg_ptr);
+        return SchemaLayout.__wrap(ret);
+    }
+}
+if (Symbol.dispose) PreparedSelectQuery.prototype[Symbol.dispose] = PreparedSelectQuery.prototype.free;
+
 /**
  * Pre-computed layout for binary encoding/decoding
  */
@@ -2034,6 +2079,25 @@ export class SelectBuilder {
         return SelectBuilder.__wrap(ret);
     }
     /**
+     * Compiles the current query into a reusable prepared handle.
+     * @returns {PreparedSelectQuery}
+     */
+    prepare() {
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.selectbuilder_prepare(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            if (r2) {
+                throw takeObject(r1);
+            }
+            return PreparedSelectQuery.__wrap(r0);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+        }
+    }
+    /**
      * Adds a STDDEV(column) aggregate.
      * @param {string} column
      * @returns {SelectBuilder}
@@ -2365,7 +2429,7 @@ function __wbg_get_imports() {
                     const a = state0.a;
                     state0.a = 0;
                     try {
-                        return __wasm_bindgen_func_elem_4893(a, state0.b, arg0, arg1);
+                        return __wasm_bindgen_func_elem_4945(a, state0.b, arg0, arg1);
                     } finally {
                         state0.a = a;
                     }
@@ -2462,12 +2526,12 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_75, __wasm_bindgen_func_elem_1006);
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_75, __wasm_bindgen_func_elem_1015);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 199, function: Function { arguments: [Externref], shim_idx: 200, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_2064, __wasm_bindgen_func_elem_2071);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 206, function: Function { arguments: [Externref], shim_idx: 207, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.__wasm_bindgen_func_elem_2116, __wasm_bindgen_func_elem_2123);
             return addHeapObject(ret);
         },
         __wbindgen_cast_0000000000000003: function(arg0) {
@@ -2498,16 +2562,16 @@ function __wbg_get_imports() {
     };
 }
 
-function __wasm_bindgen_func_elem_1006(arg0, arg1) {
-    wasm.__wasm_bindgen_func_elem_1006(arg0, arg1);
+function __wasm_bindgen_func_elem_1015(arg0, arg1) {
+    wasm.__wasm_bindgen_func_elem_1015(arg0, arg1);
 }
 
-function __wasm_bindgen_func_elem_2071(arg0, arg1, arg2) {
-    wasm.__wasm_bindgen_func_elem_2071(arg0, arg1, addHeapObject(arg2));
+function __wasm_bindgen_func_elem_2123(arg0, arg1, arg2) {
+    wasm.__wasm_bindgen_func_elem_2123(arg0, arg1, addHeapObject(arg2));
 }
 
-function __wasm_bindgen_func_elem_4893(arg0, arg1, arg2, arg3) {
-    wasm.__wasm_bindgen_func_elem_4893(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
+function __wasm_bindgen_func_elem_4945(arg0, arg1, arg2, arg3) {
+    wasm.__wasm_bindgen_func_elem_4945(arg0, arg1, addHeapObject(arg2), addHeapObject(arg3));
 }
 
 const BinaryResultFinalization = (typeof FinalizationRegistry === 'undefined')
@@ -2552,6 +2616,9 @@ const JsTransactionFinalization = (typeof FinalizationRegistry === 'undefined')
 const JsonbColumnFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_jsonbcolumn_free(ptr >>> 0, 1));
+const PreparedSelectQueryFinalization = (typeof FinalizationRegistry === 'undefined')
+    ? { register: () => {}, unregister: () => {} }
+    : new FinalizationRegistry(ptr => wasm.__wbg_preparedselectquery_free(ptr >>> 0, 1));
 const SchemaLayoutFinalization = (typeof FinalizationRegistry === 'undefined')
     ? { register: () => {}, unregister: () => {} }
     : new FinalizationRegistry(ptr => wasm.__wbg_schemalayout_free(ptr >>> 0, 1));
