@@ -175,7 +175,7 @@ function subscribeToQuery(query: string) {
     // Subscribe to changes
     currentUnsubscribe = currentSubscription.subscribe((payload: unknown) => {
       postToMain({ type: 'subscriptionData', data: payload })
-    })
+    }) as () => void
   } catch (err) {
     postToMain({ type: 'error', message: String(err) })
   }
