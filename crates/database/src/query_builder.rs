@@ -7,14 +7,13 @@ use crate::binary_protocol::{SchemaLayout, SchemaLayoutCache};
 use crate::convert::{js_array_to_rows, js_to_value, projected_rows_to_js_array, rows_to_js_array};
 use crate::dataflow_compiler::compile_to_dataflow;
 use crate::expr::{Expr, ExprInner};
+use crate::live_runtime::{LiveDependencySet, LivePlan, LiveRegistry, RowsProjection};
 use crate::query_engine::{
     compile_cached_plan, compile_plan, execute_compiled_physical_plan,
     execute_compiled_physical_plan_with_summary, execute_physical_plan, execute_plan, explain_plan,
     CompiledPhysicalPlan,
 };
-use crate::reactive_bridge::{
-    JsChangesStream, JsIvmObservableQuery, JsObservableQuery, QueryRegistry, ReQueryObservable,
-};
+use crate::reactive_bridge::{JsChangesStream, JsIvmObservableQuery, JsObservableQuery};
 use crate::JsSortOrder;
 use alloc::boxed::Box;
 use alloc::rc::Rc;
@@ -27,7 +26,7 @@ use cynos_incremental::Delta;
 use cynos_query::ast::{AggregateFunc, SortOrder};
 use cynos_query::plan_cache::{compute_plan_fingerprint, PlanCache};
 use cynos_query::planner::LogicalPlan;
-use cynos_reactive::{ObservableQuery, TableId};
+use cynos_reactive::TableId;
 use cynos_storage::TableCache;
 use wasm_bindgen::prelude::*;
 
@@ -35,7 +34,7 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub struct SelectBuilder {
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     schema_layout_cache: Rc<RefCell<SchemaLayoutCache>>,
     plan_cache: Rc<RefCell<PlanCache>>,
@@ -188,7 +187,7 @@ enum JoinType {
 impl SelectBuilder {
     pub(crate) fn new(
         cache: Rc<RefCell<TableCache>>,
-        query_registry: Rc<RefCell<QueryRegistry>>,
+        query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
         schema_layout_cache: Rc<RefCell<SchemaLayoutCache>>,
         plan_cache: Rc<RefCell<PlanCache>>,
@@ -1463,52 +1462,49 @@ impl SelectBuilder {
         let initial_output = execute_compiled_physical_plan_with_summary(&cache, &compiled_plan)
             .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
 
+        let dependencies = {
+            let table_id_map = self.table_id_map.borrow();
+            let table_ids = logical_plan
+                .collect_tables()
+                .into_iter()
+                .map(|table| {
+                    table_id_map.get(&table).copied().ok_or_else(|| {
+                        JsValue::from_str(&alloc::format!("Table ID not found: {}", table))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            LiveDependencySet::snapshot(table_ids)
+        };
+
+        let projection = if self.frozen_base.is_some()
+            || !self.aggregates.is_empty()
+            || !self.group_by_cols.is_empty()
+        {
+            RowsProjection::Projection {
+                schema: output.schema,
+                columns: output_columns,
+            }
+        } else if let Some(cols) = self.parse_columns() {
+            RowsProjection::Projection {
+                schema,
+                columns: cols,
+            }
+        } else {
+            RowsProjection::Full { schema }
+        };
+
         drop(cache); // Release borrow
 
-        // Create re-query observable with cached compiled plan
-        let observable = ReQueryObservable::new_with_summary(
+        let live_plan = LivePlan::rows_snapshot(
+            dependencies,
             compiled_plan,
-            cache_ref.clone(),
             initial_output.rows,
             initial_output.summary,
+            projection,
+            binary_layout,
         );
-        let observable_rc = Rc::new(RefCell::new(observable));
 
-        {
-            let table_id_map = self.table_id_map.borrow();
-            let mut registry = self.query_registry.borrow_mut();
-            for table in logical_plan.collect_tables() {
-                let table_id = table_id_map.get(&table).copied().ok_or_else(|| {
-                    JsValue::from_str(&alloc::format!("Table ID not found: {}", table))
-                })?;
-                registry.register(observable_rc.clone(), table_id);
-            }
-        }
-
-        if self.frozen_base.is_some() {
-            Ok(JsObservableQuery::new_with_projection(
-                observable_rc,
-                output.schema,
-                output_columns,
-                binary_layout,
-            ))
-        } else if !self.aggregates.is_empty() || !self.group_by_cols.is_empty() {
-            Ok(JsObservableQuery::new_with_projection(
-                observable_rc,
-                output.schema,
-                output_columns,
-                binary_layout,
-            ))
-        } else if let Some(cols) = self.parse_columns() {
-            Ok(JsObservableQuery::new_with_projection(
-                observable_rc,
-                schema,
-                cols,
-                binary_layout,
-            ))
-        } else {
-            Ok(JsObservableQuery::new(observable_rc, schema, binary_layout))
-        }
+        Ok(live_plan.materialize_rows_snapshot(cache_ref.clone(), self.query_registry.clone()))
     }
 
     /// Creates a changes stream (initial + incremental).
@@ -1560,18 +1556,18 @@ impl SelectBuilder {
             SchemaLayout::from_schemas(&schemas)
         };
         let physical_plan = compile_plan(&cache, table_name, logical_plan);
-        let mut table_column_counts = hashbrown::HashMap::new();
-        table_column_counts.insert(table_name.clone(), store.schema().columns().len());
+        let mut table_schemas = hashbrown::HashMap::new();
+        table_schemas.insert(table_name.clone(), store.schema().clone());
         for join in &self.joins {
             let join_store = cache.get_table(&join.table).ok_or_else(|| {
                 JsValue::from_str(&alloc::format!("Join table not found: {}", join.table))
             })?;
-            table_column_counts.insert(join.table.clone(), join_store.schema().columns().len());
+            table_schemas.insert(join.table.clone(), join_store.schema().clone());
         }
 
         // Compile physical plan to dataflow — errors if not incrementalizable
         let table_id_map = self.table_id_map.borrow();
-        let compile_result = compile_to_dataflow(&physical_plan, &table_id_map, &table_column_counts)
+        let compile_result = compile_to_dataflow(&physical_plan, &table_id_map, &table_schemas)
             .ok_or_else(|| JsValue::from_str(
                 "Query is not incrementalizable (contains ORDER BY, LIMIT, or other non-streamable operators). Use observe() instead."
             ))?;
@@ -1580,45 +1576,38 @@ impl SelectBuilder {
         let initial_rows = execute_physical_plan(&cache, &physical_plan)
             .map_err(|e| JsValue::from_str(&alloc::format!("Query execution error: {:?}", e)))?;
 
+        let dependencies =
+            LiveDependencySet::snapshot(compile_result.table_ids.values().copied().collect());
         drop(cache);
         drop(table_id_map);
 
-        // Convert Rc<Row> → Row for ObservableQuery
         let initial_owned: Vec<Row> = initial_rows.iter().map(|rc| (**rc).clone()).collect();
-
-        // Create IVM observable with dataflow and initial result
-        let observable = ObservableQuery::with_initial(compile_result.dataflow, initial_owned);
-        let observable_rc = Rc::new(RefCell::new(observable));
-
-        // Register with query registry for IVM delta propagation
-        self.query_registry
-            .borrow_mut()
-            .register_ivm(observable_rc.clone());
-
-        if self.frozen_base.is_some()
+        let projection = if self.frozen_base.is_some()
             || !self.aggregates.is_empty()
             || !self.group_by_cols.is_empty()
         {
-            Ok(JsIvmObservableQuery::new_with_projection(
-                observable_rc,
-                output.schema,
-                output_columns,
-                binary_layout,
-            ))
+            RowsProjection::Projection {
+                schema: output.schema,
+                columns: output_columns,
+            }
         } else if let Some(cols) = self.parse_columns() {
-            Ok(JsIvmObservableQuery::new_with_projection(
-                observable_rc,
+            RowsProjection::Projection {
                 schema,
-                cols,
-                binary_layout,
-            ))
+                columns: cols,
+            }
         } else {
-            Ok(JsIvmObservableQuery::new(
-                observable_rc,
-                schema,
-                binary_layout,
-            ))
-        }
+            RowsProjection::Full { schema }
+        };
+
+        let live_plan = LivePlan::rows_delta(
+            dependencies,
+            compile_result.dataflow,
+            initial_owned,
+            projection,
+            binary_layout,
+        );
+
+        Ok(live_plan.materialize_rows_delta(self.query_registry.clone()))
     }
 
     /// Gets the schema layout for binary decoding.
@@ -1716,7 +1705,7 @@ impl PreparedSelectQuery {
 #[wasm_bindgen]
 pub struct InsertBuilder {
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     table_name: String,
     values_data: Option<JsValue>,
@@ -1725,7 +1714,7 @@ pub struct InsertBuilder {
 impl InsertBuilder {
     pub(crate) fn new(
         cache: Rc<RefCell<TableCache>>,
-        query_registry: Rc<RefCell<QueryRegistry>>,
+        query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
         table: &str,
     ) -> Self {
@@ -1789,7 +1778,7 @@ impl InsertBuilder {
             drop(cache); // Release borrow before notifying
             self.query_registry
                 .borrow_mut()
-                .on_table_change_ivm(table_id, deltas, &inserted_ids);
+                .on_table_change_delta(table_id, deltas, &inserted_ids);
         }
 
         Ok(JsValue::from_f64(row_count as f64))
@@ -1800,7 +1789,7 @@ impl InsertBuilder {
 #[wasm_bindgen]
 pub struct UpdateBuilder {
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     table_name: String,
     set_values: Vec<(String, JsValue)>,
@@ -1810,7 +1799,7 @@ pub struct UpdateBuilder {
 impl UpdateBuilder {
     pub(crate) fn new(
         cache: Rc<RefCell<TableCache>>,
-        query_registry: Rc<RefCell<QueryRegistry>>,
+        query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
         table: &str,
     ) -> Self {
@@ -1951,7 +1940,7 @@ impl UpdateBuilder {
             drop(cache);
             self.query_registry
                 .borrow_mut()
-                .on_table_change_ivm(table_id, deltas, &updated_ids);
+                .on_table_change_delta(table_id, deltas, &updated_ids);
         }
 
         Ok(JsValue::from_f64(update_count as f64))
@@ -1962,7 +1951,7 @@ impl UpdateBuilder {
 #[wasm_bindgen]
 pub struct DeleteBuilder {
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     table_name: String,
     where_clause: Option<Expr>,
@@ -1971,7 +1960,7 @@ pub struct DeleteBuilder {
 impl DeleteBuilder {
     pub(crate) fn new(
         cache: Rc<RefCell<TableCache>>,
-        query_registry: Rc<RefCell<QueryRegistry>>,
+        query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
         table: &str,
     ) -> Self {
@@ -2036,7 +2025,7 @@ impl DeleteBuilder {
 
             // Notify query registry
             if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
-                self.query_registry.borrow_mut().on_table_change_ivm(
+                self.query_registry.borrow_mut().on_table_change_delta(
                     table_id,
                     deltas,
                     &deleted_ids,
@@ -2097,7 +2086,7 @@ impl DeleteBuilder {
         if let Some(table_id) = self.table_id_map.borrow().get(&self.table_name).copied() {
             self.query_registry
                 .borrow_mut()
-                .on_table_change_ivm(table_id, deltas, &deleted_ids);
+                .on_table_change_delta(table_id, deltas, &deleted_ids);
         }
 
         Ok(JsValue::from_f64(delete_count as f64))
@@ -2654,7 +2643,7 @@ mod tests {
 
     struct TestSelectContext {
         cache: Rc<RefCell<TableCache>>,
-        query_registry: Rc<RefCell<QueryRegistry>>,
+        query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
         schema_layout_cache: Rc<RefCell<SchemaLayoutCache>>,
         plan_cache: Rc<RefCell<PlanCache>>,
@@ -2733,7 +2722,7 @@ mod tests {
         }
 
         let cache = Rc::new(RefCell::new(cache));
-        let query_registry = Rc::new(RefCell::new(QueryRegistry::new()));
+        let query_registry = Rc::new(RefCell::new(LiveRegistry::new()));
         query_registry
             .borrow_mut()
             .set_self_ref(query_registry.clone());
@@ -2799,7 +2788,7 @@ mod tests {
         }
 
         let cache = Rc::new(RefCell::new(cache));
-        let query_registry = Rc::new(RefCell::new(QueryRegistry::new()));
+        let query_registry = Rc::new(RefCell::new(LiveRegistry::new()));
         query_registry
             .borrow_mut()
             .set_self_ref(query_registry.clone());

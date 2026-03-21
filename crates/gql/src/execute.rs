@@ -53,7 +53,9 @@ pub fn execute_bound_operation(
 
     let mut fields = Vec::with_capacity(operation.fields.len());
     for field in &operation.fields {
-        fields.push(execute_root_field_readonly(cache, catalog, operation, field)?);
+        fields.push(execute_root_field_readonly(
+            cache, catalog, operation, field,
+        )?);
     }
     Ok(GraphqlResponse::new(ResponseValue::object(fields)))
 }
@@ -86,12 +88,26 @@ pub fn render_root_field_rows(
     rows: &[Rc<Row>],
 ) -> GqlResult<ResponseField> {
     let value = match &field.kind {
-        BoundRootFieldKind::Collection { table_name, selection, .. }
-        | BoundRootFieldKind::Insert { table_name, selection, .. }
-        | BoundRootFieldKind::Update { table_name, selection, .. }
-        | BoundRootFieldKind::Delete { table_name, selection, .. } => {
-            render_row_list(cache, catalog, table_name, rows, selection)?
+        BoundRootFieldKind::Collection {
+            table_name,
+            selection,
+            ..
         }
+        | BoundRootFieldKind::Insert {
+            table_name,
+            selection,
+            ..
+        }
+        | BoundRootFieldKind::Update {
+            table_name,
+            selection,
+            ..
+        }
+        | BoundRootFieldKind::Delete {
+            table_name,
+            selection,
+            ..
+        } => render_row_list(cache, catalog, table_name, rows, selection)?,
         BoundRootFieldKind::ByPk {
             table_name,
             selection,
@@ -262,10 +278,13 @@ fn execute_insert_field(
     }
 
     let response = render_root_field_rows(cache, catalog, field, &inserted_rows)?;
-    Ok((response, vec![TableChange {
-        table_name: table_name.to_string(),
-        row_changes,
-    }]))
+    Ok((
+        response,
+        vec![TableChange {
+            table_name: table_name.to_string(),
+            row_changes,
+        }],
+    ))
 }
 
 fn execute_update_field(
@@ -323,10 +342,13 @@ fn execute_update_field(
     }
 
     let response = render_root_field_rows(cache, catalog, field, &updated_rows)?;
-    Ok((response, vec![TableChange {
-        table_name: table_name.to_string(),
-        row_changes,
-    }]))
+    Ok((
+        response,
+        vec![TableChange {
+            table_name: table_name.to_string(),
+            row_changes,
+        }],
+    ))
 }
 
 fn execute_delete_field(
@@ -358,10 +380,13 @@ fn execute_delete_field(
         .iter()
         .map(|row| RowChange::Delete((**row).clone()))
         .collect();
-    Ok((response, vec![TableChange {
-        table_name: table_name.to_string(),
-        row_changes,
-    }]))
+    Ok((
+        response,
+        vec![TableChange {
+            table_name: table_name.to_string(),
+            row_changes,
+        }],
+    ))
 }
 
 fn select_collection_rows(
@@ -410,7 +435,9 @@ fn render_row_list(
 ) -> GqlResult<ResponseValue> {
     let mut values = Vec::with_capacity(rows.len());
     for row in rows {
-        values.push(execute_row_selection(cache, catalog, table_name, row, selection)?);
+        values.push(execute_row_selection(
+            cache, catalog, table_name, row, selection,
+        )?);
     }
     Ok(ResponseValue::list(values))
 }
@@ -432,7 +459,9 @@ fn execute_row_selection(
     let mut fields = Vec::with_capacity(selection.fields.len());
     for field in &selection.fields {
         let value = match field {
-            BoundField::Typename { value, .. } => ResponseValue::Scalar(Value::String(value.clone())),
+            BoundField::Typename { value, .. } => {
+                ResponseValue::Scalar(Value::String(value.clone()))
+            }
             BoundField::Column { column_index, .. } => row
                 .get(*column_index)
                 .cloned()
@@ -517,13 +546,23 @@ fn execute_reverse_relation(
         )
     })?;
 
-    let mut rows =
-        fetch_rows_by_index_or_scan(store, &relation.fk_name, &relation.child_column, &source_value);
+    let mut rows = fetch_rows_by_index_or_scan(
+        store,
+        &relation.fk_name,
+        &relation.child_column,
+        &source_value,
+    );
     rows = apply_collection_query(rows, query);
 
     let mut values = Vec::with_capacity(rows.len());
     for row in rows {
-        values.push(execute_row_selection(cache, catalog, &relation.child_table, &row, selection)?);
+        values.push(execute_row_selection(
+            cache,
+            catalog,
+            &relation.child_table,
+            &row,
+            selection,
+        )?);
     }
     Ok(ResponseValue::list(values))
 }
@@ -539,7 +578,11 @@ fn fetch_rows_by_column(store: &RowStore, column_name: &str, value: &Value) -> V
 
     store
         .scan()
-        .filter(|row| row.get(column_index).map(|candidate| candidate.sql_eq(value)).unwrap_or(false))
+        .filter(|row| {
+            row.get(column_index)
+                .map(|candidate| candidate.sql_eq(value))
+                .unwrap_or(false)
+        })
         .collect()
 }
 
@@ -549,7 +592,10 @@ fn fetch_rows_by_index_or_scan(
     column_name: &str,
     value: &Value,
 ) -> Vec<Rc<Row>> {
-    let rows = store.index_scan(index_name, Some(&cynos_index::KeyRange::only(value.clone())));
+    let rows = store.index_scan(
+        index_name,
+        Some(&cynos_index::KeyRange::only(value.clone())),
+    );
     if !rows.is_empty() || store.schema().get_column_index(column_name).is_none() {
         return rows;
     }
@@ -559,7 +605,11 @@ fn fetch_rows_by_index_or_scan(
     };
     store
         .scan()
-        .filter(|row| row.get(column_index).map(|candidate| candidate.sql_eq(value)).unwrap_or(false))
+        .filter(|row| {
+            row.get(column_index)
+                .map(|candidate| candidate.sql_eq(value))
+                .unwrap_or(false)
+        })
         .collect()
 }
 
@@ -572,7 +622,10 @@ fn find_single_column_index_name<'a>(store: &'a RowStore, column_name: &str) -> 
         .map(|index| index.name())
 }
 
-fn apply_collection_query(mut rows: Vec<Rc<Row>>, query: &BoundCollectionQuery) -> Vec<Rc<Row>> {
+pub(crate) fn apply_collection_query(
+    mut rows: Vec<Rc<Row>>,
+    query: &BoundCollectionQuery,
+) -> Vec<Rc<Row>> {
     if let Some(filter) = &query.filter {
         rows.retain(|row| matches_filter(row, filter));
     }
@@ -628,7 +681,9 @@ fn matches_column_predicate(row: &Row, predicate: &ColumnPredicate) -> bool {
         PredicateOp::Between(lower, upper) => value >= lower && value <= upper,
         PredicateOp::Like(pattern) => match value {
             Value::String(value) => like(value, pattern),
-            Value::Bytes(value) => core::str::from_utf8(value).map(|value| like(value, pattern)).unwrap_or(false),
+            Value::Bytes(value) => core::str::from_utf8(value)
+                .map(|value| like(value, pattern))
+                .unwrap_or(false),
             _ => false,
         },
         PredicateOp::Json(predicate) => matches_json_predicate(value, predicate),

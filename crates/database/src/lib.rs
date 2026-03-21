@@ -42,6 +42,7 @@ pub mod convert;
 pub mod database;
 pub mod dataflow_compiler;
 pub mod expr;
+pub mod live_runtime;
 pub mod query_builder;
 pub mod query_engine;
 pub mod reactive_bridge;
@@ -55,7 +56,9 @@ pub use expr::{Column, Expr};
 pub use query_builder::{
     DeleteBuilder, InsertBuilder, PreparedSelectQuery, SelectBuilder, UpdateBuilder,
 };
-pub use reactive_bridge::{JsChangesStream, JsGraphqlSubscription, JsIvmObservableQuery, JsObservableQuery};
+pub use reactive_bridge::{
+    JsChangesStream, JsGraphqlSubscription, JsIvmObservableQuery, JsObservableQuery,
+};
 pub use table::{ForeignKeyOptions, JsTable, JsTableBuilder};
 pub use transaction::JsTransaction;
 

@@ -363,10 +363,7 @@ fn build_query_fields(tables: &[Table], type_names: &BTreeMap<String, String>) -
     fields
 }
 
-fn build_mutation_fields(
-    tables: &[Table],
-    type_names: &BTreeMap<String, String>,
-) -> Vec<FieldDef> {
+fn build_mutation_fields(tables: &[Table], type_names: &BTreeMap<String, String>) -> Vec<FieldDef> {
     let mut fields = Vec::new();
     for table in tables {
         let table_name = table.name().to_string();
@@ -379,7 +376,10 @@ fn build_mutation_fields(
             name: format!("insert{}", type_name),
             args: vec![InputValueDef {
                 name: "input".to_string(),
-                ty: TypeRef::list(TypeRef::named(format!("{}InsertInput", type_name), true), true),
+                ty: TypeRef::list(
+                    TypeRef::named(format!("{}InsertInput", type_name), true),
+                    true,
+                ),
             }],
             ty: TypeRef::list(TypeRef::named(type_name.clone(), true), true),
         });
@@ -422,7 +422,10 @@ fn collection_arguments(type_name: &str) -> Vec<InputValueDef> {
         },
         InputValueDef {
             name: "orderBy".to_string(),
-            ty: TypeRef::list(TypeRef::named(format!("{}OrderByInput", type_name), true), false),
+            ty: TypeRef::list(
+                TypeRef::named(format!("{}OrderByInput", type_name), true),
+                false,
+            ),
         },
         InputValueDef {
             name: "limit".to_string(),
@@ -440,11 +443,17 @@ fn build_where_input(table: &Table) -> InputObjectTypeDef {
     let mut fields = vec![
         InputValueDef {
             name: "AND".to_string(),
-            ty: TypeRef::list(TypeRef::named(format!("{}WhereInput", type_name), true), false),
+            ty: TypeRef::list(
+                TypeRef::named(format!("{}WhereInput", type_name), true),
+                false,
+            ),
         },
         InputValueDef {
             name: "OR".to_string(),
-            ty: TypeRef::list(TypeRef::named(format!("{}WhereInput", type_name), true), false),
+            ty: TypeRef::list(
+                TypeRef::named(format!("{}WhereInput", type_name), true),
+                false,
+            ),
         },
     ];
 
@@ -571,7 +580,9 @@ fn build_reverse_relations(tables: &[Table]) -> BTreeMap<String, Vec<ForeignKey>
     let mut map: BTreeMap<String, Vec<ForeignKey>> = BTreeMap::new();
     for table in tables {
         for fk in table.constraints().get_foreign_keys() {
-            map.entry(fk.parent_table.clone()).or_default().push(fk.clone());
+            map.entry(fk.parent_table.clone())
+                .or_default()
+                .push(fk.clone());
         }
     }
     map

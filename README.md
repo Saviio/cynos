@@ -17,8 +17,9 @@ The public JS package lives in `js/packages/core` as `@cynos/core`. The Rust cra
   - `observe()`: cached query execution, callback receives the full current result set when it changes.
   - `changes()`: cached query execution, callback receives the full current result set immediately and on later changes.
   - `trace()`: incremental view maintenance (IVM), callback receives `{ added, removed }` deltas for incrementalizable queries.
+- A shared live runtime abstraction in `cynos-database` that batches table changes once and fans them out to row subscriptions and GraphQL subscriptions across snapshot and delta backends.
 - Prepared query handles via `prepare()`, which reuse the compiled physical plan and expose `exec()`, `execBinary()`, and `getSchemaLayout()` for repeated execution.
-- A Rust/WASM-first GraphQL adapter via `cynos-gql`, including generated SDL, root `query` / `mutation` / `subscription` fields, prepared GraphQL operations, and planner-backed root-table execution for `where` / `orderBy` / `limit` / `offset`.
+- A Rust/WASM-first GraphQL adapter via `cynos-gql`, including generated SDL, root `query` / `mutation` / `subscription` fields, prepared GraphQL operations, planner-backed root-table execution for `where` / `orderBy` / `limit` / `offset`, and batched nested relation rendering to avoid in-memory N+1 work during live payload assembly.
 - Compiled single-table execution fast paths that can fuse scan/filter/project work and apply row-local reactive patches for simple subscriptions instead of always re-running the full query.
 - Binary query results via `execBinary()` + `getSchemaLayout()` + `ResultSet` for low-overhead WASM-to-JS transfer.
 - JSONB building blocks including a compact binary codec, a JSONPath subset parser/evaluator, JSONB operators, and extraction helpers for GIN indexing.
@@ -114,6 +115,8 @@ Application code
 ```
 
 Operationally there are two query delivery paths:
+
+Both paths sit under one live runtime control plane in `cynos-database`: row subscriptions and GraphQL subscriptions share the same change registry / flush machinery, while the GraphQL layer stays an adapter that selects the snapshot or delta kernel per query shape.
 
 1. Cached execution path:
    - `SelectBuilder` produces a logical plan.
@@ -343,6 +346,8 @@ const prepared = db.prepareGraphql(
 const sub = prepared.subscribe();
 ```
 
+Runtime note: GraphQL subscriptions compile the root field into the existing planner path, then choose a snapshot/re-query or delta/IVM backend depending on query shape. Nested relation payloads are assembled with Rust-side batching so multi-level relations do not degrade into row-by-row in-memory N+1 fetch patterns.
+
 ### Filters, ordering, and scalars
 
 The generated schema includes table-specific inputs such as:
@@ -394,11 +399,10 @@ Current scalar mapping:
 The current GraphQL surface is intentionally focused on table access and live queries. Today it does not support:
 
 - fragments
-- directives
 - full GraphQL introspection
 - multi-root subscriptions
 
-`__typename` is supported, but GraphQL subscriptions must select exactly one concrete root field.
+`@include`, `@skip`, and `__typename` are supported, but GraphQL subscriptions must select exactly one concrete root field.
 
 ## Reactive Modes
 
@@ -625,7 +629,7 @@ Notes:
 - Cynos is in-memory only. There is no durable on-disk storage engine yet.
 - Transactions are journaled commit/rollback over in-memory state; this is not durable storage in the traditional ACID database sense.
 - `trace()` only works for plans that the physical planner can lower to incremental dataflow.
-- The GraphQL layer is currently a focused table/query subset: fragments, directives, and full introspection are not implemented yet, and subscriptions currently require a single concrete root field.
+- The GraphQL layer is currently a focused table/query subset: fragments, full introspection, and multi-root subscriptions are not implemented yet, and subscriptions currently require a single concrete root field.
 - Storage/query integration currently materializes B+Tree and GIN indexes from schema definitions. A standalone hash index implementation also exists in the workspace, but it is not the default secondary-index path in `RowStore` today.
 - JavaScript `Int64` values are exposed through JS-friendly paths as numbers, so values outside the safe integer range lose precision unless the calling pattern is designed around that limitation.
 

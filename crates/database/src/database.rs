@@ -5,18 +5,19 @@
 
 use crate::binary_protocol::SchemaLayoutCache;
 use crate::convert::{gql_response_to_js, js_to_gql_variables};
+use crate::dataflow_compiler::compile_to_dataflow;
+use crate::live_runtime::{LiveDependencySet, LivePlan, LiveRegistry};
 use crate::query_builder::{DeleteBuilder, InsertBuilder, SelectBuilder, UpdateBuilder};
-use crate::reactive_bridge::{JsGraphqlSubscription, QueryRegistry, ReQueryObservable};
+use crate::reactive_bridge::JsGraphqlSubscription;
 use crate::table::{JsTable, JsTableBuilder};
 use crate::transaction::JsTransaction;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
-#[cfg(feature = "benchmark")]
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use cynos_core::Row;
-use cynos_incremental::Delta;
 use cynos_gql::{PreparedQuery as GqlPreparedQuery, SchemaCache as GraphqlSchemaCache};
+use cynos_incremental::Delta;
 use cynos_query::plan_cache::PlanCache;
 use cynos_reactive::TableId;
 use cynos_storage::TableCache;
@@ -33,7 +34,7 @@ use wasm_bindgen::prelude::*;
 pub struct Database {
     name: String,
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     next_table_id: Rc<RefCell<TableId>>,
     schema_layout_cache: Rc<RefCell<SchemaLayoutCache>>,
@@ -46,7 +47,7 @@ pub struct Database {
 #[wasm_bindgen]
 pub struct PreparedGraphqlQuery {
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     graphql_schema_cache: Rc<RefCell<GraphqlSchemaCache>>,
     schema_epoch: Rc<RefCell<u64>>,
@@ -58,7 +59,7 @@ impl Database {
     /// Creates a new database instance.
     #[wasm_bindgen(constructor)]
     pub fn new(name: &str) -> Self {
-        let query_registry = Rc::new(RefCell::new(QueryRegistry::new()));
+        let query_registry = Rc::new(RefCell::new(LiveRegistry::new()));
         // Set self reference for microtask scheduling
         query_registry
             .borrow_mut()
@@ -584,7 +585,7 @@ fn bind_graphql_operation(
 
 fn execute_graphql_bound_operation(
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     catalog: cynos_gql::GraphqlCatalog,
     bound: cynos_gql::BoundOperation,
@@ -606,11 +607,28 @@ fn execute_graphql_bound_operation(
 
 fn create_graphql_subscription(
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     catalog: cynos_gql::GraphqlCatalog,
     bound: cynos_gql::BoundOperation,
 ) -> Result<JsGraphqlSubscription, JsValue> {
+    let live_plan = compile_graphql_live_plan(cache.clone(), table_id_map, catalog, bound)?;
+    Ok(match live_plan.descriptor.engine {
+        crate::live_runtime::LiveEngineKind::Snapshot => {
+            live_plan.materialize_graphql_snapshot(cache, query_registry)
+        }
+        crate::live_runtime::LiveEngineKind::Delta => {
+            live_plan.materialize_graphql_delta(cache, query_registry)
+        }
+    })
+}
+
+fn compile_graphql_live_plan(
+    cache: Rc<RefCell<TableCache>>,
+    table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
+    catalog: cynos_gql::GraphqlCatalog,
+    bound: cynos_gql::BoundOperation,
+) -> Result<LivePlan, JsValue> {
     if bound.kind != cynos_gql::OperationType::Subscription {
         return Err(JsValue::from_str(
             "subscribeGraphql() only accepts subscription operations",
@@ -633,49 +651,159 @@ fn create_graphql_subscription(
         ));
     }
 
-    let plan = cynos_gql::build_root_field_plan(&catalog, &field)
+    let root_plan = cynos_gql::build_root_field_plan(&catalog, &field)
         .map_err(|error| JsValue::from_str(error.message()))?;
-    let dependent_tables = plan.logical_plan.collect_tables();
-
-    let cache_ref = cache.clone();
-    let cache_borrow = cache_ref.borrow();
-    let compiled_plan =
-        crate::query_engine::compile_cached_plan(&cache_borrow, &plan.table_name, plan.logical_plan);
-    let initial_output =
-        crate::query_engine::execute_compiled_physical_plan_with_summary(&cache_borrow, &compiled_plan)
-            .map_err(|error| JsValue::from_str(&alloc::format!("Query execution error: {:?}", error)))?;
-    drop(cache_borrow);
-
-    let observable = ReQueryObservable::new_with_summary(
-        compiled_plan,
-        cache_ref.clone(),
-        initial_output.rows,
-        initial_output.summary,
-    );
-    let observable_rc = Rc::new(RefCell::new(observable));
+    let mut root_dependency_tables = root_plan.logical_plan.collect_tables();
+    if !root_dependency_tables
+        .iter()
+        .any(|table| table == &root_plan.table_name)
+    {
+        root_dependency_tables.push(root_plan.table_name.clone());
+    }
+    let all_dependency_tables = cynos_gql::bind::collect_dependency_tables(&field);
+    let (dependency_set, dependency_table_bindings) = {
+        let table_id_map = table_id_map.borrow();
+        let dependency_table_bindings =
+            build_graphql_dependency_bindings(&table_id_map, &all_dependency_tables)?;
+        let dependency_set = build_graphql_dependency_set(
+            &table_id_map,
+            &dependency_table_bindings,
+            &root_dependency_tables,
+        )?;
+        (dependency_set, dependency_table_bindings)
+    };
 
     {
+        let cache_borrow = cache.borrow();
         let table_id_map = table_id_map.borrow();
-        let mut registry = query_registry.borrow_mut();
-        for table in dependent_tables {
-            let table_id = table_id_map
-                .get(&table)
-                .copied()
-                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table ID not found: {}", table)))?;
-            registry.register(observable_rc.clone(), table_id);
+        if cynos_gql::bind::is_delta_capable_root_field(&field) {
+            if let Some(live_plan) = build_graphql_delta_live_plan(
+                &cache_borrow,
+                &table_id_map,
+                dependency_set.clone(),
+                catalog.clone(),
+                field.clone(),
+                dependency_table_bindings.clone(),
+                &root_plan,
+            )? {
+                return Ok(live_plan);
+            }
         }
     }
 
-    Ok(JsGraphqlSubscription::new(
-        observable_rc,
-        cache_ref,
+    let cache_borrow = cache.borrow();
+    let compiled_plan = crate::query_engine::compile_cached_plan(
+        &cache_borrow,
+        &root_plan.table_name,
+        root_plan.logical_plan,
+    );
+    let initial_output = crate::query_engine::execute_compiled_physical_plan_with_summary(
+        &cache_borrow,
+        &compiled_plan,
+    )
+    .map_err(|error| JsValue::from_str(&alloc::format!("Query execution error: {:?}", error)))?;
+
+    Ok(LivePlan::graphql_snapshot(
+        dependency_set,
+        compiled_plan,
+        initial_output.rows,
+        initial_output.summary,
         catalog,
         field,
+        dependency_table_bindings,
     ))
 }
 
+fn build_graphql_dependency_bindings(
+    table_id_map: &hashbrown::HashMap<String, TableId>,
+    dependency_tables: &[String],
+) -> Result<Vec<(TableId, String)>, JsValue> {
+    let mut bindings = dependency_tables
+        .iter()
+        .map(|table| {
+            table_id_map
+                .get(table)
+                .copied()
+                .map(|table_id| (table_id, table.clone()))
+                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table ID not found: {}", table)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    bindings.sort_unstable_by(|(left_id, left_name), (right_id, right_name)| {
+        left_id
+            .cmp(right_id)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    bindings.dedup_by(|left, right| left.0 == right.0);
+    Ok(bindings)
+}
+
+fn build_graphql_dependency_set(
+    table_id_map: &hashbrown::HashMap<String, TableId>,
+    dependency_table_bindings: &[(TableId, String)],
+    root_tables: &[String],
+) -> Result<LiveDependencySet, JsValue> {
+    let dependency_table_ids = dependency_table_bindings
+        .iter()
+        .map(|(table_id, _)| *table_id)
+        .collect::<Vec<_>>();
+    let root_table_ids = root_tables
+        .iter()
+        .map(|table| {
+            table_id_map
+                .get(table)
+                .copied()
+                .ok_or_else(|| JsValue::from_str(&alloc::format!("Table ID not found: {}", table)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(LiveDependencySet::graphql(
+        dependency_table_ids,
+        root_table_ids,
+    ))
+}
+
+fn build_graphql_delta_live_plan(
+    cache: &TableCache,
+    table_id_map: &hashbrown::HashMap<String, TableId>,
+    dependency_set: LiveDependencySet,
+    catalog: cynos_gql::GraphqlCatalog,
+    field: cynos_gql::bind::BoundRootField,
+    dependency_table_bindings: Vec<(TableId, String)>,
+    root_plan: &cynos_gql::RootFieldPlan,
+) -> Result<Option<LivePlan>, JsValue> {
+    let store = cache.get_table(&root_plan.table_name).ok_or_else(|| {
+        JsValue::from_str(&alloc::format!("Table not found: {}", root_plan.table_name))
+    })?;
+
+    let physical_plan = crate::query_engine::compile_plan(
+        cache,
+        &root_plan.table_name,
+        root_plan.logical_plan.clone(),
+    );
+    let mut table_schemas = hashbrown::HashMap::new();
+    table_schemas.insert(root_plan.table_name.clone(), store.schema().clone());
+    let Some(compile_result) = compile_to_dataflow(&physical_plan, table_id_map, &table_schemas)
+    else {
+        return Ok(None);
+    };
+
+    let initial_rows =
+        crate::query_engine::execute_physical_plan(cache, &physical_plan).map_err(|error| {
+            JsValue::from_str(&alloc::format!("Query execution error: {:?}", error))
+        })?;
+    let initial_owned = initial_rows.iter().map(|row| (**row).clone()).collect();
+
+    Ok(Some(LivePlan::graphql_delta(
+        dependency_set,
+        compile_result.dataflow,
+        initial_owned,
+        catalog,
+        field,
+        dependency_table_bindings,
+    )))
+}
+
 fn notify_graphql_changes(
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     changes: &[cynos_gql::TableChange],
 ) {
@@ -710,7 +838,7 @@ fn notify_graphql_changes(
     let mut registry = query_registry.borrow_mut();
     for (table_name, (deltas, changed_ids)) in aggregated {
         if let Some(table_id) = table_id_map.get(&table_name).copied() {
-            registry.on_table_change_ivm(table_id, deltas, &changed_ids);
+            registry.on_table_change_delta(table_id, deltas, &changed_ids);
         }
     }
 }
@@ -723,7 +851,7 @@ impl Database {
     }
 
     /// Gets the query registry (for internal use).
-    pub(crate) fn query_registry(&self) -> Rc<RefCell<QueryRegistry>> {
+    pub(crate) fn query_registry(&self) -> Rc<RefCell<LiveRegistry>> {
         self.query_registry.clone()
     }
 
@@ -747,12 +875,87 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_runtime::LiveEngineKind;
     use crate::table::{ColumnOptions, ForeignKeyOptions};
     use crate::JsDataType;
     use cynos_core::{Row, Value};
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    fn setup_graphql_users_db() -> Database {
+        let db = Database::new("graphql");
+        let users = db
+            .create_table("users")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("name", JsDataType::String, None);
+        db.register_table(&users).unwrap();
+        db
+    }
+
+    fn setup_graphql_users_posts_db() -> Database {
+        let db = setup_graphql_users_db();
+        let posts = db
+            .create_table("posts")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("author_id", JsDataType::Int64, None)
+            .column("title", JsDataType::String, None)
+            .foreign_key(
+                "fk_posts_author",
+                "author_id",
+                "users",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("author")
+                        .set_reverse_field_name("posts"),
+                ),
+            );
+        db.register_table(&posts).unwrap();
+        db
+    }
+
+    fn collect_titles(array: &js_sys::Array) -> Vec<String> {
+        let mut titles = Vec::with_capacity(array.length() as usize);
+        for index in 0..array.length() {
+            let item = array.get(index);
+            let title = js_sys::Reflect::get(&item, &JsValue::from_str("title"))
+                .unwrap()
+                .as_string()
+                .unwrap();
+            titles.push(title);
+        }
+        titles.sort();
+        titles
+    }
+
+    fn compile_subscription_engine(db: &Database, query: &str) -> LiveEngineKind {
+        let prepared = GqlPreparedQuery::parse_with_operation(query, None).unwrap();
+        let variables = cynos_gql::VariableValues::default();
+        let cache = db.cache.borrow();
+        let (catalog, bound) = bind_graphql_operation(
+            &prepared,
+            &cache,
+            &db.graphql_schema_cache,
+            &db.schema_epoch,
+            &variables,
+        )
+        .unwrap();
+        drop(cache);
+
+        compile_graphql_live_plan(db.cache.clone(), db.table_id_map.clone(), catalog, bound)
+            .unwrap()
+            .descriptor
+            .engine
+    }
 
     #[wasm_bindgen_test]
     fn test_database_new() {
@@ -1115,6 +1318,476 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn test_graphql_live_selector_chooses_delta_for_scalar_root_subscription() {
+        let db = setup_graphql_users_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription UserCard { usersByPk(pk: { id: 1 }) { id name } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Delta);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_graphql_live_selector_chooses_delta_for_nested_relations_without_sorting() {
+        let db = setup_graphql_users_posts_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription PostAuthorGraph { postsByPk(pk: { id: 10 }) { id title author { id name posts { id title } } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Delta);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_graphql_live_selector_falls_back_to_snapshot_for_nested_relation_sorting() {
+        let db = setup_graphql_users_posts_db();
+        let engine = compile_subscription_engine(
+            &db,
+            "subscription UserCard { usersByPk(pk: { id: 1 }) { id name posts(orderBy: [{ field: ID, direction: ASC }]) { id title } } }",
+        );
+        assert_eq!(engine, LiveEngineKind::Snapshot);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_delta_subscription_tracks_scalar_root_updates() {
+        let db = setup_graphql_users_db();
+
+        let subscription = db
+            .subscribe_graphql(
+                "subscription UserCard { usersByPk(pk: { id: 1 }) { id name } }",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            compile_subscription_engine(
+                &db,
+                "subscription UserCard { usersByPk(pk: { id: 1 }) { id name } }"
+            ),
+            LiveEngineKind::Delta
+        );
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_user =
+            js_sys::Reflect::get(&initial_data, &JsValue::from_str("usersByPk")).unwrap();
+        assert!(initial_user.is_null());
+
+        db.graphql(
+            "mutation { insertUsers(input: [{ id: 1, name: \"Alice\" }]) { id name } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_user =
+            js_sys::Reflect::get(&inserted_data, &JsValue::from_str("usersByPk")).unwrap();
+        let inserted_name = js_sys::Reflect::get(&inserted_user, &JsValue::from_str("name"))
+            .unwrap()
+            .as_string()
+            .unwrap();
+        assert_eq!(inserted_name, "Alice");
+
+        db.graphql(
+            "mutation { updateUsers(where: { id: { eq: 1 } }, set: { name: \"Alicia\" }) { id name } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let updated = subscription.get_result();
+        let updated_data = js_sys::Reflect::get(&updated, &JsValue::from_str("data")).unwrap();
+        let updated_user =
+            js_sys::Reflect::get(&updated_data, &JsValue::from_str("usersByPk")).unwrap();
+        let updated_name = js_sys::Reflect::get(&updated_user, &JsValue::from_str("name"))
+            .unwrap()
+            .as_string()
+            .unwrap();
+        assert_eq!(updated_name, "Alicia");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_delta_subscription_tracks_multilevel_nested_relation_changes() {
+        let db = setup_graphql_users_posts_db();
+
+        assert_eq!(
+            compile_subscription_engine(
+                &db,
+                "subscription PostAuthorGraph { postsByPk(pk: { id: 10 }) { id title author { id name posts { id title } } } }",
+            ),
+            LiveEngineKind::Delta
+        );
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                2,
+                alloc::vec![Value::Int64(2), Value::String("Bob".into())],
+            ))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("posts")
+            .unwrap()
+            .insert(Row::new(
+                10,
+                alloc::vec![
+                    Value::Int64(10),
+                    Value::Int64(2),
+                    Value::String("First".into()),
+                ],
+            ))
+            .unwrap();
+
+        let subscription = db
+            .subscribe_graphql(
+                "subscription PostAuthorGraph { postsByPk(pk: { id: 10 }) { id title author { id name posts { id title } } } }",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_post =
+            js_sys::Reflect::get(&initial_data, &JsValue::from_str("postsByPk")).unwrap();
+        let initial_author =
+            js_sys::Reflect::get(&initial_post, &JsValue::from_str("author")).unwrap();
+        let initial_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_author, &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(collect_titles(&initial_posts), vec!["First".to_string()]);
+
+        db.graphql(
+            "mutation { insertPosts(input: [{ id: 11, author_id: 2, title: \"Second\" }]) { id title } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let updated = subscription.get_result();
+        let updated_data = js_sys::Reflect::get(&updated, &JsValue::from_str("data")).unwrap();
+        let updated_post =
+            js_sys::Reflect::get(&updated_data, &JsValue::from_str("postsByPk")).unwrap();
+        let updated_author =
+            js_sys::Reflect::get(&updated_post, &JsValue::from_str("author")).unwrap();
+        let updated_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_author, &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(
+            collect_titles(&updated_posts),
+            vec!["First".to_string(), "Second".to_string()]
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_delta_subscription_reparents_nested_relation_membership() {
+        let db = setup_graphql_users_posts_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                2,
+                alloc::vec![Value::Int64(2), Value::String("Bob".into())],
+            ))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                3,
+                alloc::vec![Value::Int64(3), Value::String("Cara".into())],
+            ))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("posts")
+            .unwrap()
+            .insert(Row::new(
+                10,
+                alloc::vec![
+                    Value::Int64(10),
+                    Value::Int64(2),
+                    Value::String("First".into()),
+                ],
+            ))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("posts")
+            .unwrap()
+            .insert(Row::new(
+                11,
+                alloc::vec![
+                    Value::Int64(11),
+                    Value::Int64(2),
+                    Value::String("Second".into()),
+                ],
+            ))
+            .unwrap();
+
+        let subscription = db
+            .subscribe_graphql(
+                "subscription PostAuthorGraph { postsByPk(pk: { id: 10 }) { id title author { id name posts { id title } } } }",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_post =
+            js_sys::Reflect::get(&initial_data, &JsValue::from_str("postsByPk")).unwrap();
+        let initial_author =
+            js_sys::Reflect::get(&initial_post, &JsValue::from_str("author")).unwrap();
+        let initial_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_author, &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(
+            collect_titles(&initial_posts),
+            vec!["First".to_string(), "Second".to_string()]
+        );
+
+        db.graphql(
+            "mutation { updatePosts(where: { id: { eq: 11 } }, set: { author_id: 3 }) { id title } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let updated = subscription.get_result();
+        let updated_data = js_sys::Reflect::get(&updated, &JsValue::from_str("data")).unwrap();
+        let updated_post =
+            js_sys::Reflect::get(&updated_data, &JsValue::from_str("postsByPk")).unwrap();
+        let updated_author =
+            js_sys::Reflect::get(&updated_post, &JsValue::from_str("author")).unwrap();
+        let updated_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_author, &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(collect_titles(&updated_posts), vec!["First".to_string()]);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_subscription_tracks_nested_relation_changes() {
+        let db = Database::new("test");
+
+        let users = db
+            .create_table("users")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("name", JsDataType::String, None);
+        db.register_table(&users).unwrap();
+
+        let posts = db
+            .create_table("posts")
+            .column(
+                "id",
+                JsDataType::Int64,
+                Some(ColumnOptions::new().set_primary_key(true)),
+            )
+            .column("author_id", JsDataType::Int64, None)
+            .column("title", JsDataType::String, None)
+            .foreign_key(
+                "fk_posts_author",
+                "author_id",
+                "users",
+                "id",
+                Some(
+                    ForeignKeyOptions::new()
+                        .set_field_name("author")
+                        .set_reverse_field_name("posts"),
+                ),
+            );
+        db.register_table(&posts).unwrap();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                1,
+                alloc::vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
+            .unwrap();
+
+        let subscription = db
+            .subscribe_graphql(
+                "subscription WatchUsersWithPosts { users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(orderBy: [{ field: ID, direction: ASC }]) { id title } } }",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_users = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_data, &JsValue::from_str("users")).unwrap(),
+        );
+        assert_eq!(initial_users.length(), 1);
+        let initial_user = initial_users.get(0);
+        let initial_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_user, &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(initial_posts.length(), 0);
+
+        db.graphql(
+            "mutation { insertPosts(input: [{ id: 10, author_id: 1, title: \"Hello\" }]) { id title } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let inserted = subscription.get_result();
+        let inserted_data = js_sys::Reflect::get(&inserted, &JsValue::from_str("data")).unwrap();
+        let inserted_users = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_data, &JsValue::from_str("users")).unwrap(),
+        );
+        let inserted_user = inserted_users.get(0);
+        let inserted_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&inserted_user, &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(inserted_posts.length(), 1);
+        let inserted_post = inserted_posts.get(0);
+        let title = js_sys::Reflect::get(&inserted_post, &JsValue::from_str("title"))
+            .unwrap()
+            .as_string()
+            .unwrap();
+        assert_eq!(title, "Hello");
+
+        db.graphql(
+            "mutation { updatePosts(where: { id: { eq: 10 } }, set: { title: \"Updated\" }) { id title } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let updated = subscription.get_result();
+        let updated_data = js_sys::Reflect::get(&updated, &JsValue::from_str("data")).unwrap();
+        let updated_users = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_data, &JsValue::from_str("users")).unwrap(),
+        );
+        let updated_user = updated_users.get(0);
+        let updated_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_user, &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(updated_posts.length(), 1);
+        let updated_post = updated_posts.get(0);
+        let title = js_sys::Reflect::get(&updated_post, &JsValue::from_str("title"))
+            .unwrap()
+            .as_string()
+            .unwrap();
+        assert_eq!(title, "Updated");
+    }
+
+    #[wasm_bindgen_test]
+    fn test_database_graphql_snapshot_subscription_reparents_nested_relation_membership() {
+        let db = setup_graphql_users_posts_db();
+
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                1,
+                alloc::vec![Value::Int64(1), Value::String("Alice".into())],
+            ))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("users")
+            .unwrap()
+            .insert(Row::new(
+                2,
+                alloc::vec![Value::Int64(2), Value::String("Bob".into())],
+            ))
+            .unwrap();
+        db.cache
+            .borrow_mut()
+            .get_table_mut("posts")
+            .unwrap()
+            .insert(Row::new(
+                10,
+                alloc::vec![
+                    Value::Int64(10),
+                    Value::Int64(1),
+                    Value::String("Hello".into()),
+                ],
+            ))
+            .unwrap();
+
+        let subscription = db
+            .subscribe_graphql(
+                "subscription WatchUsersWithPosts { users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(orderBy: [{ field: ID, direction: ASC }]) { id title } } }",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            compile_subscription_engine(
+                &db,
+                "subscription WatchUsersWithPosts { users(orderBy: [{ field: ID, direction: ASC }]) { id name posts(orderBy: [{ field: ID, direction: ASC }]) { id title } } }"
+            ),
+            LiveEngineKind::Snapshot
+        );
+
+        let initial = subscription.get_result();
+        let initial_data = js_sys::Reflect::get(&initial, &JsValue::from_str("data")).unwrap();
+        let initial_users = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_data, &JsValue::from_str("users")).unwrap(),
+        );
+        let user_one_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_users.get(0), &JsValue::from_str("posts")).unwrap(),
+        );
+        let user_two_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&initial_users.get(1), &JsValue::from_str("posts")).unwrap(),
+        );
+        assert_eq!(collect_titles(&user_one_posts), vec!["Hello".to_string()]);
+        assert!(collect_titles(&user_two_posts).is_empty());
+
+        db.graphql(
+            "mutation { updatePosts(where: { id: { eq: 10 } }, set: { author_id: 2 }) { id title } }",
+            None,
+            None,
+        )
+        .unwrap();
+        db.query_registry.borrow_mut().flush();
+
+        let updated = subscription.get_result();
+        let updated_data = js_sys::Reflect::get(&updated, &JsValue::from_str("data")).unwrap();
+        let updated_users = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_data, &JsValue::from_str("users")).unwrap(),
+        );
+        let updated_user_one_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_users.get(0), &JsValue::from_str("posts")).unwrap(),
+        );
+        let updated_user_two_posts = js_sys::Array::from(
+            &js_sys::Reflect::get(&updated_users.get(1), &JsValue::from_str("posts")).unwrap(),
+        );
+        assert!(collect_titles(&updated_user_one_posts).is_empty());
+        assert_eq!(
+            collect_titles(&updated_user_two_posts),
+            vec!["Hello".to_string()]
+        );
+    }
+
+    #[wasm_bindgen_test]
     fn test_prepared_graphql_supports_mutation_and_subscription() {
         let db = Database::new("test");
 
@@ -1144,7 +1817,12 @@ mod tests {
             .unwrap();
 
         let variables = js_sys::Object::new();
-        js_sys::Reflect::set(&variables, &JsValue::from_str("id"), &JsValue::from_f64(2.0)).unwrap();
+        js_sys::Reflect::set(
+            &variables,
+            &JsValue::from_str("id"),
+            &JsValue::from_f64(2.0),
+        )
+        .unwrap();
         js_sys::Reflect::set(
             &variables,
             &JsValue::from_str("name"),
@@ -1164,7 +1842,8 @@ mod tests {
 
         let payload = subscription.get_result();
         let data = js_sys::Reflect::get(&payload, &JsValue::from_str("data")).unwrap();
-        let users = js_sys::Array::from(&js_sys::Reflect::get(&data, &JsValue::from_str("users")).unwrap());
+        let users =
+            js_sys::Array::from(&js_sys::Reflect::get(&data, &JsValue::from_str("users")).unwrap());
         assert_eq!(users.length(), 1);
         let first = users.get(0);
         let id = js_sys::Reflect::get(&first, &JsValue::from_str("id"))

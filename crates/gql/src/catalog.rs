@@ -146,7 +146,11 @@ impl GraphqlCatalog {
     }
 
     pub fn mutation_field(&self, field_name: &str) -> Option<&RootFieldMeta> {
-        lookup_root_field(&self.mutation_fields, &self.mutation_field_lookup, field_name)
+        lookup_root_field(
+            &self.mutation_fields,
+            &self.mutation_field_lookup,
+            field_name,
+        )
     }
 
     pub fn subscription_field(&self, field_name: &str) -> Option<&RootFieldMeta> {
@@ -397,7 +401,9 @@ fn build_reverse_relations(tables: &[Table]) -> BTreeMap<String, Vec<ForeignKey>
     let mut map: BTreeMap<String, Vec<ForeignKey>> = BTreeMap::new();
     for table in tables {
         for fk in table.constraints().get_foreign_keys() {
-            map.entry(fk.parent_table.clone()).or_default().push(fk.clone());
+            map.entry(fk.parent_table.clone())
+                .or_default()
+                .push(fk.clone());
         }
     }
     map

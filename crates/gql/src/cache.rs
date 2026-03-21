@@ -47,7 +47,9 @@ impl SchemaCache {
             self.sdl = Some(sdl);
         }
 
-        self.schema.clone().unwrap_or_else(|| GraphqlSchema::from_table_cache(cache))
+        self.schema
+            .clone()
+            .unwrap_or_else(|| GraphqlSchema::from_table_cache(cache))
     }
 
     pub fn sdl(&mut self, epoch: u64, cache: &TableCache) -> String {

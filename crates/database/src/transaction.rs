@@ -4,8 +4,8 @@
 
 use crate::convert::{js_array_to_rows, js_to_value};
 use crate::expr::Expr;
+use crate::live_runtime::LiveRegistry;
 use crate::query_builder::evaluate_predicate;
-use crate::reactive_bridge::QueryRegistry;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -20,7 +20,7 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub struct JsTransaction {
     cache: Rc<RefCell<TableCache>>,
-    query_registry: Rc<RefCell<QueryRegistry>>,
+    query_registry: Rc<RefCell<LiveRegistry>>,
     table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     inner: Option<Transaction>,
     /// Pending changes: (table_id, changed_row_ids)
@@ -30,7 +30,7 @@ pub struct JsTransaction {
 impl JsTransaction {
     pub(crate) fn new(
         cache: Rc<RefCell<TableCache>>,
-        query_registry: Rc<RefCell<QueryRegistry>>,
+        query_registry: Rc<RefCell<LiveRegistry>>,
         table_id_map: Rc<RefCell<hashbrown::HashMap<String, TableId>>>,
     ) -> Self {
         Self {
