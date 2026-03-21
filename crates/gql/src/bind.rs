@@ -153,6 +153,115 @@ pub struct JsonPredicate {
 
 pub type VariableValues = BTreeMap<String, InputValue>;
 
+pub fn collect_dependency_tables(field: &BoundRootField) -> Vec<String> {
+    let mut tables = hashbrown::HashSet::new();
+    collect_root_field_dependency_tables(field, &mut tables);
+    let mut tables: Vec<_> = tables.into_iter().collect();
+    tables.sort();
+    tables
+}
+
+pub fn is_delta_capable_root_field(field: &BoundRootField) -> bool {
+    match &field.kind {
+        BoundRootFieldKind::Collection {
+            query, selection, ..
+        } => {
+            query.order_by.is_empty()
+                && query.limit.is_none()
+                && query.offset == 0
+                && is_delta_capable_selection(selection)
+        }
+        BoundRootFieldKind::ByPk { selection, .. } => is_delta_capable_selection(selection),
+        BoundRootFieldKind::Typename
+        | BoundRootFieldKind::Insert { .. }
+        | BoundRootFieldKind::Update { .. }
+        | BoundRootFieldKind::Delete { .. } => false,
+    }
+}
+
+fn is_delta_capable_selection(selection: &BoundSelectionSet) -> bool {
+    selection.fields.iter().all(is_delta_capable_field)
+}
+
+fn is_delta_capable_field(field: &BoundField) -> bool {
+    match field {
+        BoundField::Typename { .. } | BoundField::Column { .. } => true,
+        BoundField::ForwardRelation { selection, .. } => is_delta_capable_selection(selection),
+        BoundField::ReverseRelation {
+            query, selection, ..
+        } => {
+            query.order_by.is_empty()
+                && query.limit.is_none()
+                && query.offset == 0
+                && is_delta_capable_selection(selection)
+        }
+    }
+}
+
+fn collect_root_field_dependency_tables(
+    field: &BoundRootField,
+    tables: &mut hashbrown::HashSet<String>,
+) {
+    match &field.kind {
+        BoundRootFieldKind::Typename => {}
+        BoundRootFieldKind::Collection {
+            table_name,
+            selection,
+            ..
+        }
+        | BoundRootFieldKind::ByPk {
+            table_name,
+            selection,
+            ..
+        }
+        | BoundRootFieldKind::Insert {
+            table_name,
+            selection,
+            ..
+        }
+        | BoundRootFieldKind::Update {
+            table_name,
+            selection,
+            ..
+        }
+        | BoundRootFieldKind::Delete {
+            table_name,
+            selection,
+            ..
+        } => {
+            tables.insert(table_name.clone());
+            collect_selection_dependency_tables(selection, tables);
+        }
+    }
+}
+
+fn collect_selection_dependency_tables(
+    selection: &BoundSelectionSet,
+    tables: &mut hashbrown::HashSet<String>,
+) {
+    for field in &selection.fields {
+        match field {
+            BoundField::Typename { .. } | BoundField::Column { .. } => {}
+            BoundField::ForwardRelation {
+                relation,
+                selection,
+                ..
+            } => {
+                tables.insert(relation.parent_table.clone());
+                collect_selection_dependency_tables(selection, tables);
+            }
+            BoundField::ReverseRelation {
+                relation,
+                selection,
+                ..
+            } => {
+                tables.insert(relation.child_table.clone());
+                collect_selection_dependency_tables(selection, tables);
+            }
+        }
+    }
+}
+
 pub fn bind_document(
     document: &Document,
     catalog: &GraphqlCatalog,

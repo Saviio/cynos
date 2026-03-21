@@ -22,12 +22,239 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use cynos_core::schema::Table;
-use cynos_core::Row;
-use cynos_incremental::{Delta, TableId};
+use cynos_core::{Row, Value};
+use cynos_incremental::{DataflowNode, Delta, MaterializedView, TableId};
 use cynos_reactive::ObservableQuery;
 use cynos_storage::TableCache;
 use hashbrown::{HashMap, HashSet};
 use wasm_bindgen::prelude::*;
+
+fn collect_changed_rows(
+    cache: &Rc<RefCell<TableCache>>,
+    compiled_plan: &CompiledPhysicalPlan,
+    changed_ids: &HashSet<u64>,
+) -> Option<Vec<(u64, Option<Rc<Row>>)>> {
+    let table_name = compiled_plan.reactive_patch_table()?;
+    let cache = cache.borrow();
+    let store = cache.get_table(table_name)?;
+    let mut changed_rows = Vec::with_capacity(changed_ids.len());
+    for &row_id in changed_ids {
+        changed_rows.push((row_id, store.get(row_id)));
+    }
+    Some(changed_rows)
+}
+
+fn query_results_equal(
+    old_summary: &QueryResultSummary,
+    new_summary: &QueryResultSummary,
+    old: &[Rc<Row>],
+    new: &[Rc<Row>],
+) -> bool {
+    if old_summary != new_summary || old.len() != new.len() {
+        return false;
+    }
+
+    old.iter().zip(new.iter()).all(|(old_row, new_row)| {
+        Rc::ptr_eq(old_row, new_row)
+            || (old_row.id() == new_row.id()
+                && old_row.version() == new_row.version()
+                && old_row.values() == new_row.values())
+    })
+}
+
+#[derive(Default)]
+struct GraphqlSubscribers {
+    callbacks: Vec<(usize, Box<dyn Fn(&cynos_gql::GraphqlResponse) + 'static>)>,
+    keepalive_ids: HashSet<usize>,
+    next_sub_id: usize,
+}
+
+impl GraphqlSubscribers {
+    fn add_keepalive(&mut self) -> usize {
+        let id = self.next_sub_id;
+        self.next_sub_id += 1;
+        self.keepalive_ids.insert(id);
+        id
+    }
+
+    fn add_callback<F>(&mut self, callback: F) -> usize
+    where
+        F: Fn(&cynos_gql::GraphqlResponse) + 'static,
+    {
+        let id = self.next_sub_id;
+        self.next_sub_id += 1;
+        self.callbacks.push((id, Box::new(callback)));
+        id
+    }
+
+    fn remove(&mut self, id: usize) -> bool {
+        if self.keepalive_ids.remove(&id) {
+            return true;
+        }
+
+        let len_before = self.callbacks.len();
+        self.callbacks.retain(|(sub_id, _)| *sub_id != id);
+        self.callbacks.len() < len_before
+    }
+
+    fn total_count(&self) -> usize {
+        self.keepalive_ids.len() + self.callbacks.len()
+    }
+
+    fn callback_count(&self) -> usize {
+        self.callbacks.len()
+    }
+
+    fn emit(&self, response: &cynos_gql::GraphqlResponse) {
+        for (_, callback) in &self.callbacks {
+            callback(response);
+        }
+    }
+}
+
+fn build_graphql_response(
+    cache: &TableCache,
+    catalog: &cynos_gql::GraphqlCatalog,
+    field: &cynos_gql::bind::BoundRootField,
+    rows: &[Rc<Row>],
+) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
+    let root_field = cynos_gql::execute::render_root_field_rows(cache, catalog, field, rows)?;
+    Ok(cynos_gql::GraphqlResponse::new(
+        cynos_gql::ResponseValue::object(alloc::vec![root_field]),
+    ))
+}
+
+fn build_graphql_response_batched(
+    cache: &TableCache,
+    catalog: &cynos_gql::GraphqlCatalog,
+    field: &cynos_gql::bind::BoundRootField,
+    plan: &cynos_gql::GraphqlBatchPlan,
+    state: &mut cynos_gql::GraphqlBatchState,
+    rows: &[Rc<Row>],
+) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
+    cynos_gql::batch_render::render_graphql_response(cache, catalog, field, plan, state, rows)
+}
+
+fn build_graphql_response_from_owned_rows(
+    cache: &TableCache,
+    catalog: &cynos_gql::GraphqlCatalog,
+    field: &cynos_gql::bind::BoundRootField,
+    rows: &[Row],
+) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
+    let rows: Vec<Rc<Row>> = rows.iter().cloned().map(Rc::new).collect();
+    build_graphql_response(cache, catalog, field, &rows)
+}
+
+fn build_graphql_response_from_owned_rows_batched(
+    cache: &TableCache,
+    catalog: &cynos_gql::GraphqlCatalog,
+    field: &cynos_gql::bind::BoundRootField,
+    plan: &cynos_gql::GraphqlBatchPlan,
+    state: &mut cynos_gql::GraphqlBatchState,
+    rows: &[Row],
+) -> Result<cynos_gql::GraphqlResponse, cynos_gql::GqlError> {
+    let rows: Vec<Rc<Row>> = rows.iter().cloned().map(Rc::new).collect();
+    build_graphql_response_batched(cache, catalog, field, plan, state, &rows)
+}
+
+fn root_field_has_relations(field: &cynos_gql::bind::BoundRootField) -> bool {
+    match &field.kind {
+        cynos_gql::bind::BoundRootFieldKind::Typename => false,
+        cynos_gql::bind::BoundRootFieldKind::Collection { selection, .. }
+        | cynos_gql::bind::BoundRootFieldKind::ByPk { selection, .. }
+        | cynos_gql::bind::BoundRootFieldKind::Insert { selection, .. }
+        | cynos_gql::bind::BoundRootFieldKind::Update { selection, .. }
+        | cynos_gql::bind::BoundRootFieldKind::Delete { selection, .. } => {
+            selection_has_relations(selection)
+        }
+    }
+}
+
+fn selection_has_relations(selection: &cynos_gql::bind::BoundSelectionSet) -> bool {
+    selection.fields.iter().any(field_has_relations)
+}
+
+fn field_has_relations(field: &cynos_gql::bind::BoundField) -> bool {
+    matches!(
+        field,
+        cynos_gql::bind::BoundField::ForwardRelation { .. }
+            | cynos_gql::bind::BoundField::ReverseRelation { .. }
+    )
+}
+
+fn build_snapshot_batch_invalidation(
+    table_names: &HashMap<TableId, String>,
+    changes: &HashMap<TableId, HashSet<u64>>,
+    root_changed: bool,
+) -> Result<cynos_gql::GraphqlInvalidation, ()> {
+    let mut changed_tables = Vec::with_capacity(changes.len());
+    let mut dirty_table_rows = HashMap::new();
+    for table_id in changes.keys() {
+        let Some(table_name) = table_names.get(table_id) else {
+            return Err(());
+        };
+        changed_tables.push(table_name.clone());
+        if let Some(changed_ids) = changes.get(table_id) {
+            dirty_table_rows.insert(table_name.clone(), changed_ids.clone());
+        }
+    }
+
+    Ok(cynos_gql::GraphqlInvalidation {
+        root_changed,
+        changed_tables,
+        dirty_edge_keys: HashMap::new(),
+        dirty_table_rows,
+    })
+}
+
+fn build_delta_batch_invalidation(
+    plan: &cynos_gql::GraphqlBatchPlan,
+    table_names: &HashMap<TableId, String>,
+    table_id: TableId,
+    deltas: &[Delta<Row>],
+    root_changed: bool,
+) -> Result<cynos_gql::GraphqlInvalidation, ()> {
+    let Some(table_name) = table_names.get(&table_id) else {
+        return Err(());
+    };
+    let dirty_row_ids: HashSet<u64> = deltas.iter().map(|delta| delta.data.id()).collect();
+
+    let mut invalidation = cynos_gql::GraphqlInvalidation {
+        root_changed,
+        changed_tables: alloc::vec![table_name.clone()],
+        dirty_edge_keys: HashMap::new(),
+        dirty_table_rows: HashMap::from([(table_name.clone(), dirty_row_ids)]),
+    };
+
+    for edge_id in plan.edges_for_table(table_name) {
+        let edge = plan.edge(*edge_id);
+        let key_column_index = match edge.kind {
+            cynos_gql::render_plan::RelationEdgeKind::Forward => edge.relation.parent_column_index,
+            cynos_gql::render_plan::RelationEdgeKind::Reverse => edge.relation.child_column_index,
+        };
+
+        let mut dirty_keys = HashSet::<Value>::new();
+        for delta in deltas {
+            let Some(value) = delta.data.get(key_column_index).cloned() else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            dirty_keys.insert(value);
+        }
+
+        if !dirty_keys.is_empty() {
+            invalidation.dirty_edge_keys.insert(*edge_id, dirty_keys);
+        }
+    }
+
+    Ok(invalidation)
+}
+
+fn graphql_response_to_js_value(response: &cynos_gql::GraphqlResponse) -> JsValue {
+    gql_response_to_js(response).unwrap_or(JsValue::NULL)
+}
 
 /// A re-query based observable that re-executes the query on each change.
 /// This leverages the query optimizer and indexes for optimal performance.
@@ -125,7 +352,9 @@ impl ReQueryObservable {
             return;
         }
 
-        if let Some(changed_rows) = self.collect_fast_path_rows(changed_ids) {
+        if let Some(changed_rows) =
+            collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
+        {
             match self
                 .compiled_plan
                 .apply_reactive_patch(&mut self.result, &changed_rows)
@@ -148,7 +377,7 @@ impl ReQueryObservable {
         match execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan) {
             Ok(output) => {
                 // Only notify if result changed
-                if !Self::results_equal(
+                if !query_results_equal(
                     &self.result_summary,
                     &output.summary,
                     &self.result,
@@ -167,322 +396,463 @@ impl ReQueryObservable {
             }
         }
     }
-
-    fn collect_fast_path_rows(
-        &self,
-        changed_ids: &HashSet<u64>,
-    ) -> Option<Vec<(u64, Option<Rc<Row>>)>> {
-        let table_name = self.compiled_plan.reactive_patch_table()?;
-        let cache = self.cache.borrow();
-        let store = cache.get_table(table_name)?;
-        let mut changed_rows = Vec::with_capacity(changed_ids.len());
-        for &row_id in changed_ids {
-            changed_rows.push((row_id, store.get(row_id)));
-        }
-        Some(changed_rows)
-    }
-
-    /// Compares two result sets using a precomputed summary captured during execution.
-    /// This keeps the unchanged path O(1) after the query has already been re-executed.
-    fn results_equal(
-        old_summary: &QueryResultSummary,
-        new_summary: &QueryResultSummary,
-        old: &[Rc<Row>],
-        new: &[Rc<Row>],
-    ) -> bool {
-        if old_summary != new_summary || old.len() != new.len() {
-            return false;
-        }
-
-        old.iter().zip(new.iter()).all(|(old_row, new_row)| {
-            Rc::ptr_eq(old_row, new_row)
-                || (old_row.id() == new_row.id()
-                    && old_row.version() == new_row.version()
-                    && old_row.values() == new_row.values())
-        })
-    }
 }
 
-/// Registry for tracking re-query observables and routing table changes.
-/// Supports batching of changes to avoid redundant re-queries during rapid updates.
-pub struct QueryRegistry {
-    /// Map from table ID to list of queries that depend on it
-    queries: HashMap<TableId, Vec<Rc<RefCell<ReQueryObservable>>>>,
-    /// Map from table ID to IVM-based queries
-    ivm_queries: HashMap<TableId, Vec<Rc<RefCell<ObservableQuery>>>>,
-    /// Pending changes to be flushed (table_id -> accumulated changed_ids)
-    pending_changes: Rc<RefCell<HashMap<TableId, HashSet<u64>>>>,
-    /// Pending IVM deltas (table_id -> accumulated deltas)
-    pending_ivm_deltas: Rc<RefCell<HashMap<TableId, Vec<Delta<Row>>>>>,
-    /// Whether a flush is already scheduled
-    flush_scheduled: Rc<RefCell<bool>>,
-    /// Self reference for scheduling flush callback
-    self_ref: Option<Rc<RefCell<QueryRegistry>>>,
-    /// Reusable flush closure to avoid Closure::once + forget() leak per DML
-    #[cfg(target_arch = "wasm32")]
-    flush_closure: Option<Closure<dyn FnMut(JsValue)>>,
+pub struct GraphqlSubscriptionObservable {
+    compiled_plan: CompiledPhysicalPlan,
+    cache: Rc<RefCell<TableCache>>,
+    catalog: cynos_gql::GraphqlCatalog,
+    field: cynos_gql::bind::BoundRootField,
+    batch_plan: Option<cynos_gql::GraphqlBatchPlan>,
+    batch_state: cynos_gql::GraphqlBatchState,
+    dependency_table_names: HashMap<TableId, String>,
+    root_table_ids: HashSet<TableId>,
+    root_rows: Vec<Rc<Row>>,
+    root_summary: QueryResultSummary,
+    response: Option<cynos_gql::GraphqlResponse>,
+    response_dirty: bool,
+    subscribers: GraphqlSubscribers,
 }
 
-impl QueryRegistry {
-    /// Creates a new query registry.
-    pub fn new() -> Self {
+impl GraphqlSubscriptionObservable {
+    pub fn new(
+        compiled_plan: CompiledPhysicalPlan,
+        cache: Rc<RefCell<TableCache>>,
+        catalog: cynos_gql::GraphqlCatalog,
+        field: cynos_gql::bind::BoundRootField,
+        dependency_table_bindings: Vec<(TableId, String)>,
+        root_table_ids: HashSet<TableId>,
+        initial_rows: Vec<Rc<Row>>,
+        initial_summary: QueryResultSummary,
+    ) -> Self {
         Self {
-            queries: HashMap::new(),
-            ivm_queries: HashMap::new(),
-            pending_changes: Rc::new(RefCell::new(HashMap::new())),
-            pending_ivm_deltas: Rc::new(RefCell::new(HashMap::new())),
-            flush_scheduled: Rc::new(RefCell::new(false)),
-            self_ref: None,
-            #[cfg(target_arch = "wasm32")]
-            flush_closure: None,
+            compiled_plan,
+            cache,
+            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
+                .ok()
+                .filter(|plan| plan.has_relations()),
+            batch_state: cynos_gql::GraphqlBatchState::default(),
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
+            catalog,
+            field,
+            root_table_ids,
+            root_rows: initial_rows,
+            root_summary: initial_summary,
+            response: None,
+            response_dirty: true,
+            subscribers: GraphqlSubscribers::default(),
         }
     }
 
-    /// Sets the self reference for scheduling flush callbacks.
-    /// Must be called after wrapping in Rc<RefCell<>>.
-    pub fn set_self_ref(&mut self, self_ref: Rc<RefCell<QueryRegistry>>) {
-        self.self_ref = Some(self_ref);
+    pub fn attach_keepalive(&mut self) -> usize {
+        self.subscribers.add_keepalive()
     }
 
-    /// Registers a re-query observable with its dependent table.
-    pub fn register(&mut self, query: Rc<RefCell<ReQueryObservable>>, table_id: TableId) {
-        self.queries
-            .entry(table_id)
-            .or_insert_with(Vec::new)
-            .push(query);
-    }
+    pub fn response_js_value(&mut self) -> JsValue {
+        if self.response.is_some() && !self.response_dirty {
+            return graphql_response_to_js_value(self.response.as_ref().unwrap());
+        }
 
-    /// Registers an IVM-based observable query.
-    /// The query's dependencies are automatically extracted from its dataflow.
-    pub fn register_ivm(&mut self, query: Rc<RefCell<ObservableQuery>>) {
-        let deps: Vec<TableId> = query.borrow().dependencies().to_vec();
-        for table_id in deps {
-            self.ivm_queries
-                .entry(table_id)
-                .or_insert_with(Vec::new)
-                .push(query.clone());
+        if self.subscribers.callback_count() == 0 {
+            return self.render_response_js_value();
+        }
+
+        match self.current_response() {
+            Some(response) => graphql_response_to_js_value(response),
+            None => JsValue::NULL,
         }
     }
 
-    fn flush_requery_changes(&self, changes: HashMap<TableId, HashSet<u64>>) {
-        let mut merged: HashMap<usize, (Rc<RefCell<ReQueryObservable>>, HashSet<u64>)> =
-            HashMap::new();
-
-        for (table_id, changed_ids) in changes {
-            if let Some(queries) = self.queries.get(&table_id) {
-                for query in queries {
-                    let key = Rc::as_ptr(query) as usize;
-                    let entry = merged
-                        .entry(key)
-                        .or_insert_with(|| (query.clone(), HashSet::new()));
-                    entry.1.extend(changed_ids.iter().copied());
-                }
-            }
-        }
-
-        for (_, (query, changed_ids)) in merged {
-            query.borrow_mut().on_change(&changed_ids);
-        }
-    }
-
-    /// Handles table changes by batching and scheduling a flush.
-    /// Multiple rapid changes are coalesced into a single re-query/propagation.
-    pub fn on_table_change(&mut self, table_id: TableId, changed_ids: &HashSet<u64>) {
-        // Accumulate changes for re-query observables
-        {
-            let mut pending = self.pending_changes.borrow_mut();
-            pending
-                .entry(table_id)
-                .or_insert_with(HashSet::new)
-                .extend(changed_ids.iter().copied());
-        }
-
-        // Schedule flush if not already scheduled
-        let mut scheduled = self.flush_scheduled.borrow_mut();
-        if !*scheduled {
-            *scheduled = true;
-            drop(scheduled);
-            self.schedule_flush();
-        }
-    }
-
-    /// Handles table changes with IVM deltas.
-    /// This is the new DBSP-based path that propagates deltas incrementally.
-    pub fn on_table_change_ivm(
+    pub fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(
         &mut self,
-        table_id: TableId,
-        deltas: Vec<Delta<Row>>,
-        changed_ids: &HashSet<u64>,
-    ) {
-        // Accumulate IVM deltas
-        {
-            let mut pending = self.pending_ivm_deltas.borrow_mut();
-            pending
-                .entry(table_id)
-                .or_insert_with(Vec::new)
-                .extend(deltas);
-        }
-
-        // Also accumulate for re-query observables
-        {
-            let mut pending = self.pending_changes.borrow_mut();
-            pending
-                .entry(table_id)
-                .or_insert_with(HashSet::new)
-                .extend(changed_ids.iter().copied());
-        }
-
-        let mut scheduled = self.flush_scheduled.borrow_mut();
-        if !*scheduled {
-            *scheduled = true;
-            drop(scheduled);
-            self.schedule_flush();
-        }
+        callback: F,
+    ) -> usize {
+        self.subscribers.add_callback(callback)
     }
 
-    /// Schedules a flush to run after the current microtask.
-    fn schedule_flush(&mut self) {
-        #[cfg(target_arch = "wasm32")]
-        {
-            // Lazily create the reusable flush closure once
-            if self.flush_closure.is_none() {
-                if let Some(ref self_ref) = self.self_ref {
-                    let self_ref_clone = self_ref.clone();
-                    let pending_changes = self.pending_changes.clone();
-                    let pending_ivm_deltas = self.pending_ivm_deltas.clone();
-                    let flush_scheduled = self.flush_scheduled.clone();
+    pub fn unsubscribe(&mut self, id: usize) -> bool {
+        self.subscribers.remove(id)
+    }
 
-                    self.flush_closure = Some(Closure::new(move |_: JsValue| {
-                        *flush_scheduled.borrow_mut() = false;
+    pub fn subscription_count(&self) -> usize {
+        self.subscribers.total_count()
+    }
 
-                        // Flush IVM deltas first (O(delta) path)
-                        let ivm_changes: HashMap<TableId, Vec<Delta<Row>>> =
-                            pending_ivm_deltas.borrow_mut().drain().collect();
-                        {
-                            let registry = self_ref_clone.borrow();
-                            for (table_id, deltas) in &ivm_changes {
-                                if let Some(queries) = registry.ivm_queries.get(table_id) {
-                                    for query in queries {
-                                        query
-                                            .borrow_mut()
-                                            .on_table_change(*table_id, deltas.clone());
-                                    }
-                                }
-                            }
-                        }
+    pub fn listener_count(&self) -> usize {
+        self.subscribers.callback_count()
+    }
 
-                        // Then flush re-query changes (O(result_set) path)
-                        let changes: HashMap<TableId, HashSet<u64>> =
-                            pending_changes.borrow_mut().drain().collect();
-                        {
-                            let registry = self_ref_clone.borrow();
-                            registry.flush_requery_changes(changes);
-                        }
+    pub fn on_change(&mut self, changes: &HashMap<TableId, HashSet<u64>>) {
+        if self.subscribers.total_count() == 0 {
+            return;
+        }
 
-                        // GC: remove queries with no subscribers to prevent memory leaks
-                        {
-                            let mut registry = self_ref_clone.borrow_mut();
-                            registry.gc_dead_queries();
-                        }
-                    }));
-                }
-            }
-
-            if let Some(ref closure) = self.flush_closure {
-                let promise = js_sys::Promise::resolve(&JsValue::UNDEFINED);
-                let _ = promise.then(closure);
+        let mut root_changed_ids = HashSet::new();
+        let mut saw_nested_change = false;
+        for (table_id, changed_ids) in changes {
+            if self.root_table_ids.contains(table_id) {
+                root_changed_ids.extend(changed_ids.iter().copied());
+            } else {
+                saw_nested_change = true;
             }
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            // In non-WASM environment, flush immediately (for testing)
-            self.flush_sync();
+        let mut root_changed = false;
+        if !root_changed_ids.is_empty() {
+            root_changed = match self.refresh_root_rows(&root_changed_ids) {
+                Some(changed) => changed,
+                None => return,
+            };
         }
-    }
 
-    /// Synchronous flush for testing in non-WASM environment.
-    #[cfg(not(target_arch = "wasm32"))]
-    fn flush_sync(&mut self) {
-        *self.flush_scheduled.borrow_mut() = false;
+        if !root_changed && !saw_nested_change {
+            return;
+        }
 
-        // Flush IVM deltas
-        let ivm_changes: HashMap<TableId, Vec<Delta<Row>>> =
-            self.pending_ivm_deltas.borrow_mut().drain().collect();
-        for (table_id, deltas) in &ivm_changes {
-            if let Some(queries) = self.ivm_queries.get(table_id) {
-                for query in queries {
-                    query
-                        .borrow_mut()
-                        .on_table_change(*table_id, deltas.clone());
+        if let Some(plan) = self.batch_plan.as_ref() {
+            match build_snapshot_batch_invalidation(
+                &self.dependency_table_names,
+                changes,
+                root_changed,
+            ) {
+                Ok(invalidation) => self.batch_state.apply_invalidation(plan, &invalidation),
+                Err(()) => {
+                    self.batch_state = cynos_gql::GraphqlBatchState::default();
                 }
             }
         }
+        self.response_dirty = true;
+        if self.subscribers.callback_count() == 0 {
+            return;
+        }
 
-        // Flush re-query changes
-        let changes: HashMap<TableId, HashSet<u64>> =
-            self.pending_changes.borrow_mut().drain().collect();
-        self.flush_requery_changes(changes);
-
-        self.gc_dead_queries();
-    }
-
-    /// Forces an immediate flush of all pending changes.
-    /// Useful for testing or when you need synchronous behavior.
-    pub fn flush(&mut self) {
-        *self.flush_scheduled.borrow_mut() = false;
-
-        // Flush IVM deltas
-        let ivm_changes: HashMap<TableId, Vec<Delta<Row>>> =
-            self.pending_ivm_deltas.borrow_mut().drain().collect();
-        for (table_id, deltas) in &ivm_changes {
-            if let Some(queries) = self.ivm_queries.get(table_id) {
-                for query in queries {
-                    query
-                        .borrow_mut()
-                        .on_table_change(*table_id, deltas.clone());
+        if let Some(changed) = self.materialize_response_if_dirty() {
+            if changed {
+                if let Some(response) = self.response.as_ref() {
+                    self.subscribers.emit(response);
                 }
             }
         }
-
-        // Flush re-query changes
-        let changes: HashMap<TableId, HashSet<u64>> =
-            self.pending_changes.borrow_mut().drain().collect();
-        self.flush_requery_changes(changes);
-
-        self.gc_dead_queries();
     }
 
-    /// Removes queries with no active subscribers from the registry.
-    /// Called after each flush to prevent memory leaks from abandoned queries.
-    fn gc_dead_queries(&mut self) {
-        for queries in self.ivm_queries.values_mut() {
-            queries.retain(|q| q.borrow().subscription_count() > 0);
+    fn refresh_root_rows(&mut self, changed_ids: &HashSet<u64>) -> Option<bool> {
+        if let Some(changed_rows) =
+            collect_changed_rows(&self.cache, &self.compiled_plan, changed_ids)
+        {
+            match self
+                .compiled_plan
+                .apply_reactive_patch(&mut self.root_rows, &changed_rows)
+            {
+                Some(true) => {
+                    self.root_summary = QueryResultSummary::from_rows(&self.root_rows);
+                    return Some(true);
+                }
+                Some(false) => return Some(false),
+                None => {}
+            }
         }
-        self.ivm_queries.retain(|_, v| !v.is_empty());
 
-        for queries in self.queries.values_mut() {
-            queries.retain(|q| q.borrow().subscription_count() > 0);
+        let cache = self.cache.borrow();
+        let output =
+            execute_compiled_physical_plan_with_summary(&cache, &self.compiled_plan).ok()?;
+        if query_results_equal(
+            &self.root_summary,
+            &output.summary,
+            &self.root_rows,
+            &output.rows,
+        ) {
+            return Some(false);
         }
-        self.queries.retain(|_, v| !v.is_empty());
+
+        self.root_rows = output.rows;
+        self.root_summary = output.summary;
+        Some(true)
     }
 
-    /// Returns the number of registered queries (both re-query and IVM).
-    pub fn query_count(&self) -> usize {
-        let requery_count: usize = self.queries.values().map(|v| v.len()).sum();
-        let ivm_count: usize = self.ivm_queries.values().map(|v| v.len()).sum();
-        requery_count + ivm_count
+    fn materialize_response_if_dirty(&mut self) -> Option<bool> {
+        if !self.response_dirty && self.response.is_some() {
+            return Some(false);
+        }
+
+        let cache = self.cache.borrow();
+        let response = match self.batch_plan.as_ref() {
+            Some(plan) => build_graphql_response_batched(
+                &cache,
+                &self.catalog,
+                &self.field,
+                plan,
+                &mut self.batch_state,
+                &self.root_rows,
+            )
+            .ok()?,
+            None => {
+                build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows).ok()?
+            }
+        };
+        let changed = self
+            .response
+            .as_ref()
+            .map_or(true, |current| *current != response);
+        if changed {
+            self.response = Some(response);
+        }
+        self.response_dirty = false;
+        Some(changed)
     }
 
-    /// Returns whether there are pending changes waiting to be flushed.
-    pub fn has_pending_changes(&self) -> bool {
-        !self.pending_changes.borrow().is_empty()
+    fn current_response(&mut self) -> Option<&cynos_gql::GraphqlResponse> {
+        self.materialize_response_if_dirty()?;
+        self.response.as_ref()
+    }
+
+    fn render_response_js_value(&mut self) -> JsValue {
+        let cache = self.cache.borrow();
+        let response = match self.batch_plan.as_ref() {
+            Some(plan) => build_graphql_response_batched(
+                &cache,
+                &self.catalog,
+                &self.field,
+                plan,
+                &mut self.batch_state,
+                &self.root_rows,
+            ),
+            None => build_graphql_response(&cache, &self.catalog, &self.field, &self.root_rows),
+        };
+        match response {
+            Ok(response) => graphql_response_to_js_value(&response),
+            Err(_) => JsValue::NULL,
+        }
     }
 }
 
-impl Default for QueryRegistry {
-    fn default() -> Self {
-        Self::new()
+pub struct GraphqlDeltaObservable {
+    view: MaterializedView,
+    cache: Rc<RefCell<TableCache>>,
+    catalog: cynos_gql::GraphqlCatalog,
+    field: cynos_gql::bind::BoundRootField,
+    batch_plan: Option<cynos_gql::GraphqlBatchPlan>,
+    batch_state: cynos_gql::GraphqlBatchState,
+    dependency_table_names: HashMap<TableId, String>,
+    has_nested_relations: bool,
+    response: Option<cynos_gql::GraphqlResponse>,
+    response_dirty: bool,
+    subscribers: GraphqlSubscribers,
+}
+
+impl GraphqlDeltaObservable {
+    pub fn new(
+        dataflow: DataflowNode,
+        cache: Rc<RefCell<TableCache>>,
+        catalog: cynos_gql::GraphqlCatalog,
+        field: cynos_gql::bind::BoundRootField,
+        dependency_table_bindings: Vec<(TableId, String)>,
+        initial_rows: Vec<Row>,
+    ) -> Self {
+        Self {
+            view: MaterializedView::with_initial(dataflow, initial_rows),
+            cache,
+            batch_plan: cynos_gql::compile_batch_plan(&catalog, &field)
+                .ok()
+                .filter(|plan| plan.has_relations()),
+            batch_state: cynos_gql::GraphqlBatchState::default(),
+            dependency_table_names: dependency_table_bindings.into_iter().collect(),
+            catalog,
+            has_nested_relations: root_field_has_relations(&field),
+            field,
+            response: None,
+            response_dirty: true,
+            subscribers: GraphqlSubscribers::default(),
+        }
+    }
+
+    pub fn attach_keepalive(&mut self) -> usize {
+        self.subscribers.add_keepalive()
+    }
+
+    pub fn response_js_value(&mut self) -> JsValue {
+        if self.response.is_some() && !self.response_dirty {
+            return graphql_response_to_js_value(self.response.as_ref().unwrap());
+        }
+
+        if self.subscribers.callback_count() == 0 {
+            return self.render_response_js_value();
+        }
+
+        match self.current_response() {
+            Some(response) => graphql_response_to_js_value(response),
+            None => JsValue::NULL,
+        }
+    }
+
+    pub fn dependencies(&self) -> &[TableId] {
+        self.view.dependencies()
+    }
+
+    pub fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(
+        &mut self,
+        callback: F,
+    ) -> usize {
+        self.subscribers.add_callback(callback)
+    }
+
+    pub fn unsubscribe(&mut self, id: usize) -> bool {
+        self.subscribers.remove(id)
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscribers.total_count()
+    }
+
+    pub fn listener_count(&self) -> usize {
+        self.subscribers.callback_count()
+    }
+
+    pub fn on_table_change(&mut self, table_id: TableId, deltas: Vec<Delta<Row>>) {
+        if self.subscribers.total_count() == 0 {
+            return;
+        }
+
+        let batch_invalidation = self.batch_plan.as_ref().map(|plan| {
+            build_delta_batch_invalidation(
+                plan,
+                &self.dependency_table_names,
+                table_id,
+                &deltas,
+                false,
+            )
+        });
+        let output_deltas = self.view.on_table_change(table_id, deltas);
+        if output_deltas.is_empty() && !self.has_nested_relations {
+            return;
+        }
+
+        if let Some(plan) = self.batch_plan.as_ref() {
+            match batch_invalidation {
+                Some(Ok(mut invalidation)) => {
+                    invalidation.root_changed = !output_deltas.is_empty();
+                    self.batch_state.apply_invalidation(plan, &invalidation);
+                }
+                Some(Err(())) => {
+                    self.batch_state = cynos_gql::GraphqlBatchState::default();
+                }
+                None => {}
+            }
+        }
+        self.response_dirty = true;
+        if self.subscribers.callback_count() == 0 {
+            return;
+        }
+
+        if let Some(changed) = self.materialize_response_if_dirty() {
+            if changed {
+                if let Some(response) = self.response.as_ref() {
+                    self.subscribers.emit(response);
+                }
+            }
+        }
+    }
+
+    fn materialize_response_if_dirty(&mut self) -> Option<bool> {
+        if !self.response_dirty && self.response.is_some() {
+            return Some(false);
+        }
+
+        let rows = self.view.result();
+        let cache = self.cache.borrow();
+        let response = match self.batch_plan.as_ref() {
+            Some(plan) => build_graphql_response_from_owned_rows_batched(
+                &cache,
+                &self.catalog,
+                &self.field,
+                plan,
+                &mut self.batch_state,
+                &rows,
+            )
+            .ok()?,
+            None => {
+                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
+                    .ok()?
+            }
+        };
+        let changed = self
+            .response
+            .as_ref()
+            .map_or(true, |current| *current != response);
+        if changed {
+            self.response = Some(response);
+        }
+        self.response_dirty = false;
+        Some(changed)
+    }
+
+    fn current_response(&mut self) -> Option<&cynos_gql::GraphqlResponse> {
+        self.materialize_response_if_dirty()?;
+        self.response.as_ref()
+    }
+
+    fn render_response_js_value(&mut self) -> JsValue {
+        let rows = self.view.result();
+        let cache = self.cache.borrow();
+        let response = match self.batch_plan.as_ref() {
+            Some(plan) => build_graphql_response_from_owned_rows_batched(
+                &cache,
+                &self.catalog,
+                &self.field,
+                plan,
+                &mut self.batch_state,
+                &rows,
+            ),
+            None => {
+                build_graphql_response_from_owned_rows(&cache, &self.catalog, &self.field, &rows)
+            }
+        };
+        match response {
+            Ok(response) => graphql_response_to_js_value(&response),
+            Err(_) => JsValue::NULL,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum GraphqlSubscriptionInner {
+    Snapshot(Rc<RefCell<GraphqlSubscriptionObservable>>),
+    Delta(Rc<RefCell<GraphqlDeltaObservable>>),
+}
+
+impl GraphqlSubscriptionInner {
+    fn attach_keepalive(&self) -> usize {
+        match self {
+            Self::Snapshot(inner) => inner.borrow_mut().attach_keepalive(),
+            Self::Delta(inner) => inner.borrow_mut().attach_keepalive(),
+        }
+    }
+
+    fn response_js_value(&self) -> JsValue {
+        match self {
+            Self::Snapshot(inner) => inner.borrow_mut().response_js_value(),
+            Self::Delta(inner) => inner.borrow_mut().response_js_value(),
+        }
+    }
+
+    fn subscribe<F: Fn(&cynos_gql::GraphqlResponse) + 'static>(&self, callback: F) -> usize {
+        match self {
+            Self::Snapshot(inner) => inner.borrow_mut().subscribe(callback),
+            Self::Delta(inner) => inner.borrow_mut().subscribe(callback),
+        }
+    }
+
+    fn unsubscribe(&self, id: usize) -> bool {
+        match self {
+            Self::Snapshot(inner) => inner.borrow_mut().unsubscribe(id),
+            Self::Delta(inner) => inner.borrow_mut().unsubscribe(id),
+        }
+    }
+
+    fn listener_count(&self) -> usize {
+        match self {
+            Self::Snapshot(inner) => inner.borrow().listener_count(),
+            Self::Delta(inner) => inner.borrow().listener_count(),
+        }
     }
 }
 
@@ -823,51 +1193,34 @@ fn ivm_full_rows_to_js_array(rows: &[Row], schema: &Table) -> JsValue {
 ///
 /// The callback receives a standard GraphQL payload object with a single `data`
 /// property. The payload is emitted immediately on subscribe and again whenever
-/// the root query result changes.
+/// the rendered GraphQL response changes.
 #[wasm_bindgen]
 pub struct JsGraphqlSubscription {
-    inner: Rc<RefCell<ReQueryObservable>>,
-    cache: Rc<RefCell<TableCache>>,
-    catalog: cynos_gql::GraphqlCatalog,
-    field: cynos_gql::bind::BoundRootField,
+    inner: GraphqlSubscriptionInner,
     keepalive_sub_id: usize,
 }
 
 impl JsGraphqlSubscription {
-    pub(crate) fn new(
-        inner: Rc<RefCell<ReQueryObservable>>,
-        cache: Rc<RefCell<TableCache>>,
-        catalog: cynos_gql::GraphqlCatalog,
-        field: cynos_gql::bind::BoundRootField,
-    ) -> Self {
-        let keepalive_sub_id = inner.borrow_mut().subscribe(|_| {});
-        Self {
-            inner,
-            cache,
-            catalog,
-            field,
-            keepalive_sub_id,
-        }
+    pub(crate) fn new_snapshot(inner: Rc<RefCell<GraphqlSubscriptionObservable>>) -> Self {
+        Self::new(GraphqlSubscriptionInner::Snapshot(inner))
     }
 
-    fn payload_for_rows(&self, rows: &[Rc<Row>]) -> JsValue {
-        let cache = self.cache.borrow();
-        let root_field =
-            match cynos_gql::execute::render_root_field_rows(&cache, &self.catalog, &self.field, rows)
-            {
-                Ok(field) => field,
-                Err(_) => return JsValue::NULL,
-            };
+    pub(crate) fn new_delta(inner: Rc<RefCell<GraphqlDeltaObservable>>) -> Self {
+        Self::new(GraphqlSubscriptionInner::Delta(inner))
+    }
 
-        let response =
-            cynos_gql::GraphqlResponse::new(cynos_gql::ResponseValue::object(alloc::vec![root_field]));
-        gql_response_to_js(&response).unwrap_or(JsValue::NULL)
+    fn new(inner: GraphqlSubscriptionInner) -> Self {
+        let keepalive_sub_id = inner.attach_keepalive();
+        Self {
+            inner,
+            keepalive_sub_id,
+        }
     }
 }
 
 impl Drop for JsGraphqlSubscription {
     fn drop(&mut self) {
-        self.inner.borrow_mut().unsubscribe(self.keepalive_sub_id);
+        self.inner.unsubscribe(self.keepalive_sub_id);
     }
 }
 
@@ -876,35 +1229,19 @@ impl JsGraphqlSubscription {
     /// Returns the current GraphQL payload.
     #[wasm_bindgen(js_name = getResult)]
     pub fn get_result(&self) -> JsValue {
-        let inner = self.inner.borrow();
-        self.payload_for_rows(inner.result())
+        self.inner.response_js_value()
     }
 
     /// Subscribes to GraphQL payload changes and emits the initial value immediately.
     pub fn subscribe(&self, callback: js_sys::Function) -> js_sys::Function {
-        let initial = {
-            let inner = self.inner.borrow();
-            self.payload_for_rows(inner.result())
-        };
-        callback.call1(&JsValue::NULL, &initial).ok();
-
         let inner = self.inner.clone();
-        let cache = self.cache.clone();
-        let catalog = self.catalog.clone();
-        let field = self.field.clone();
-        let sub_id = inner.borrow_mut().subscribe(move |rows| {
-            let cache = cache.borrow();
-            let payload = match cynos_gql::execute::render_root_field_rows(&cache, &catalog, &field, rows) {
-                Ok(root_field) => {
-                    let response = cynos_gql::GraphqlResponse::new(cynos_gql::ResponseValue::object(
-                        alloc::vec![root_field],
-                    ));
-                    gql_response_to_js(&response).unwrap_or(JsValue::NULL)
-                }
-                Err(_) => JsValue::NULL,
-            };
+        let initial_callback = callback.clone();
+        let sub_id = inner.subscribe(move |response| {
+            let payload = graphql_response_to_js_value(response);
             callback.call1(&JsValue::NULL, &payload).ok();
         });
+        let initial = inner.response_js_value();
+        initial_callback.call1(&JsValue::NULL, &initial).ok();
 
         let called = Rc::new(RefCell::new(false));
         let called_c = called.clone();
@@ -912,7 +1249,7 @@ impl JsGraphqlSubscription {
             let mut c = called_c.borrow_mut();
             if !*c {
                 *c = true;
-                inner.borrow_mut().unsubscribe(sub_id);
+                inner.unsubscribe(sub_id);
             }
         }) as Box<dyn FnMut()>);
         unsubscribe.into_js_value().unchecked_into()
@@ -921,7 +1258,7 @@ impl JsGraphqlSubscription {
     /// Returns the number of active subscriptions.
     #[wasm_bindgen(js_name = subscriptionCount)]
     pub fn subscription_count(&self) -> usize {
-        self.inner.borrow().subscription_count().saturating_sub(1)
+        self.inner.listener_count()
     }
 }
 
@@ -1055,6 +1392,7 @@ fn projected_rows_to_js_array(rows: &[Rc<Row>], column_names: &[String]) -> JsVa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_runtime::LiveRegistry;
     use cynos_core::schema::TableBuilder;
     use cynos_core::{DataType, Value};
     use cynos_query::ast::Expr;
@@ -1091,8 +1429,8 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
-    fn test_query_registry_new() {
-        let registry = QueryRegistry::new();
+    fn test_live_registry_new() {
+        let registry = LiveRegistry::new();
         assert_eq!(registry.query_count(), 0);
     }
 
@@ -1172,7 +1510,7 @@ mod tests {
         let old_summary = QueryResultSummary::from_rows(&old_rows);
         let new_summary = QueryResultSummary::from_rows(&new_rows);
         assert!(
-            !ReQueryObservable::results_equal(&old_summary, &new_summary, &old_rows, &new_rows),
+            !query_results_equal(&old_summary, &new_summary, &old_rows, &new_rows),
             "Projected value changed from Alice to Alicia, so live query comparison should detect a change",
         );
     }
@@ -1196,12 +1534,7 @@ mod tests {
         };
 
         assert!(
-            !ReQueryObservable::results_equal(
-                &colliding_summary,
-                &colliding_summary,
-                &old_rows,
-                &new_rows,
-            ),
+            !query_results_equal(&colliding_summary, &colliding_summary, &old_rows, &new_rows,),
             "Row comparison must remain deterministic even if two summaries collide",
         );
     }

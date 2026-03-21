@@ -576,8 +576,8 @@ impl Expr {
             }
             ExprInner::Between { column, low, high } => {
                 let lookup_key = column_lookup_key(column);
-                let (table, idx, dt) = get_column_info(&lookup_key)
-                    .unwrap_or((String::new(), 0, DataType::Float64));
+                let (table, idx, dt) =
+                    get_column_info(&lookup_key).unwrap_or((String::new(), 0, DataType::Float64));
                 let col_expr = AstExpr::column(&table, &column.name, idx);
                 let low_val = js_to_value(low, dt).unwrap_or(Value::Null);
                 let high_val = js_to_value(high, dt).unwrap_or(Value::Null);
@@ -589,8 +589,8 @@ impl Expr {
             }
             ExprInner::NotBetween { column, low, high } => {
                 let lookup_key = column_lookup_key(column);
-                let (table, idx, dt) = get_column_info(&lookup_key)
-                    .unwrap_or((String::new(), 0, DataType::Float64));
+                let (table, idx, dt) =
+                    get_column_info(&lookup_key).unwrap_or((String::new(), 0, DataType::Float64));
                 let col_expr = AstExpr::column(&table, &column.name, idx);
                 let low_val = js_to_value(low, dt).unwrap_or(Value::Null);
                 let high_val = js_to_value(high, dt).unwrap_or(Value::Null);

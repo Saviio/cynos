@@ -14,13 +14,14 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use cynos_core::{Row, Value};
+use cynos_core::{schema::Table, Row, Value};
 use cynos_incremental::{
     AggregateType, DataflowNode, JoinType as IvmJoinType, KeyExtractorFn, TableId,
 };
+use cynos_index::KeyRange;
 use cynos_query::ast::JoinType as QueryJoinType;
 use cynos_query::ast::{AggregateFunc, BinaryOp, Expr, UnaryOp};
-use cynos_query::planner::PhysicalPlan;
+use cynos_query::planner::{IndexBounds, PhysicalPlan};
 use hashbrown::HashMap;
 
 /// Result of compiling a PhysicalPlan to a DataflowNode.
@@ -119,6 +120,12 @@ struct CompiledNode {
     layout: CompileLayout,
 }
 
+#[derive(Clone)]
+struct IndexedColumnRef {
+    name: String,
+    index: usize,
+}
+
 /// Compiles a PhysicalPlan into a DataflowNode for IVM.
 ///
 /// Returns None if the plan contains non-incrementalizable operators
@@ -126,43 +133,258 @@ struct CompiledNode {
 pub fn compile_to_dataflow(
     plan: &PhysicalPlan,
     table_id_map: &HashMap<String, TableId>,
-    table_column_counts: &HashMap<String, usize>,
+    table_schemas: &HashMap<String, Table>,
 ) -> Option<CompileResult> {
     if !plan.is_incrementalizable() {
         return None;
     }
 
     let mut table_ids = table_id_map.clone();
-    let compiled = compile_node(plan, &mut table_ids, table_column_counts)?;
+    let compiled = compile_node(plan, &mut table_ids, table_schemas)?;
     Some(CompileResult {
         dataflow: compiled.dataflow,
         table_ids,
     })
 }
 
+fn compile_source_node(
+    table: &str,
+    table_ids: &mut HashMap<String, TableId>,
+    table_schemas: &HashMap<String, Table>,
+) -> Option<CompiledNode> {
+    let table_id = get_or_assign_table_id(table, table_ids);
+    let column_count = table_schemas.get(table)?.columns().len();
+    Some(CompiledNode {
+        dataflow: DataflowNode::source(table_id),
+        layout: CompileLayout::table(table, column_count),
+    })
+}
+
+fn compile_filtered_source(
+    table: &str,
+    predicate: Option<Expr>,
+    table_ids: &mut HashMap<String, TableId>,
+    table_schemas: &HashMap<String, Table>,
+) -> Option<CompiledNode> {
+    let source = compile_source_node(table, table_ids, table_schemas)?;
+    if let Some(predicate) = predicate {
+        let bound_predicate = bind_expr_to_layout(&predicate, &source.layout);
+        let pred_fn = compile_predicate(&bound_predicate);
+        return Some(CompiledNode {
+            dataflow: DataflowNode::Filter {
+                input: Box::new(source.dataflow),
+                predicate: pred_fn,
+            },
+            layout: source.layout,
+        });
+    }
+
+    Some(source)
+}
+
+fn lookup_index_columns(
+    table_schemas: &HashMap<String, Table>,
+    table: &str,
+    index_name: &str,
+) -> Option<Vec<IndexedColumnRef>> {
+    let schema = table_schemas.get(table)?;
+    let index = schema
+        .get_index(index_name)
+        .or_else(|| {
+            schema
+                .indices()
+                .iter()
+                .find(|candidate| candidate.normalized_name() == index_name)
+        })
+        .or_else(|| {
+            schema.primary_key().filter(|candidate| {
+                candidate.name() == index_name || candidate.normalized_name() == index_name
+            })
+        })?;
+
+    index
+        .columns()
+        .iter()
+        .map(|column| {
+            Some(IndexedColumnRef {
+                name: column.name.clone(),
+                index: schema.get_column_index(&column.name)?,
+            })
+        })
+        .collect()
+}
+
+fn column_expr(table: &str, column: &IndexedColumnRef) -> Expr {
+    Expr::column(table, column.name.clone(), column.index)
+}
+
+fn combine_with_and(mut predicates: Vec<Expr>) -> Option<Expr> {
+    let first = predicates.pop()?;
+    Some(
+        predicates
+            .into_iter()
+            .fold(first, |combined, predicate| Expr::and(combined, predicate)),
+    )
+}
+
+fn build_scalar_range_predicate(
+    table: &str,
+    column: &IndexedColumnRef,
+    range: &KeyRange<Value>,
+) -> Option<Expr> {
+    let expr = column_expr(table, column);
+    match range {
+        KeyRange::All => None,
+        KeyRange::Only(value) => Some(Expr::eq(expr, Expr::Literal(value.clone()))),
+        KeyRange::LowerBound { value, exclusive } => Some(if *exclusive {
+            Expr::gt(expr, Expr::Literal(value.clone()))
+        } else {
+            Expr::ge(expr, Expr::Literal(value.clone()))
+        }),
+        KeyRange::UpperBound { value, exclusive } => Some(if *exclusive {
+            Expr::lt(expr, Expr::Literal(value.clone()))
+        } else {
+            Expr::le(expr, Expr::Literal(value.clone()))
+        }),
+        KeyRange::Bound {
+            lower,
+            upper,
+            lower_exclusive,
+            upper_exclusive,
+        } => combine_with_and(alloc::vec![
+            if *lower_exclusive {
+                Expr::gt(column_expr(table, column), Expr::Literal(lower.clone()))
+            } else {
+                Expr::ge(column_expr(table, column), Expr::Literal(lower.clone()))
+            },
+            if *upper_exclusive {
+                Expr::lt(column_expr(table, column), Expr::Literal(upper.clone()))
+            } else {
+                Expr::le(column_expr(table, column), Expr::Literal(upper.clone()))
+            },
+        ]),
+    }
+}
+
+fn build_composite_only_predicate(
+    table: &str,
+    indexed_columns: &[IndexedColumnRef],
+    values: &[Value],
+) -> Result<Expr, ()> {
+    if indexed_columns.len() != values.len() || indexed_columns.is_empty() {
+        return Err(());
+    }
+
+    combine_with_and(
+        indexed_columns
+            .iter()
+            .zip(values.iter())
+            .map(|(column, value)| {
+                Expr::eq(column_expr(table, column), Expr::Literal(value.clone()))
+            })
+            .collect(),
+    )
+    .ok_or(())
+}
+
+fn build_index_scan_predicate(
+    table: &str,
+    indexed_columns: &[IndexedColumnRef],
+    bounds: &IndexBounds,
+) -> Result<Option<Expr>, ()> {
+    match bounds {
+        IndexBounds::Unbounded => Ok(None),
+        IndexBounds::Scalar(range) => {
+            if indexed_columns.len() != 1 {
+                return Err(());
+            }
+            Ok(build_scalar_range_predicate(
+                table,
+                &indexed_columns[0],
+                range,
+            ))
+        }
+        IndexBounds::Composite(range) => match range {
+            KeyRange::All => Ok(None),
+            KeyRange::Only(values) => {
+                build_composite_only_predicate(table, indexed_columns, values).map(Some)
+            }
+            KeyRange::Bound {
+                lower,
+                upper,
+                lower_exclusive,
+                upper_exclusive,
+            } if lower == upper && !lower_exclusive && !upper_exclusive => {
+                build_composite_only_predicate(table, indexed_columns, lower).map(Some)
+            }
+            _ => Err(()),
+        },
+    }
+}
+
 fn compile_node(
     plan: &PhysicalPlan,
     table_ids: &mut HashMap<String, TableId>,
-    table_column_counts: &HashMap<String, usize>,
+    table_schemas: &HashMap<String, Table>,
 ) -> Option<CompiledNode> {
     match plan {
-        // All scan types map to Source nodes
-        PhysicalPlan::TableScan { table }
-        | PhysicalPlan::IndexScan { table, .. }
-        | PhysicalPlan::IndexGet { table, .. }
-        | PhysicalPlan::IndexInGet { table, .. }
-        | PhysicalPlan::GinIndexScan { table, .. }
-        | PhysicalPlan::GinIndexScanMulti { table, .. } => {
-            let table_id = get_or_assign_table_id(table, table_ids);
-            let column_count = table_column_counts.get(table).copied()?;
-            Some(CompiledNode {
-                dataflow: DataflowNode::source(table_id),
-                layout: CompileLayout::table(table, column_count),
-            })
+        PhysicalPlan::TableScan { table } => compile_source_node(table, table_ids, table_schemas),
+
+        PhysicalPlan::IndexScan {
+            table,
+            index,
+            bounds,
+            limit,
+            offset,
+            reverse,
+        } => {
+            if *reverse || limit.is_some() || offset.unwrap_or(0) > 0 {
+                return None;
+            }
+            let indexed_columns = lookup_index_columns(table_schemas, table, index)?;
+            let predicate = build_index_scan_predicate(table, &indexed_columns, bounds).ok()?;
+            compile_filtered_source(table, predicate, table_ids, table_schemas)
+        }
+
+        PhysicalPlan::IndexGet {
+            table,
+            index,
+            key,
+            limit,
+        } => {
+            if limit.is_some() {
+                return None;
+            }
+            let indexed_columns = lookup_index_columns(table_schemas, table, index)?;
+            if indexed_columns.len() != 1 {
+                return None;
+            }
+            let predicate = Some(Expr::eq(
+                column_expr(table, &indexed_columns[0]),
+                Expr::Literal(key.clone()),
+            ));
+            compile_filtered_source(table, predicate, table_ids, table_schemas)
+        }
+
+        PhysicalPlan::IndexInGet { table, index, keys } => {
+            let indexed_columns = lookup_index_columns(table_schemas, table, index)?;
+            if indexed_columns.len() != 1 {
+                return None;
+            }
+            let predicate = Some(Expr::In {
+                expr: Box::new(column_expr(table, &indexed_columns[0])),
+                list: keys.iter().cloned().map(Expr::Literal).collect(),
+            });
+            compile_filtered_source(table, predicate, table_ids, table_schemas)
+        }
+
+        PhysicalPlan::GinIndexScan { table, recheck, .. }
+        | PhysicalPlan::GinIndexScanMulti { table, recheck, .. } => {
+            compile_filtered_source(table, Some(recheck.clone()?), table_ids, table_schemas)
         }
 
         PhysicalPlan::Filter { input, predicate } => {
-            let input_node = compile_node(input, table_ids, table_column_counts)?;
+            let input_node = compile_node(input, table_ids, table_schemas)?;
             let bound_predicate = bind_expr_to_layout(predicate, &input_node.layout);
             let pred_fn = compile_predicate(&bound_predicate);
             Some(CompiledNode {
@@ -175,7 +397,7 @@ fn compile_node(
         }
 
         PhysicalPlan::Project { input, columns } => {
-            let input_node = compile_node(input, table_ids, table_column_counts)?;
+            let input_node = compile_node(input, table_ids, table_schemas)?;
             let bound_columns: Vec<Expr> = columns
                 .iter()
                 .map(|expr| bind_expr_to_layout(expr, &input_node.layout))
@@ -231,8 +453,8 @@ fn compile_node(
             join_type,
             output_tables,
         } => {
-            let left_node = compile_node(left, table_ids, table_column_counts)?;
-            let right_node = compile_node(right, table_ids, table_column_counts)?;
+            let left_node = compile_node(left, table_ids, table_schemas)?;
+            let right_node = compile_node(right, table_ids, table_schemas)?;
             let ivm_join_type = convert_join_type(join_type);
             let (left_key, right_key) =
                 extract_join_keys(condition, &left_node.layout, &right_node.layout);
@@ -256,9 +478,9 @@ fn compile_node(
             output_tables,
             ..
         } => {
-            let outer_node = compile_node(outer, table_ids, table_column_counts)?;
+            let outer_node = compile_node(outer, table_ids, table_schemas)?;
             let inner_table_id = get_or_assign_table_id(inner_table, table_ids);
-            let inner_column_count = table_column_counts.get(inner_table).copied()?;
+            let inner_column_count = table_schemas.get(inner_table)?.columns().len();
             let inner_layout = CompileLayout::table(inner_table, inner_column_count);
             let inner_node = CompiledNode {
                 dataflow: DataflowNode::source(inner_table_id),
@@ -286,8 +508,8 @@ fn compile_node(
         }
 
         PhysicalPlan::CrossProduct { left, right } => {
-            let left_node = compile_node(left, table_ids, table_column_counts)?;
-            let right_node = compile_node(right, table_ids, table_column_counts)?;
+            let left_node = compile_node(left, table_ids, table_schemas)?;
+            let right_node = compile_node(right, table_ids, table_schemas)?;
             let raw_layout = CompileLayout::combined(&left_node.layout, &right_node.layout);
             // Cross product = join with constant key (everything matches)
             Some(CompiledNode {
@@ -307,7 +529,7 @@ fn compile_node(
             group_by,
             aggregates,
         } => {
-            let input_node = compile_node(input, table_ids, table_column_counts)?;
+            let input_node = compile_node(input, table_ids, table_schemas)?;
             let bound_group_by: Vec<Expr> = group_by
                 .iter()
                 .map(|expr| bind_expr_to_layout(expr, &input_node.layout))
@@ -348,7 +570,7 @@ fn compile_node(
             })
         }
 
-        PhysicalPlan::NoOp { input } => compile_node(input, table_ids, table_column_counts),
+        PhysicalPlan::NoOp { input } => compile_node(input, table_ids, table_schemas),
         PhysicalPlan::Empty => Some(CompiledNode {
             dataflow: DataflowNode::source(u32::MAX),
             layout: CompileLayout {
@@ -762,12 +984,19 @@ fn convert_aggregate_func(func: &AggregateFunc) -> AggregateType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cynos_core::{schema::TableBuilder, DataType};
     use cynos_query::ast::Expr;
 
-    fn column_counts(entries: &[(&str, usize)]) -> HashMap<String, usize> {
+    fn table_schemas(entries: &[(&str, &[&str])]) -> HashMap<String, Table> {
         entries
             .iter()
-            .map(|(table, count)| ((*table).into(), *count))
+            .map(|(table, columns)| {
+                let mut builder = TableBuilder::new(*table).unwrap();
+                for column in *columns {
+                    builder = builder.add_column(*column, DataType::String).unwrap();
+                }
+                ((*table).into(), builder.build().unwrap())
+            })
             .collect()
     }
 
@@ -776,9 +1005,9 @@ mod tests {
         let plan = PhysicalPlan::table_scan("users");
         let mut table_ids = HashMap::new();
         table_ids.insert("users".into(), 1u32);
-        let table_column_counts = column_counts(&[("users", 2)]);
+        let table_schemas = table_schemas(&[("users", &["id", "name"])]);
 
-        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
         assert!(matches!(
             result.dataflow,
             DataflowNode::Source { table_id: 1 }
@@ -793,10 +1022,83 @@ mod tests {
         );
         let mut table_ids = HashMap::new();
         table_ids.insert("users".into(), 1u32);
-        let table_column_counts = column_counts(&[("users", 2)]);
+        let table_schemas = table_schemas(&[("users", &["id", "age"])]);
 
-        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
         assert!(matches!(result.dataflow, DataflowNode::Filter { .. }));
+    }
+
+    #[test]
+    fn test_compile_index_get_lowers_to_filtered_source() {
+        use cynos_incremental::{Delta, MaterializedView};
+
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_column("name", DataType::String)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let pk_name = users.primary_key().unwrap().name().to_string();
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert("users".into(), users);
+
+        let plan = PhysicalPlan::index_get("users", pk_name, Value::Int64(1));
+        let mut table_ids = HashMap::new();
+        table_ids.insert("users".into(), 1u32);
+
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
+        assert!(matches!(result.dataflow, DataflowNode::Filter { .. }));
+
+        let mut view = MaterializedView::new(result.dataflow);
+        view.on_table_change(
+            1,
+            vec![
+                Delta::insert(Row::new(
+                    1,
+                    vec![Value::Int64(1), Value::String("Alice".into())],
+                )),
+                Delta::insert(Row::new(
+                    2,
+                    vec![Value::Int64(2), Value::String("Bob".into())],
+                )),
+            ],
+        );
+
+        let rows = view.result();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::Int64(1)));
+    }
+
+    #[test]
+    fn test_compile_reverse_index_scan_is_not_incrementalizable() {
+        let users = TableBuilder::new("users")
+            .unwrap()
+            .add_column("id", DataType::Int64)
+            .unwrap()
+            .add_primary_key(&["id"], false)
+            .unwrap()
+            .build()
+            .unwrap();
+        let pk_name = users.primary_key().unwrap().name().to_string();
+        let mut table_schemas = HashMap::new();
+        table_schemas.insert("users".into(), users);
+
+        let plan = PhysicalPlan::IndexScan {
+            table: "users".into(),
+            index: pk_name,
+            bounds: IndexBounds::Unbounded,
+            limit: None,
+            offset: None,
+            reverse: true,
+        };
+        let mut table_ids = HashMap::new();
+        table_ids.insert("users".into(), 1u32);
+
+        assert!(compile_to_dataflow(&plan, &table_ids, &table_schemas).is_none());
     }
 
     #[test]
@@ -809,8 +1111,8 @@ mod tests {
             )],
         );
         let table_ids = HashMap::new();
-        let table_column_counts = column_counts(&[("users", 1)]);
-        assert!(compile_to_dataflow(&plan, &table_ids, &table_column_counts).is_none());
+        let table_schemas = table_schemas(&[("users", &["id"])]);
+        assert!(compile_to_dataflow(&plan, &table_ids, &table_schemas).is_none());
     }
 
     #[test]
@@ -828,9 +1130,12 @@ mod tests {
         let mut table_ids = HashMap::new();
         table_ids.insert("employees".into(), 1u32);
         table_ids.insert("departments".into(), 2u32);
-        let table_column_counts = column_counts(&[("employees", 3), ("departments", 2)]);
+        let table_schemas = table_schemas(&[
+            ("employees", &["id", "name", "dept_id"]),
+            ("departments", &["id", "name"]),
+        ]);
 
-        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
         match &result.dataflow {
             DataflowNode::Join { join_type, .. } => {
                 assert_eq!(*join_type, IvmJoinType::LeftOuter);
@@ -856,9 +1161,12 @@ mod tests {
         let mut table_ids = HashMap::new();
         table_ids.insert("employees".into(), 1u32);
         table_ids.insert("departments".into(), 2u32);
-        let table_column_counts = column_counts(&[("employees", 2), ("departments", 2)]);
+        let table_schemas = table_schemas(&[
+            ("employees", &["id", "dept_id"]),
+            ("departments", &["id", "name"]),
+        ]);
 
-        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
         match &result.dataflow {
             DataflowNode::Project { input, columns } => {
                 assert_eq!(columns, &[2, 3, 0, 1]);
@@ -883,9 +1191,9 @@ mod tests {
         );
         let mut table_ids = HashMap::new();
         table_ids.insert("orders".into(), 1u32);
-        let table_column_counts = column_counts(&[("orders", 3)]);
+        let table_schemas = table_schemas(&[("orders", &["customer_id", "id", "amount"])]);
 
-        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
         match &result.dataflow {
             DataflowNode::Aggregate {
                 group_by,
@@ -1007,9 +1315,9 @@ mod tests {
         );
         let mut table_ids = HashMap::new();
         table_ids.insert("users".into(), 1u32);
-        let table_column_counts = column_counts(&[("users", 2)]);
+        let table_schemas = table_schemas(&[("users", &["id", "name"])]);
 
-        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
         let mut view = MaterializedView::new(result.dataflow);
 
         // Insert rows: id=1 (match), id=2 (no match), id=3 (match)
@@ -1065,9 +1373,12 @@ mod tests {
         let mut table_ids = HashMap::new();
         table_ids.insert("employees".into(), 1u32);
         table_ids.insert("departments".into(), 2u32);
-        let table_column_counts = column_counts(&[("employees", 2), ("departments", 2)]);
+        let table_schemas = table_schemas(&[
+            ("employees", &["id", "dept_id"]),
+            ("departments", &["id", "name"]),
+        ]);
 
-        let result = compile_to_dataflow(&plan, &table_ids, &table_column_counts).unwrap();
+        let result = compile_to_dataflow(&plan, &table_ids, &table_schemas).unwrap();
         let mut view = MaterializedView::new(result.dataflow);
 
         view.on_table_change(

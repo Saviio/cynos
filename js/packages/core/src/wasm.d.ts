@@ -380,7 +380,7 @@ export enum JsDataType {
  *
  * The callback receives a standard GraphQL payload object with a single `data`
  * property. The payload is emitted immediately on subscribe and again whenever
- * the root query result changes.
+ * the rendered GraphQL response changes.
  */
 export class JsGraphqlSubscription {
     private constructor();
@@ -1068,11 +1068,11 @@ export interface InitOutput {
     readonly schemalayout_columnType: (a: number, b: number) => number;
     readonly schemalayout_nullMaskSize: (a: number) => number;
     readonly schemalayout_rowStride: (a: number) => number;
-    readonly __wasm_bindgen_func_elem_79: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_2202: (a: number, b: number) => void;
-    readonly __wasm_bindgen_func_elem_6158: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_2209: (a: number, b: number, c: number) => void;
-    readonly __wasm_bindgen_func_elem_1053: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_80: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_2475: (a: number, b: number) => void;
+    readonly __wasm_bindgen_func_elem_6812: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_2482: (a: number, b: number, c: number) => void;
+    readonly __wasm_bindgen_func_elem_1114: (a: number, b: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;
