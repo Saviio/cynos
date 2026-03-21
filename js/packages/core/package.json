@@ -1,6 +1,6 @@
 {
   "name": "@cynos/core",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Cynos - High-performance in-memory database for JavaScript/TypeScript",
   "author": "Saviio",
   "license": "Apache-2.0",
@@ -55,5 +55,4 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org"
   }
-
 }

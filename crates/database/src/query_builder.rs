@@ -520,15 +520,14 @@ impl SelectBuilder {
                 .order_by
                 .iter()
                 .filter_map(|(col, order)| {
-                    self.get_column_info_for_projection(col)
-                        .map(|(tbl, idx, _)| {
-                            let col_name = if let Some(dot_pos) = col.find('.') {
-                                &col[dot_pos + 1..]
-                            } else {
-                                col.as_str()
-                            };
-                            (cynos_query::ast::Expr::column(&tbl, col_name, idx), *order)
-                        })
+                    self.get_order_column_info(col).map(|(tbl, idx, _)| {
+                        let col_name = if let Some(dot_pos) = col.find('.') {
+                            &col[dot_pos + 1..]
+                        } else {
+                            col.as_str()
+                        };
+                        (cynos_query::ast::Expr::column(&tbl, col_name, idx), *order)
+                    })
                 })
                 .collect();
             plan = LogicalPlan::Sort {
@@ -633,6 +632,20 @@ impl SelectBuilder {
         }
 
         None
+    }
+
+    fn get_order_column_info(&self, col_name: &str) -> Option<(String, usize, DataType)> {
+        if self.frozen_base.is_some()
+            || !self.group_by_cols.is_empty()
+            || !self.aggregates.is_empty()
+        {
+            let output = self.describe_output().ok()?;
+            return output
+                .resolve_column(col_name)
+                .map(|(index, column)| (String::new(), index, column.data_type));
+        }
+
+        self.get_column_info_for_projection(col_name)
     }
 
     fn representative_schema(&self) -> Result<Table, JsValue> {
@@ -1033,7 +1046,7 @@ impl SelectBuilder {
         &self,
         col_name: &str,
         current_join: &JoinClause,
-        table_offsets: &hashbrown::HashMap<String, usize>,
+        _table_offsets: &hashbrown::HashMap<String, usize>,
     ) -> Option<(String, usize, DataType)> {
         let current_ref_name = current_join.reference_name();
 
@@ -1058,12 +1071,7 @@ impl SelectBuilder {
                 if table_part == main_table {
                     if let Some(schema) = self.get_schema() {
                         if let Some(col) = schema.get_column(col_part) {
-                            let offset = table_offsets.get(main_table).copied().unwrap_or(0);
-                            return Some((
-                                table_part.to_string(),
-                                offset + col.index(),
-                                col.data_type(),
-                            ));
+                            return Some((main_table.clone(), col.index(), col.data_type()));
                         }
                     }
                 }
@@ -1075,12 +1083,7 @@ impl SelectBuilder {
                 if table_part == ref_name && ref_name != current_ref_name {
                     if let Some(store) = self.cache.borrow().get_table(&join.table) {
                         if let Some(col) = store.schema().get_column(col_part) {
-                            let offset = table_offsets.get(ref_name).copied().unwrap_or(0);
-                            return Some((
-                                table_part.to_string(),
-                                offset + col.index(),
-                                col.data_type(),
-                            ));
+                            return Some((join.table.clone(), col.index(), col.data_type()));
                         }
                     }
                 }
@@ -1089,13 +1092,7 @@ impl SelectBuilder {
             // Try direct table lookup (for cases without alias)
             if let Some(store) = self.cache.borrow().get_table(table_part) {
                 if let Some(col) = store.schema().get_column(col_part) {
-                    let idx = if table_part == &current_join.table {
-                        col.index()
-                    } else {
-                        let offset = table_offsets.get(table_part).copied().unwrap_or(0);
-                        offset + col.index()
-                    };
-                    return Some((table_part.to_string(), idx, col.data_type()));
+                    return Some((table_part.to_string(), col.index(), col.data_type()));
                 }
             }
         }
@@ -1110,10 +1107,9 @@ impl SelectBuilder {
 
         // Then try the main table
         if let Some(table_name) = &self.from_table {
-            let offset = table_offsets.get(table_name).copied().unwrap_or(0);
             if let Some(schema) = self.get_schema() {
                 if let Some(col) = schema.get_column(col_name) {
-                    return Some((table_name.clone(), offset + col.index(), col.data_type()));
+                    return Some((table_name.clone(), col.index(), col.data_type()));
                 }
             }
         }
